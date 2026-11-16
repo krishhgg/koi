@@ -1,0 +1,10 @@
+# Settings for `tofu -chdir=infra init -backend-config=backend.hcl`.
+#
+# infra/bootstrap.sh writes infra/backend.hcl from the account it runs in, so
+# the usual path is to run it. To run tofu by hand before that, copy this file
+# to backend.hcl and put your account id in the bucket name. backend.hcl is
+# gitignored because the bucket name carries the account id.
+bucket       = "koi-tfstate-<account-id>"
+key          = "koi.tfstate"
+region       = "us-east-1"
+use_lockfile = true

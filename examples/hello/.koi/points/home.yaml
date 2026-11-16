@@ -1,0 +1,12 @@
+id: hello.home
+revision: 2
+claim: The home page says hello from koi.
+select:
+  always: true
+  paths: [Dockerfile]
+run:
+  command: [python3, .koi/runners/home.py]
+assertions:
+  - name: home-says-hello
+    description: The home page's heading reads "hello from koi" in koi's browser, shown by a screenshot and by the recorder's own read of GET /.
+    evidence: [screenshot, http-response]

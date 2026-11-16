@@ -1,0 +1,22 @@
+node_modules/
+dist/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Python bytecode, written when the egress proxy's tests run
+__pycache__/
+*.pyc
+
+# OpenTofu
+infra/.terraform/
+# Written by infra/bootstrap.sh; the bucket name carries the account id.
+infra/backend.hcl
+infra/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.auto.tfvars.example
+*.tfplan

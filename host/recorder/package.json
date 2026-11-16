@@ -1,0 +1,19 @@
+{
+	"name": "@koi/recorder",
+	"version": "0.0.0",
+	"private": true,
+	"license": "MIT",
+	"type": "module",
+	"description": "The browser koi records a verification run with: a Playwright server and a capture API inside the run network.",
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"start": "node dist/server.js"
+	},
+	"dependencies": {
+		"playwright-core": "1.64.1"
+	},
+	"devDependencies": {
+		"@types/node": "26.6.5",
+		"typescript": "7.0.2"
+	}
+}

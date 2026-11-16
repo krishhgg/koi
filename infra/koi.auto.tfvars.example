@@ -1,0 +1,4 @@
+# Copy this file to infra/koi.auto.tfvars (gitignored) and set your own domain.
+# OpenTofu reads *.auto.tfvars on its own. The account must hold the Route 53
+# hosted zone for the domain; previews are served at <label>.<domain>.
+domain = "previews.example.com"

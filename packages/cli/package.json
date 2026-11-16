@@ -1,0 +1,23 @@
+{
+	"name": "@koi/cli",
+	"version": "0.0.0",
+	"private": true,
+	"license": "MIT",
+	"type": "module",
+	"bin": {
+		"koi": "./src/main.ts"
+	},
+	"scripts": {
+		"build": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/koi ./src/main.ts"
+	},
+	"dependencies": {
+		"@koi/shared": "workspace:*",
+		"@aws-sdk/client-ec2": "^3.900.0",
+		"@aws-sdk/client-s3": "^3.900.0",
+		"@aws-sdk/client-ssm": "^3.900.0",
+		"@aws-sdk/client-sts": "^3.900.0",
+		"@aws-sdk/credential-providers": "^3.900.0",
+		"@aws-sdk/lib-storage": "^3.900.0",
+		"zod": "^4.1.0"
+	}
+}

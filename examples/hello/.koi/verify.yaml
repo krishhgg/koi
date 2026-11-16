@@ -1,0 +1,12 @@
+# What koi should check on a hello preview: one point, run in koi's default
+# verifier image (host/verifier), which has Python and the Playwright client.
+# See docs/verify.md.
+version: 1
+points:
+  - points/*.yaml
+profiles:
+  pr:
+    always: [hello.home]
+    select: changed
+runner:
+  image: koi-verifier

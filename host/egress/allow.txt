@@ -1,0 +1,17 @@
+# Hosts preview containers may reach through the koi egress proxy, one per
+# line. "*.example.com" matches any subdomain (not example.com itself).
+# Only port 443 (CONNECT) and port 80 (plain HTTP) are allowed.
+
+# Python packages, for apps that install their requirements on first use.
+pypi.org
+files.pythonhosted.org
+download.pytorch.org
+
+# Model weights some nodes download on first use.
+huggingface.co
+*.huggingface.co
+*.hf.co
+
+# LLM provider APIs are always allowed and are listed in koi_egress.py
+# (PROVIDERS), because they are also the hosts where the proxy swaps koi
+# tokens for real keys. Do not add them here.
