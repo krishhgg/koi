@@ -1821,17 +1821,81 @@ koid. For the verifier: build the image on the box
 koid. To let a project name another image, put it on the box yourself
 (`docker pull` by digest, or a build) and list it in `KOI_VERIFIER_IMAGES`.
 
+### Packet tests
+
+`host/verify/packet-test/run.sh` sends real packets through two run networks
+and checks each flow against the rules in "Run network". Run it as root on a
+box set up like the real one, after `host/verify/install.sh`. Stop koid
+first, since koid's startup removes run networks it did not make. On a
+deployed box the files are under `/usr/local/share/koi/verify/packet-test/`.
+
+```sh
+sudo systemctl stop koid
+sudo host/verify/packet-test/run.sh
+sudo systemctl start koid
+```
+
+The test runs `provision` twice and checks that the ruleset does not change.
+It then builds two runs with the same `docker` arguments as
+`packages/daemon/src/docker.ts`, the same addresses and MACs, and the same
+`apply` calls through `sudo -n` as `koi`. The recorder and the verifier are a
+small stand-in image, since the network is what is tested. Probes run in each
+container's network namespace through nsenter. A privileged attacker container
+on the same bridge forges the other endpoints' addresses and MACs. At the end
+the test revokes one run as koid does and checks the helper's refusals.
+
+Every target gets a listener first, so a drop is told apart from nothing
+listening. A flow counts as dropped when the client got no answer, the
+listener saw nothing, and a deny rule's packet counter went up. A run network
+has no route off its /28, so for targets off it the test adds a route through
+the gateway in the probing namespace. The firewall is then what stops the
+packet.
+
+The test prints one line per flow: what it expected, what it saw, and how.
+`GAP` marks a limit this page states, the time before a container's permits
+bind to its bridge port, and does not fail the run. The exit code is 1 when
+any line fails. `--keep` leaves the networks for inspection, `--verbose`
+prints the rules after `apply`, and `--cleanup` removes what a killed run
+left.
+
 ### What is not here yet
 
 The agent actions (`verify act`), the trusted required policy from the base
 branch, proof verification, the pull request comment publisher, provider
-request budgets in the egress proxy, a login key for runners, fixtures
-registered with the recorder, and the packet tests that prove the rules on
-a real host. The recorder's Chromium sandbox needs the host to allow
+request budgets in the egress proxy, a login key for runners, and fixtures
+registered with the recorder.
+
+The packet tests ran once, on Ubuntu 24.04 with kernel 7.0.0-1014-aws,
+Docker 29.10.0 and iptables 1.8.10 (nf_tables). Three things they found are
+not fixed yet:
+
+- The helper cannot run `provision` a second time, or `apply` or `revoke` at
+  all. On that kernel, iptables reports a chain that does not exist as
+  "Incompatible with this kernel" once the filter table has an `OUTPUT` chain,
+  and `listing()` takes only "No chain" to mean a missing chain. `attest`
+  still works, so koid reports verification available and the first run fails
+  at `apply`, with no rule installed. The other results came from a copy of
+  the helper that also reads that message as a missing chain.
+- br_netfilter passes an 802.1Q-tagged frame to iptables only with
+  `net.bridge.bridge-nf-filter-vlan-tagged=1`, and provisioning leaves it at
+  0. The receiving kernel strips a tag with VLAN id 0 and takes the packet. A
+  tagged UDP datagram from the attacker reached the recorder. With the sysctl
+  at 1, `KOI-VERIFY` drops the same frames.
+- A permit names the source's bridge port but not the destination's. A
+  container that sends a frame from the recorder's MAC makes the bridge send
+  the recorder's traffic to that container's port. The attacker read the
+  verifier's data to TCP 4317 this way.
+
+The last two need a container that can send raw frames. The app, the
+recorder and the verifier cannot: each has every capability dropped, and the
+test checks that.
+
+The recorder's Chromium sandbox needs the host to allow
 unprivileged user namespaces inside the container; that is part of the host
 configuration still to be pinned and tested, and the Docker-gated
 integration tests (`packages/daemon/test/recorder.integration.test.ts`,
 `packages/daemon/test/verifier.integration.test.ts`) are where it shows.
+koid's sandbox probe passed on the host above.
 The design's runner protocol had four events; this version adds `read`,
 because a point whose assertion declares `http-response` evidence had no
 way to ask for it.
