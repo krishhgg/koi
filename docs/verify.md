@@ -1876,25 +1876,38 @@ sudo host/verify/packet-test/run.sh
 sudo systemctl start koid
 ```
 
-The test runs `provision` twice and checks that the ruleset does not change.
-It then builds two runs with the same `docker` arguments as
-`packages/daemon/src/docker.ts`, the same addresses and MACs, and the same
-`apply` calls through `sudo -n` as `koi`. The recorder and the verifier are a
-small stand-in image, since the network is what is tested. Probes run in each
-container's network namespace through nsenter. A privileged attacker container
-on the same bridge forges the other endpoints' addresses and MACs. At the end
-the test revokes one run as koid does and checks the helper's refusals.
+The test runs `provision` twice and checks that the ruleset, ebtables
+included, does not change. It then builds two runs with the same `docker`
+arguments as `packages/daemon/src/docker.ts`, the same addresses and MACs,
+and the same `apply` calls through `sudo -n` as `koi`. The recorder and the
+verifier are a small stand-in image, since the network is what is tested.
+Probes run in each container's network namespace through nsenter. Once the
+verifiers run, it checks that `KOI-VERIFY-L2` is first in ebtables' `FORWARD`,
+that `bridge-nf-filter-vlan-tagged` is 1, and that each endpoint's MAC is
+pinned to its port and the recorder is the host's permanent neighbour.
+
+A privileged attacker container on the same bridge forges the other
+endpoints' addresses and MACs. It sends packets under one VLAN tag, under two
+(802.1Q twice, and 802.1ad outside 802.1Q) and inside PPPoE. And it tries to
+read three permitted flows while they carry markers: the verifier to the
+recorder on TCP 4317, the recorder's replies, and `koi` on the host to the
+recorder on TCP 4318. It tries two ways: frames from the recorder's MAC, a
+gratuitous ARP among them, so the bridge learns that MAC on its port; and
+ARP that tells the verifier, the recorder or the host that an address is at
+the attacker's MAC. At the end the test revokes one run as koid does, checks
+that its pins and the neighbour are gone, and checks the helper's refusals.
 
 Every target gets a listener first, so a drop is told apart from nothing
 listening. A flow counts as dropped when the client got no answer, the
-listener saw nothing, and a deny rule's packet counter went up. A run network
+listener saw nothing, and a deny rule's packet counter went up: an iptables
+deny, or the drop at the end of `KOI-VERIFY-L2`. A run network
 has no route off its /28, so for targets off it the test adds a route through
 the gateway in the probing namespace. The firewall is then what stops the
 packet.
 
 The test prints one line per flow: what it expected, what it saw, and how.
 `GAP` marks a limit this page states, the time before a container's permits
-bind to its bridge port, and does not fail the run. The exit code is 1 when
+bind to its bridge port and its MAC is pinned, and does not fail the run. The exit code is 1 when
 any line fails. `--keep` leaves the networks for inspection, `--verbose`
 prints the rules after `apply`, and `--cleanup` removes what a killed run
 left.
@@ -1906,30 +1919,50 @@ branch, proof verification, the pull request comment publisher, provider
 request budgets in the egress proxy, a login key for runners, and fixtures
 registered with the recorder.
 
-The packet tests ran once, on Ubuntu 24.04 with kernel 7.0.0-1014-aws,
-Docker 29.10.0 and iptables 1.8.10 (nf_tables). Three things they found are
-not fixed yet:
+The packet tests ran twice, on Ubuntu 24.04 with kernel 7.0.0-1014-aws,
+Docker 29.10.0 and iptables 1.8.10 (nf_tables). The first run found three
+problems. All three are fixed (see "Run network"):
 
-- The helper cannot run `provision` a second time, or `apply` or `revoke` at
-  all. On that kernel, iptables reports a chain that does not exist as
-  "Incompatible with this kernel" once the filter table has an `OUTPUT` chain,
-  and `listing()` takes only "No chain" to mean a missing chain. `attest`
-  still works, so koid reports verification available and the first run fails
-  at `apply`, with no rule installed. The other results came from a copy of
-  the helper that also reads that message as a missing chain.
-- br_netfilter passes an 802.1Q-tagged frame to iptables only with
-  `net.bridge.bridge-nf-filter-vlan-tagged=1`, and provisioning leaves it at
-  0. The receiving kernel strips a tag with VLAN id 0 and takes the packet. A
-  tagged UDP datagram from the attacker reached the recorder. With the sysctl
-  at 1, `KOI-VERIFY` drops the same frames.
-- A permit names the source's bridge port but not the destination's. A
-  container that sends a frame from the recorder's MAC makes the bridge send
-  the recorder's traffic to that container's port. The attacker read the
-  verifier's data to TCP 4317 this way.
+- The helper could not run `provision` a second time, or `apply` or `revoke`
+  at all. On that kernel, iptables reports a chain that does not exist as
+  "Incompatible with this kernel" once the filter table has an `OUTPUT` chain.
+  `attest` still worked, so koid reported verification available and every
+  run failed at `apply`.
+- A UDP datagram under an 802.1Q tag with VLAN id 0 reached the recorder,
+  since provisioning left `bridge-nf-filter-vlan-tagged` at 0.
+- A container that sent frames from the recorder's MAC read the verifier's
+  data to TCP 4317, since a permit named the source's bridge port only.
 
-The last two need a container that can send raw frames. The app, the
+The second run used the fixed helper, unpatched: 128 checks, none failed,
+and the one `GAP` line. It also tried what the first run did not. A packet
+under two VLAN tags reached the recorder's socket with the sysctl at 1, which
+is why `KOI-VERIFY-L2` exists; it is now dropped. A PPPoE frame reached the
+recorder's port but no socket, since the receiving kernel has no PPPoE
+session, so `bridge-nf-filter-pppoe-tagged` stays 0 and the allowlist drops
+those frames. Frames from the recorder's MAC no longer move it, so the
+verifier's flow and koid's flow to the recorder both kept their data. ARP
+that pointed the verifier, the recorder or the host at the attacker's MAC
+got the attacker nothing. Between containers the misled flow stalls until
+the sender's ARP entry is right again, since `--physdev-out` drops its
+packets. koid's flow to the recorder carried on, since the host's neighbour
+for the recorder is permanent. A `koi verify run` with koid on the same box
+passed one point and failed the other, as the points say, and left no rule,
+pin or neighbour behind.
+
+Runs with one protection taken out of a copy of the helper showed what each
+one is for. Without `--physdev-out`, ARP led the verifier's data and the
+recorder's replies to the attacker. Without the permanent neighbour, ARP led
+koid's data to it. Without the pins, frames from the recorder's MAC led
+koid's data to it; the verifier's flow only stalled, since `--physdev-out`
+held. Without `KOI-VERIFY-L2`, packets under two VLAN tags reached the
+recorder's socket.
+
+These attacks need a container that can send raw frames. The app, the
 recorder and the verifier cannot: each has every capability dropped, and the
-test checks that.
+test checks that. One limit stays, the `GAP` line: before a container first
+runs, its permits name no bridge port and its MAC has no pin. The same holds
+after a container stops and before `apply` binds its next start, since a pin
+goes with its port.
 
 The recorder's Chromium sandbox needs the host to allow
 unprivileged user namespaces inside the container; that is part of the host
