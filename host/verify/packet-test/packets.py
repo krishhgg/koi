@@ -606,10 +606,11 @@ def ip_in(name, *args):
 # Counters ---------------------------------------------------------------------------
 
 COUNTED_CHAINS = re.compile(r"^(KOI-VERIFY\S*|DOCKER-USER|INPUT|OUTPUT|FORWARD)$")
+L2_CHAIN = "KOI-VERIFY-L2"
 
 
 def counters():
-    """Packet counters of every rule in the chains that guard kv+ bridges, IPv4 and IPv6."""
+    """Packet counters of every rule in the chains that guard kv+ bridges: IPv4, IPv6 and the layer 2 allowlist."""
     found = {}
     for tool, family in (("iptables-save", "v4"), ("ip6tables-save", "v6")):
         text = run([tool, "-c", "-t", "filter"]).stdout
@@ -621,6 +622,13 @@ def counters():
             key = (family, m.group(3), m.group(4))
             seen[key] = seen.get(key, 0) + 1
             found[(*key, seen[key])] = int(m.group(1))
+    # IPv6, tagged frames and anything else that is not IPv4 or ARP stop in
+    # the helper's ebtables chain, before ip6tables or iptables see them.
+    text = run(["ebtables", "-t", "filter", "-L", L2_CHAIN, "--Lc"], check=False).stdout
+    for index, line in enumerate(text.splitlines()):
+        m = re.match(r"^(.*) , pcnt = (\d+) -- bcnt = \d+$", line)
+        if m:
+            found[("l2", L2_CHAIN, m.group(1), index)] = int(m.group(2))
     return found
 
 
@@ -636,7 +644,7 @@ def rose(before, after, deny_only=True):
             continue
         if deny_only and not rule.endswith("-j DROP"):
             continue
-        out.append(f"{'' if family == 'v4' else 'ip6 '}{chain} [{rule}] +{delta}")
+        out.append(f"{ {'v4': '', 'v6': 'ip6 ', 'l2': 'ebtables '}[family]}{chain} [{rule}] +{delta}")
     return out
 
 
@@ -1345,13 +1353,14 @@ class PacketTest:
         res = in_ns(a.verifier, "_connect", app_ll, str(APP_PORT), "v6", "--dev", vdev)
         drops = rose(before, counters())
         seen = listener.events(since)
-        ok = res.get("result") in ("timeout", "unreachable") and not seen and any(d.startswith("ip6") for d in drops)
+        ok = res.get("result") in ("timeout", "unreachable") and not seen and any(d.startswith(("ip6", "ebtables")) for d in drops)
         self.check("verifier -> app port over IPv6 link-local", "dropped", "dropped" if ok else res.get("result", "?"),
                    f"client {res.get('result')}; listener saw {len(seen)}; {'; '.join(drops[:2])}")
         before = counters()
         run([*ns_argv(a.verifier), "ping", "-6", "-c", "1", "-W", "1", f"ff02::1%{vdev}"], check=False)
         drops = rose(before, counters())
-        self.check("verifier -> ff02::1 icmpv6", "dropped", "dropped" if any(d.startswith("ip6") for d in drops) else "passed",
+        self.check("verifier -> ff02::1 icmpv6", "dropped",
+                   "dropped" if any(d.startswith(("ip6", "ebtables")) for d in drops) else "passed",
                    "; ".join(drops[:2]) or "no ip6 deny counted (ping may be missing)")
         for name in (a.app, a.verifier):
             run([*ns_argv(name), "sysctl", "-q", "-w", f"net.ipv6.conf.{addrs[name][0]}.disable_ipv6=1"], check=False)

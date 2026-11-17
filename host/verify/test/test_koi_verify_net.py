@@ -2174,7 +2174,10 @@ class TestMain:
             assert err.getvalue().startswith("usage:")
             assert "provision" in err.getvalue()
 
-    def test_exits_1_when_a_command_fails(self):
+    def test_exits_1_when_a_command_fails(self, tmp_path, monkeypatch):
+        # On a box the real state directory is root's alone; this test is not about it.
+        monkeypatch.setattr(net, "STATE_DIR", str(tmp_path / "state"))
+
         def broken(argv, stdin=None):
             raise net.Failed("iptables -w 5 -S exited 4: xtables lock")
 
