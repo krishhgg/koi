@@ -122,6 +122,15 @@ export function attestationProblems(attestation: VerifyAttestation, pool: string
 		if (attestation.ipv6.problems.length === 0)
 			problems.push('the IPv6 denies for kv+ are not in place');
 	}
+	const bridge = attestation.bridge;
+	if (bridge === undefined) {
+		problems.push('the helper does not report the layer 2 allowlist and the MAC pins');
+	} else if (!bridge.guard || !bridge.pins) {
+		problems.push(...bridge.problems);
+		if (bridge.problems.length === 0) {
+			problems.push('the layer 2 allowlist or the MAC pins are not in place');
+		}
+	}
 	if (!attestation.sysctl.br_netfilter) problems.push('br_netfilter is not loaded');
 	else {
 		if (!attestation.sysctl.bridge_nf_call_iptables) {
@@ -129,6 +138,10 @@ export function attestationProblems(attestation: VerifyAttestation, pool: string
 		}
 		if (!attestation.sysctl.bridge_nf_call_ip6tables) {
 			problems.push('net.bridge.bridge-nf-call-ip6tables is not 1');
+		}
+		// Without it a VLAN-tagged frame crosses a kv+ bridge unfiltered.
+		if (attestation.sysctl.bridge_nf_filter_vlan_tagged !== true) {
+			problems.push('net.bridge.bridge-nf-filter-vlan-tagged is not 1');
 		}
 	}
 	return problems;

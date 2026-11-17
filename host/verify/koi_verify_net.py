@@ -9,25 +9,31 @@ the firewall, and it takes four commands:
 
   provision      creates the KOI-VERIFY chains with their default denies and
                  the jumps that reach them, or brings an older layout up to
-                 date. Run as root by provisioning (host/cloud-init.sh) and
-                 by the helper's installer, never by koid. It keeps every
-                 run's permits, and a chain it rebuilds is reached before the
-                 old one goes, so kv+ traffic is confined at every instant;
+                 date, puts the layer 2 allowlist for kv+ bridges in front
+                 of ebtables' FORWARD, and turns on the filtering of VLAN
+                 tagged frames. Run as root by provisioning
+                 (host/cloud-init.sh) and by the helper's installer, never by
+                 koid. It keeps every run's permits, and a chain it rebuilds
+                 is reached before the old one goes, so kv+ traffic is
+                 confined at every instant;
   apply          reads one JSON descriptor on stdin (docs/verify.md, "Run
-                 network") and installs that run's permits as one
-                 generation of rules;
-  revoke RUN     removes that generation from every KOI-VERIFY chain and
-                 the run's connection tracking entries;
+                 network"), pins each running endpoint's MAC to its bridge
+                 port and the recorder's address to its MAC on the host, and
+                 installs that run's permits as one generation of rules;
+  revoke RUN     removes that generation from every KOI-VERIFY chain, the
+                 pins on the run's bridge and the run's connection tracking
+                 entries;
   attest         prints a JSON summary of the chains, of the path that
-                 reaches them and of the bridge filtering sysctls, for
-                 koid's host check.
+                 reaches them, of the layer 2 allowlist and the pins, and of
+                 the bridge filtering sysctls, for koid's host check.
 
 Every field of the descriptor is checked against a fixed shape before any
 command runs. The permits are the exact connections the design allows
 (recorder and verifier to the app port, verifier to the recorder's port 4317,
 the host to the recorder's port 4318, and their replies), bound to the run's
 bridge, each endpoint's address and MAC, and its bridge port when the
-container runs. Nothing a caller writes in the descriptor becomes a chain
+container runs: the port a packet comes in by and, between containers, the
+port it leaves by. Nothing a caller writes in the descriptor becomes a chain
 name, a port of its choosing or shell text. Standard library only.
 
 Rules are never compared as text. `iptables -S` prints a rule in its own
@@ -59,7 +65,7 @@ import sys
 
 # Bumped when the rules this file installs change shape. koid refuses to
 # verify on a host whose helper reports another version.
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 
 ENV_FILE = "/etc/koi/verify/env"
 STATE_DIR = "/run/koi-verify"
@@ -119,6 +125,25 @@ BASE_IPV6 = [
     ("FORWARD", ["-o", "kv+", "-j", "DROP"], ("-i", "-o")),
     ("OUTPUT", ["-o", "kv+", "-j", "DROP"], ("-o",)),
 ]
+
+# Between two containers on a kv+ bridge only plain IPv4 and ARP pass at
+# layer 2. br_netfilter shows iptables an IPv4 packet under one VLAN tag only
+# with bridge-nf-filter-vlan-tagged=1, and never one under two or more tags,
+# yet the receiving kernel strips tags with VLAN id 0 and takes the packet.
+# So a tagged frame, and anything else that is not IPv4 or ARP, is dropped
+# before iptables is asked. ebtables is ebtables-nft, from the iptables
+# package; the protocol names come from /etc/ethertypes (netbase).
+L2_CHAIN = "KOI-VERIFY-L2"
+L2_JUMP = ["--logical-in", "kv+", "-j", L2_CHAIN]
+L2_RULES = _rules(
+    "-p IPv4 -j RETURN",
+    "-p ARP -j RETURN",
+    "-j DROP",
+)
+ETHERTYPES = {"ipv4": 0x0800, "arp": 0x0806}
+# The bridge filtering sysctls provision sets to 1. The other two,
+# bridge-nf-call-iptables and -ip6tables, Docker and koi-firewall set.
+BRIDGE_SYSCTLS = ("net.bridge.bridge-nf-filter-vlan-tagged",)
 
 RECORDER_CONTROL_PORT = 4318
 RECORDER_PLAYWRIGHT_PORT = 4317
@@ -540,11 +565,20 @@ def comment(run_id):
     return ["-m", "comment", "--comment", f"{COMMENT_PREFIX}{run_id}"]
 
 
-def source_match(endpoint, port):
-    """The match for traffic from one endpoint: its address, its MAC, and its bridge port when known."""
-    match = []
+def source_match(endpoint, port, out=None):
+    """The match for traffic from one endpoint: its MAC, its bridge port when known, and the port it must leave by when known.
+
+    The way out matters as much as the way in. A container that answers
+    ARP for another endpoint's address gets that endpoint's traffic sent to
+    its own MAC, and the bridge forwards it there; only the permit's
+    --physdev-out stops it.
+    """
+    physdev = []
     if port is not None:
-        match += ["-m", "physdev", "--physdev-in", port]
+        physdev += ["--physdev-in", port]
+    if out is not None:
+        physdev += ["--physdev-out", out]
+    match = ["-m", "physdev", *physdev] if physdev else []
     match += ["-m", "mac", "--mac-source", endpoint["mac"]]
     return match
 
@@ -553,7 +587,9 @@ def generate_rules(desc, ports, uid):
     """The run's rules per chain, as iptables argument lists without the chain.
 
     ports maps a role to the host side of its veth pair, or None while the
-    container is not running; uid is koi's, the one host user whose
+    container is not running. A permit between two containers names the
+    port of each end that is known: --physdev-in for the sender and
+    --physdev-out for the receiver. uid is koi's, the one host user whose
     connections to the recorder's control port pass. The first rule of each
     chain goes in first, so a chain reads top to bottom as listed here.
     Pure: tests assert the exact output.
@@ -570,7 +606,7 @@ def generate_rules(desc, ports, uid):
             *both,
             "-s", ep[src]["ip"], "-d", ep[dst]["ip"],
             "-p", "tcp", "-m", "tcp", "--dport", str(dport),
-            *source_match(ep[src], ports.get(src)),
+            *source_match(ep[src], ports.get(src), ports.get(dst)),
             "-m", "conntrack", "--ctstate", "NEW,ESTABLISHED",
             *tag, "-j", "ACCEPT",
         ]
@@ -578,7 +614,7 @@ def generate_rules(desc, ports, uid):
             *both,
             "-s", ep[dst]["ip"], "-d", ep[src]["ip"],
             "-p", "tcp", "-m", "tcp", "--sport", str(dport),
-            *source_match(ep[dst], ports.get(dst)),
+            *source_match(ep[dst], ports.get(dst), ports.get(src)),
             "-m", "conntrack", "--ctstate", "ESTABLISHED",
             *tag, "-j", "ACCEPT",
         ]
@@ -711,12 +747,41 @@ def run_command(argv, stdin=None):
     return done.stdout
 
 
+# iptables-nft 1.8.10 on kernel 7.0 says this, not "No chain", for a chain
+# that does not exist once the filter table has an OUTPUT chain. It is also
+# what iptables says for an EINVAL of any other cause.
+INCOMPATIBLE = "Incompatible with this kernel"
+
+
+def chain_names(run, table="iptables"):
+    """Every chain of the filter table, from the -P and -N lines of `iptables -S`.
+
+    Failed when the listing does not name the three built-in chains, since
+    a listing without them says nothing about which chains exist.
+    """
+    names = set()
+    for line in run([table, "-w", "5", "-S"]).splitlines():
+        tokens = line.split()
+        if len(tokens) >= 2 and tokens[0] in ("-P", "-N"):
+            names.add(tokens[1])
+    if not {"INPUT", "FORWARD", "OUTPUT"} <= names:
+        raise Failed(f"{table} -S does not list the INPUT, FORWARD and OUTPUT chains")
+    return names
+
+
 def listing(run, chain, table="iptables"):
-    """`iptables -S CHAIN`, or None when the chain does not exist."""
+    """`iptables -S CHAIN`, or None when the chain does not exist.
+
+    "Incompatible with this kernel" counts as a missing chain only when a
+    listing of the whole table does not name the chain; for a chain that is
+    there it is a real error, and raised.
+    """
     try:
         return run([table, "-w", "5", "-S", chain])
     except Failed as err:
         if "No chain" in str(err) or "does not exist" in str(err):
+            return None
+        if INCOMPATIBLE in str(err) and chain not in chain_names(run, table):
             return None
         raise
 
@@ -899,6 +964,11 @@ def read_sysctl(name):
         return None
 
 
+def write_sysctl(name, value):
+    with open(f"/proc/sys/{name.replace('.', '/')}", "w", encoding="ascii") as f:
+        f.write(f"{value}\n")
+
+
 def check_sysctl():
     v4 = read_sysctl("net.bridge.bridge-nf-call-iptables")
     v6 = read_sysctl("net.bridge.bridge-nf-call-ip6tables")
@@ -907,7 +977,266 @@ def check_sysctl():
         "br_netfilter": v4 is not None,
         "bridge_nf_call_iptables": v4 == "1",
         "bridge_nf_call_ip6tables": v6 == "1",
+        "bridge_nf_filter_vlan_tagged": read_sysctl("net.bridge.bridge-nf-filter-vlan-tagged") == "1",
     }
+
+
+def set_bridge_sysctls():
+    """Sets each sysctl of BRIDGE_SYSCTLS to 1 while br_netfilter is loaded; returns what changed.
+
+    provision runs at every boot (koi-firewall), so this holds across
+    reboots; host/cloud-init.sh also writes them to /etc/sysctl.d.
+    """
+    changed = []
+    for name in BRIDGE_SYSCTLS:
+        value = read_sysctl(name)
+        if value is None or value == "1":
+            continue
+        write_sysctl(name, "1")
+        changed.append(f"set {name} to 1")
+    return changed
+
+
+# --- Layer 2: the allowlist and the pins ---------------------------------------------------
+
+
+def ebtables(run, *args):
+    return run(["ebtables", "-t", "filter", *args])
+
+
+def l2_chains(run):
+    """The chains of ebtables' filter table, as {name: [rule tokens]}, from `ebtables -L`.
+
+    One listing of the whole table: a missing chain is one it does not
+    name, with no error message to read.
+    """
+    chains = {}
+    current = None
+    for line in ebtables(run, "-L").splitlines():
+        found = re.match(r"^Bridge chain: (\S+), entries: \d+, policy: \S+$", line)
+        if found:
+            current = chains.setdefault(found.group(1), [])
+        elif not line.strip():
+            current = None
+        elif current is not None:
+            current.append(line.split())
+    return chains
+
+
+def l2_rule(tokens):
+    """An ebtables rule with its protocol as a number, so `-p IPv4` and `-p 0x0800` are the same rule."""
+    out = list(tokens)
+    for index in range(len(out) - 1):
+        if out[index] != "-p":
+            continue
+        value = out[index + 1].lower()
+        try:
+            number = int(value, 16) if value.startswith("0x") else ETHERTYPES[value]
+        except (KeyError, ValueError):
+            continue
+        out[index + 1] = f"0x{number:04x}"
+    return out
+
+
+def check_l2(chains):
+    """Why the layer 2 allowlist does not hold: FORWARD must start with the jump, and the chain must be the allowlist exactly."""
+    problems = []
+    forward = chains.get("FORWARD")
+    jump = " ".join(L2_JUMP)
+    if forward is None:
+        problems.append("ebtables has no FORWARD chain")
+    elif not forward:
+        problems.append(f"ebtables FORWARD has no rule {jump}")
+    elif l2_rule(forward[0]) != l2_rule(L2_JUMP):
+        problems.append(f"ebtables FORWARD does not start with {jump}: its first rule is {' '.join(forward[0])}")
+    rules = chains.get(L2_CHAIN)
+    if rules is None:
+        problems.append(f"ebtables chain {L2_CHAIN} does not exist")
+    elif [l2_rule(r) for r in rules] != [l2_rule(r) for r in L2_RULES]:
+        got = "; ".join(" ".join(r) for r in rules) or "nothing"
+        problems.append(f"ebtables chain {L2_CHAIN} holds {got}, not the allowlist")
+    return problems
+
+
+def provision_l2(run):
+    """Puts the layer 2 allowlist in place, and the jump to it first in FORWARD; returns what changed.
+
+    A chain that differs gets the allowlist inserted above what it holds,
+    the drop first, so the chain drops anything that is not IPv4 or ARP at
+    every step; what was there is then never reached, and goes.
+    """
+    changed = []
+    chains = l2_chains(run)
+    if "FORWARD" not in chains:
+        raise Refused("ebtables has no FORWARD chain in its filter table")
+    rules = chains.get(L2_CHAIN)
+    if rules is None:
+        ebtables(run, "-N", L2_CHAIN)
+        for rule in L2_RULES:
+            ebtables(run, "-A", L2_CHAIN, *rule)
+        changed.append(f"created ebtables chain {L2_CHAIN}")
+    elif [l2_rule(r) for r in rules] != [l2_rule(r) for r in L2_RULES]:
+        for rule in reversed(L2_RULES):
+            ebtables(run, "-I", L2_CHAIN, "1", *rule)
+        for _ in rules:
+            ebtables(run, "-D", L2_CHAIN, str(len(L2_RULES) + 1))
+        changed.append(f"rebuilt ebtables chain {L2_CHAIN}")
+    forward = chains["FORWARD"]
+    jump = l2_rule(L2_JUMP)
+    copies = [index for index, rule in enumerate(forward) if l2_rule(rule) == jump]
+    if not forward or l2_rule(forward[0]) != jump:
+        ebtables(run, "-I", "FORWARD", "1", *L2_JUMP)
+        changed.append(f"ebtables FORWARD: inserted {' '.join(L2_JUMP)} first")
+        copies = [0] + [index + 1 for index in copies]
+    # Later copies go by number, highest first, so the numbers stay right.
+    for index in reversed(copies[1:]):
+        ebtables(run, "-D", "FORWARD", str(index + 1))
+        changed.append(f"ebtables FORWARD: removed a later copy of {' '.join(L2_JUMP)}")
+    return changed
+
+
+# A bridge learns which port a MAC is on from the source of every frame,
+# ARP included, which iptables never sees. A container that sends frames
+# from another endpoint's MAC would get that endpoint's traffic, the host's
+# to the recorder too, which no --physdev-out can stop. So once an endpoint
+# runs, its MAC is a static, sticky entry on its own port: static so it
+# does not age out, sticky so no frame from another port moves it. And the
+# host keeps the recorder's address at the recorder's MAC as a permanent
+# neighbour, so an ARP reply from another container cannot change where
+# koid's connection to the recorder goes.
+
+
+def fdb_entries(run):
+    """`bridge -j fdb show`: every forwarding entry of every bridge."""
+    return json.loads(run(["bridge", "-j", "fdb", "show"]) or "[]")
+
+
+def neighbours(run):
+    """`ip -4 -j neigh show`: the host's IPv4 neighbours on every interface."""
+    return json.loads(run(["ip", "-4", "-j", "neigh", "show"]) or "[]")
+
+
+def pinned(entry, port):
+    return entry.get("ifname") == port and entry.get("state") == "static" and "sticky" in (entry.get("flags") or [])
+
+
+def pin_plan(state):
+    """The pins a run's state calls for: (bridge, {mac: port}, {address: mac}), or None for a state that names no endpoints."""
+    bridge, endpoints, ports = state.get("bridge"), state.get("endpoints"), state.get("ports")
+    if not isinstance(bridge, str) or not isinstance(endpoints, dict) or not isinstance(ports, dict):
+        return None
+    try:
+        fdb = {endpoints[role]["mac"]: port for role, port in ports.items() if port is not None}
+        neigh = {}
+        if ports.get("recorder") is not None:
+            neigh[endpoints["recorder"]["ip"]] = endpoints["recorder"]["mac"]
+    except (KeyError, TypeError):
+        return None
+    return bridge, fdb, neigh
+
+
+def unpin(run, bridge, keep_fdb=None, keep_neigh=None):
+    """Removes the static entries and permanent neighbours on `bridge` that keep does not name; returns how many went.
+
+    `bridge fdb del` without a VLAN removes the MAC's entry for every VLAN
+    of the port, so each MAC and port goes once.
+    """
+    keep_fdb = keep_fdb or {}
+    keep_neigh = keep_neigh or {}
+    removed = 0
+    seen = set()
+    for entry in fdb_entries(run):
+        mac, port = entry.get("mac"), entry.get("ifname")
+        if entry.get("master") != bridge or entry.get("state") != "static" or (mac, port) in seen:
+            continue
+        seen.add((mac, port))
+        if keep_fdb.get(mac) == port:
+            continue
+        run(["bridge", "fdb", "del", mac, "dev", port, "master"])
+        removed += 1
+    for entry in neighbours(run):
+        address = entry.get("dst")
+        if entry.get("dev") != bridge or "PERMANENT" not in (entry.get("state") or []):
+            continue
+        if keep_neigh.get(address) == entry.get("lladdr"):
+            continue
+        run(["ip", "neigh", "del", address, "dev", bridge])
+        removed += 1
+    return removed
+
+
+def pin(run, desc, ports):
+    """Pins each running endpoint's MAC to its port and, once the recorder runs, its address to its MAC on the host.
+
+    Pins on the run's bridge that these ports do not call for go first.
+    """
+    bridge = desc["bridge"]
+    _, fdb, neigh = pin_plan({**desc, "ports": ports})
+    unpin(run, bridge, fdb, neigh)
+    for mac, port in fdb.items():
+        run(["bridge", "fdb", "replace", mac, "dev", port, "master", "static", "sticky"])
+    for address, mac in neigh.items():
+        run(["ip", "neigh", "replace", address, "lladdr", mac, "dev", bridge, "nud", "permanent"])
+
+
+def check_pins(fdb, neigh, links, states):
+    """Why the pins are not what the runs' states call for: a pin missing or moved, or one no state describes.
+
+    A pin whose port or bridge is gone is not looked for: the kernel drops
+    a port's entries with the port, and a container that has stopped has
+    no port until apply runs again.
+    """
+    problems = []
+    present = {link.get("ifname") for link in links}
+    want_fdb, want_neigh = {}, {}
+    for run_id, state in states.items():
+        plan = None if state is None else pin_plan(state)
+        if plan is None:
+            continue
+        bridge, macs, addresses = plan
+        for mac, port in macs.items():
+            want_fdb[(bridge, mac)] = (run_id, port)
+        for address, mac in addresses.items():
+            want_neigh[(bridge, address)] = (run_id, mac)
+    found = {}
+    for entry in fdb:
+        bridge, mac = entry.get("master"), entry.get("mac")
+        if not isinstance(bridge, str) or KV_BRIDGE.match(bridge) is None:
+            continue
+        if (bridge, mac) in want_fdb:
+            found.setdefault((bridge, mac), []).append(entry)
+        elif entry.get("state") == "static":
+            problems.append(f"bridge {bridge} has a static entry no run's state describes: {mac} on {entry.get('ifname')}")
+    for (bridge, mac), (run_id, port) in want_fdb.items():
+        if port not in present:
+            continue
+        entries = found.get((bridge, mac), [])
+        if not entries or not all(pinned(e, port) for e in entries):
+            where = ", ".join(f"{e.get('ifname')} {e.get('state') or 'learned'}" for e in entries) or "nowhere"
+            problems.append(f"run {run_id}: {mac} is not pinned to {port} on {bridge}; the bridge has it {where}")
+    held = {}
+    for entry in neigh:
+        dev = entry.get("dev")
+        if not isinstance(dev, str) or KV_BRIDGE.match(dev) is None:
+            continue
+        held[(dev, entry.get("dst"))] = entry
+        if "PERMANENT" in (entry.get("state") or []) and (dev, entry.get("dst")) not in want_neigh:
+            problems.append(f"bridge {dev} has a permanent neighbour no run's state describes: {entry.get('dst')} at {entry.get('lladdr')}")
+    for (bridge, address), (run_id, mac) in want_neigh.items():
+        if bridge not in present:
+            continue
+        entry = held.get((bridge, address))
+        if entry is None or entry.get("lladdr") != mac or "PERMANENT" not in (entry.get("state") or []):
+            problems.append(f"run {run_id}: the host does not hold {address} at {mac} on {bridge} as a permanent neighbour")
+    return problems
+
+
+def check_bridge(run, states):
+    """The layer 2 allowlist and the pins, for attest."""
+    guard = check_l2(l2_chains(run))
+    links = json.loads(run(["ip", "-j", "link", "show"]) or "[]")
+    pins = check_pins(fdb_entries(run), neighbours(run), links, states)
+    return {"guard": not guard, "pins": not pins, "problems": guard + pins}
 
 
 # --- State files -------------------------------------------------------------------
@@ -999,6 +1328,7 @@ def attest(run, env_file=None, state_dir=None):
         "pool": None if pool is None else str(pool),
         "ipv4": ipv4,
         "ipv6": check_ipv6(tables),
+        "bridge": check_bridge(run, states),
         "sysctl": check_sysctl(),
         "runs": sorted(states),
         # The bridge port each endpoint's permits are bound to, as the last
@@ -1140,7 +1470,7 @@ def provision_chain(run, spec):
 
 
 def provision(run, env_file=None, state_dir=None, lock_file=None):
-    """Installs or repairs the chains, the jumps and the IPv6 denies, under the lock apply and revoke take, and reports as attest does."""
+    """Installs or repairs the chains, the jumps, the IPv6 denies, the layer 2 allowlist and the bridge sysctls, under the lock apply and revoke take, and reports as attest does."""
     env_file = ENV_FILE if env_file is None else env_file
     state_dir = STATE_DIR if state_dir is None else state_dir
     lock_file = LOCK_FILE if lock_file is None else lock_file
@@ -1150,8 +1480,17 @@ def provision(run, env_file=None, state_dir=None, lock_file=None):
             changed += provision_chain(run, spec)
         for parent, rule, flags in BASE_IPV6:
             changed += ensure_guard(run, "ip6tables", parent, rule, flags)
+        changed += provision_l2(run)
+        changed += set_bridge_sysctls()
         report = attest(run, env_file, state_dir)
-    return {"changed": changed, "ipv4": report["ipv4"], "ipv6": report["ipv6"], "runs": report["runs"]}
+    return {
+        "changed": changed,
+        "ipv4": report["ipv4"],
+        "ipv6": report["ipv6"],
+        "bridge": report["bridge"],
+        "sysctl": report["sysctl"],
+        "runs": report["runs"],
+    }
 
 
 # --- Apply and revoke ----------------------------------------------------------------
@@ -1340,6 +1679,9 @@ def apply(run, text, env_file=None, state_dir=None, lock_file=None):
         write_state(state_dir, run_id, {**desc, "ports": ports, "uid": uid, "policy": POLICY_VERSION})
         rules = generate_rules(desc, ports, uid)
         try:
+            # The pins go in before the permits: no permitted packet goes
+            # out while another port can claim an endpoint's MAC.
+            pin(run, desc, ports)
             for command in insert_commands(rules):
                 run(command)
             disable_ipv6(desc["bridge"])
@@ -1388,6 +1730,13 @@ def revoke(run, run_id, state_dir=None, lock_file=None):
             subnets |= state_subnets(state)
         for rule in reversed(found):
             run(delete_command(rule))
+        # The run's bridge is its own, so every pin on it is the run's. A
+        # state revoke recovered names no bridge; the rules do.
+        bridges = {value for rule in found for value in rule.options("-i") + rule.options("-o") if KV_BRIDGE.match(value)}
+        if state is not None and isinstance(state.get("bridge"), str) and KV_BRIDGE.match(state["bridge"]):
+            bridges.add(state["bridge"])
+        for bridge in sorted(bridges):
+            unpin(run, bridge)
         flushed = sorted(subnets, key=network_key)
         for subnet in flushed:
             flush_conntrack(run, subnet)

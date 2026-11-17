@@ -290,11 +290,14 @@ verification_step_failed() {
 # A verification run gets a private bridge named kv<12 hex> (docs/verify.md,
 # "Run network"). Traffic bridged between two containers passes through
 # iptables only with br_netfilter loaded and these sysctls on. Docker turns
-# them on for its own inter-container rules; /etc/modules-load.d and
-# /etc/sysctl.d (written below) keep them on across boots, and this sets them
-# again in case the firewall runs first.
+# the first two on for its own inter-container rules; the third hands
+# iptables a packet under a VLAN tag, which the receiving kernel would
+# otherwise take untagged and unfiltered. /etc/modules-load.d and
+# /etc/sysctl.d (written below) keep them on across boots, this sets them
+# again in case the firewall runs first, and the helper's provision sets
+# the third once more.
 modprobe br_netfilter || verification_step_failed 'modprobe br_netfilter'
-sysctl -q -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 ||
+sysctl -q -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 net.bridge.bridge-nf-filter-vlan-tagged=1 ||
 	verification_step_failed 'setting the bridge sysctls'
 
 # The chains that confine kv+ bridges, their default denies and the jumps
@@ -335,9 +338,11 @@ UNIT
 # again (above): systemd loads the module, then applies sysctl.d.
 printf 'br_netfilter\n' > /etc/modules-load.d/koi-verify.conf
 cat > /etc/sysctl.d/90-koi-verify.conf <<'SYSCTL'
-# koi: bridged traffic on verification run networks goes through iptables.
+# koi: bridged traffic on verification run networks goes through iptables,
+# VLAN-tagged frames included.
 net.bridge.bridge-nf-call-iptables = 1
 net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-filter-vlan-tagged = 1
 SYSCTL
 modprobe br_netfilter
 sysctl -q -p /etc/sysctl.d/90-koi-verify.conf
