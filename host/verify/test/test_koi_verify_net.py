@@ -2,8 +2,9 @@
 
 The helper runs every command through one function, so these tests hand it
 a stand-in for the box: iptables and ip6tables kept in memory, docker and ip
-answered from a table, every call recorded. The stand-in lists rules the way
-iptables-nft -S prints them (addresses first and with a mask, interfaces and
+answered from a table, ebtables, the bridge's forwarding table and the
+host's neighbours kept in memory too, every call recorded. The stand-in
+lists rules the way iptables-nft -S prints them (addresses first and with a mask, interfaces and
 protocol next, each match in order, MACs in upper case, the uid numeric, the
 comment quoted), so a helper that compared text would fail here as it would
 on the box. Nothing here touches iptables, Docker or /run; the one test that
@@ -98,11 +99,11 @@ def parsed(desc):
 
 TAG = f'-m comment --comment "koi-run={RUN}"'
 LISTING_FORWARD = f"""-N KOI-VERIFY
--A KOI-VERIFY -s 10.213.0.19/32 -d 10.213.0.18/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --dport 8080 -m physdev --physdev-in vethrecorder -m mac --mac-source 02:4B:0A:D5:00:13 -m conntrack --ctstate NEW,ESTABLISHED {TAG} -j ACCEPT
--A KOI-VERIFY -s 10.213.0.18/32 -d 10.213.0.19/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --sport 8080 -m physdev --physdev-in vethapp -m mac --mac-source 02:42:0A:D5:00:12 -m conntrack --ctstate ESTABLISHED {TAG} -j ACCEPT
--A KOI-VERIFY -s 10.213.0.20/32 -d 10.213.0.18/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --dport 8080 -m mac --mac-source 02:4B:0A:D5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {TAG} -j ACCEPT
+-A KOI-VERIFY -s 10.213.0.19/32 -d 10.213.0.18/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --dport 8080 -m physdev --physdev-in vethrecorder --physdev-out vethapp -m mac --mac-source 02:4B:0A:D5:00:13 -m conntrack --ctstate NEW,ESTABLISHED {TAG} -j ACCEPT
+-A KOI-VERIFY -s 10.213.0.18/32 -d 10.213.0.19/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --sport 8080 -m physdev --physdev-in vethapp --physdev-out vethrecorder -m mac --mac-source 02:42:0A:D5:00:12 -m conntrack --ctstate ESTABLISHED {TAG} -j ACCEPT
+-A KOI-VERIFY -s 10.213.0.20/32 -d 10.213.0.18/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --dport 8080 -m physdev --physdev-out vethapp -m mac --mac-source 02:4B:0A:D5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {TAG} -j ACCEPT
 -A KOI-VERIFY -s 10.213.0.18/32 -d 10.213.0.20/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --sport 8080 -m physdev --physdev-in vethapp -m mac --mac-source 02:42:0A:D5:00:12 -m conntrack --ctstate ESTABLISHED {TAG} -j ACCEPT
--A KOI-VERIFY -s 10.213.0.20/32 -d 10.213.0.19/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --dport 4317 -m mac --mac-source 02:4B:0A:D5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {TAG} -j ACCEPT
+-A KOI-VERIFY -s 10.213.0.20/32 -d 10.213.0.19/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --dport 4317 -m physdev --physdev-out vethrecorder -m mac --mac-source 02:4B:0A:D5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {TAG} -j ACCEPT
 -A KOI-VERIFY -s 10.213.0.19/32 -d 10.213.0.20/32 -i {BRIDGE} -o {BRIDGE} -p tcp -m tcp --sport 4317 -m physdev --physdev-in vethrecorder -m mac --mac-source 02:4B:0A:D5:00:13 -m conntrack --ctstate ESTABLISHED {TAG} -j ACCEPT
 -A KOI-VERIFY -i kv+ -m conntrack --ctstate INVALID -j DROP
 -A KOI-VERIFY -o kv+ -m conntrack --ctstate INVALID -j DROP
@@ -165,7 +166,7 @@ def with_mask(value):
 ARITY = {
     "-s": 1, "-d": 1, "-i": 1, "-o": 1, "-p": 1, "-m": 1, "-j": 1, "-g": 1,
     "--dport": 1, "--sport": 1, "--ctstate": 1, "--comment": 1, "--mac-source": 1,
-    "--physdev-in": 1, "--uid-owner": 1, "--set-mark": 1,
+    "--physdev-in": 1, "--physdev-out": 1, "--uid-owner": 1, "--set-mark": 1,
 }
 
 
@@ -275,6 +276,9 @@ class Firewall:
             render("-i koi-build0 -m conntrack --ctstate NEW -j DROP".split()),
             render("-i koi-previews0 -m conntrack --ctstate NEW -j DROP".split()),
         ]
+        # Kernel 7.0 with iptables-nft 1.8.10: a missing chain is reported as
+        # "Incompatible with this kernel", not "No chain".
+        self.incompatible = False
         # While watching, every change is followed by a check that kv+
         # traffic is still denied; the commands after which it was not.
         self.watching = False
@@ -308,7 +312,7 @@ class Firewall:
             if chain is None:
                 return self.whole(table)
             if chain not in chains:
-                fail("iptables: No chain/target/match by that name.")
+                fail(f"{table}: Incompatible with this kernel." if self.incompatible else "iptables: No chain/target/match by that name.")
             return self.listing(table, chain)
         if op == "-C":
             if chain not in chains:
@@ -418,6 +422,97 @@ class Firewall:
         )
 
 
+ETHERTYPE_NAMES = {"0x0800": "IPv4", "0x0806": "ARP"}
+
+
+class Bridges:
+    """ebtables' filter table, the bridges' forwarding entries and the host's IPv4 neighbours, as the tools print them."""
+
+    def __init__(self):
+        self.ebtables = {"INPUT": [], "FORWARD": [], "OUTPUT": []}
+        self.fdb = []
+        self.neigh = []
+
+    def ebtables_listing(self):
+        """`ebtables -t filter -L` as ebtables-nft prints it: a header per chain, its rules, a blank line."""
+        out = ["Bridge table: filter", ""]
+        for name, rules in self.ebtables.items():
+            policy = "ACCEPT" if name in ("INPUT", "FORWARD", "OUTPUT") else "RETURN"
+            out.append(f"Bridge chain: {name}, entries: {len(rules)}, policy: {policy}")
+            out += [" ".join(r) for r in rules]
+            out.append("")
+        return "\n".join(out) + "\n"
+
+    def ebtables_command(self, argv):
+        """One ebtables command after `-t filter`; raises Failed as the real one exits."""
+        op, chain = argv[0], argv[1] if len(argv) > 1 else None
+
+        def fail():
+            raise net.Failed(f"ebtables -t filter {op} exited 1: ebtables: No chain/target/match by that name", returncode=1)
+
+        if op == "-L":
+            return self.ebtables_listing()
+        if chain not in self.ebtables and op != "-N":
+            fail()
+        rule = [ETHERTYPE_NAMES.get(t, t) for t in argv[2:]]
+        if op == "-N":
+            self.ebtables[chain] = []
+        elif op == "-A":
+            self.ebtables[chain].append(rule)
+        elif op == "-I":
+            self.ebtables[chain].insert(int(rule[0]) - 1, rule[1:])
+        elif op == "-D":
+            del self.ebtables[chain][int(rule[0]) - 1]
+        else:
+            raise AssertionError(f"the fake ebtables does not know {' '.join(argv)}")
+        return ""
+
+    def bridge_command(self, argv, links):
+        """`bridge fdb replace|del`: a static entry is listed once for VLAN 1 and once without, as on the box."""
+        op, mac, port = argv[2], argv[3], argv[5]
+        master = next((link.get("master") for link in links if link.get("ifname") == port), None)
+        if master is None:
+            raise net.Failed(f"bridge fdb {op} exited 255: Error: argument \"{port}\" is wrong: Device does not exist", returncode=255)
+        if op == "replace":
+            self.fdb = [e for e in self.fdb if not (e["mac"] == mac and e.get("master") == master)]
+            for vlan in (1, None):
+                entry = {"mac": mac, "ifname": port, "flags": ["sticky"], "master": master, "state": "static"}
+                if vlan is not None:
+                    entry["vlan"] = vlan
+                self.fdb.append(entry)
+        elif op == "del":
+            kept = [e for e in self.fdb if not (e["mac"] == mac and e["ifname"] == port)]
+            if len(kept) == len(self.fdb):
+                raise net.Failed("bridge fdb del exited 255: RTNETLINK answers: No such file or directory", returncode=255)
+            self.fdb = kept
+        else:
+            raise AssertionError(f"the fake bridge does not know {' '.join(argv)}")
+        return ""
+
+    def neigh_command(self, argv):
+        """`ip neigh replace ADDRESS lladdr MAC dev BRIDGE nud permanent` and `ip neigh del ADDRESS dev BRIDGE`."""
+        op, address = argv[2], argv[3]
+        dev = argv[argv.index("dev") + 1]
+        rest = [e for e in self.neigh if not (e["dst"] == address and e["dev"] == dev)]
+        if op == "replace":
+            self.neigh = rest + [{"dst": address, "dev": dev, "lladdr": argv[argv.index("lladdr") + 1], "state": ["PERMANENT"]}]
+        elif op == "del":
+            if len(rest) == len(self.neigh):
+                raise net.Failed("ip neigh del exited 2: RTNETLINK answers: No such file or directory", returncode=2)
+            self.neigh = rest
+        else:
+            raise AssertionError(f"the fake ip does not know {' '.join(argv)}")
+        return ""
+
+    def learned(self, mac, port, master):
+        """A frame from `mac` came in on `port`: the bridge learns it there, unless the entry is sticky."""
+        for entry in self.fdb:
+            if entry["mac"] == mac and entry.get("master") == master and "sticky" in entry["flags"]:
+                return
+        self.fdb = [e for e in self.fdb if not (e["mac"] == mac and e.get("master") == master)]
+        self.fdb.append({"mac": mac, "ifname": port, "flags": [], "master": master, "state": ""})
+
+
 class Crash(BaseException):
     """The helper's process dying at a command: not an Exception, so nothing in the helper catches it."""
 
@@ -434,6 +529,7 @@ class Box:
         self.state = tmp_path / "state"
         self.lock = tmp_path / "lock"
         self.fw = Firewall()
+        self.l2 = Bridges()
         self.links = []
         self.answers["ip -j route show"] = json.dumps(ROUTES)
         # The flushes asked of conntrack, and what it answers besides "0 flows".
@@ -467,6 +563,9 @@ class Box:
             }
         )
         base = 100 * (len(self.links) // 3 + 1)
+        # Each run's ports have names of their own, as on the box.
+        others = {link.get("master") for link in self.links if link.get("master") not in (None, desc["bridge"])}
+        suffix = str(len(others) + 1) if others else ""
         for e in desc["endpoints"]:
             role = e["role"]
             labels = {"koi.preview": "hello-pr-7"} if role == "app" else {"koi.role": role, "koi.run": run_id}
@@ -491,8 +590,9 @@ class Box:
             self.answers[f"nsenter --net=/var/run/docker/netns/{role} -- ip -j link show"] = json.dumps(
                 [{"ifindex": 10, "link_index": base + net.OFFSETS[role], "ifname": "eth0", "address": e["mac"]}]
             )
-            self.links.append({"ifindex": base + net.OFFSETS[role], "ifname": f"veth{role}", "master": desc["bridge"]})
-        self.answers["ip -j link show"] = json.dumps(self.links)
+            self.links.append({"ifindex": base + net.OFFSETS[role], "ifname": f"veth{role}{suffix}", "master": desc["bridge"]})
+        if not any(link.get("ifname") == desc["bridge"] for link in self.links):
+            self.links.append({"ifindex": base, "ifname": desc["bridge"]})
 
     def inspected(self, name):
         key = f"docker {'network' if name.startswith('koi-v-') else 'container'} inspect --format {{{{json .}}}} {name}"
@@ -516,6 +616,18 @@ class Box:
             if argv[3] == "-D" and argv[4].startswith("KOI-VERIFY") and (self.state / f"{RUN}.json").exists():
                 self.state_at_last_delete = json.loads((self.state / f"{RUN}.json").read_text())
             return self.fw.command(argv[0], argv[3:])
+        if line == "ip -j link show":
+            return json.dumps(self.links)
+        if argv[0] == "ebtables" and argv[1:3] == ["-t", "filter"]:
+            return self.l2.ebtables_command(argv[3:])
+        if line == "bridge -j fdb show":
+            return json.dumps(self.l2.fdb)
+        if argv[:2] == ["bridge", "fdb"]:
+            return self.l2.bridge_command(argv, self.links)
+        if line == "ip -4 -j neigh show":
+            return json.dumps(self.l2.neigh)
+        if argv[:2] == ["ip", "neigh"]:
+            return self.l2.neigh_command(argv)
         if argv[0] == "conntrack":
             self.conntrack.append(line)
             if self.conntrack_error is not None:
@@ -545,8 +657,14 @@ class Box:
 
     @staticmethod
     def is_change(argv):
-        """Whether the command changes something: a conntrack call, or an iptables call that is not a listing or a check."""
-        return argv[0] == "conntrack" or (argv[0] in ("iptables", "ip6tables") and argv[3] not in ("-S", "-C"))
+        """Whether the command changes something: conntrack, an iptables or ebtables call that is not a listing or a check, a pin."""
+        if argv[0] == "conntrack":
+            return True
+        if argv[0] in ("iptables", "ip6tables"):
+            return argv[3] not in ("-S", "-C")
+        if argv[0] == "ebtables":
+            return argv[3] != "-L"
+        return argv[:2] in (["bridge", "fdb"], ["ip", "neigh"])
 
     def changes(self):
         """The calls that change something, in order."""
@@ -554,6 +672,12 @@ class Box:
 
     def clean(self):
         return all(self.rules(spec["chain"]) == [render(r) for r in spec["base"]] for spec in net.CHAINS)
+
+    def pins(self):
+        """The static entries as (mac, port), and the permanent neighbours as (address, mac)."""
+        fdb = sorted({(e["mac"], e["ifname"]) for e in self.l2.fdb if e["state"] == "static"})
+        neigh = sorted((e["dst"], e["lladdr"]) for e in self.l2.neigh if "PERMANENT" in e["state"])
+        return fdb, neigh
 
     def state_file(self, run_id=RUN):
         return self.state / f"{run_id}.json"
@@ -565,6 +689,7 @@ def box(tmp_path, monkeypatch):
     # /etc/passwd. Nothing to read or write here.
     monkeypatch.setattr(net, "disable_ipv6", lambda bridge: None)
     monkeypatch.setattr(net, "read_sysctl", lambda name: "1")
+    monkeypatch.setattr(net, "write_sysctl", lambda name, value: pytest.fail(f"wrote {name}"))
     monkeypatch.setattr(net, "koi_uid", lambda: KOI_UID)
     return Box(tmp_path)
 
@@ -574,6 +699,7 @@ def bare(tmp_path, monkeypatch):
     """A box before provision has run."""
     monkeypatch.setattr(net, "disable_ipv6", lambda bridge: None)
     monkeypatch.setattr(net, "read_sysctl", lambda name: "1")
+    monkeypatch.setattr(net, "write_sysctl", lambda name, value: pytest.fail(f"wrote {name}"))
     monkeypatch.setattr(net, "koi_uid", lambda: KOI_UID)
     return Box(tmp_path, provisioned=False)
 
@@ -687,11 +813,12 @@ class TestRules:
         rules = net.generate_rules(self.desc, {"app": "veth0a", "recorder": None, "verifier": None}, KOI_UID)
         b = f"-i {BRIDGE} -o {BRIDGE}"
         assert joined(rules["KOI-VERIFY"]) == [
-            # Recorder to the app's port, and the app's replies.
-            f"{b} -s 10.213.0.19 -d 10.213.0.18 -p tcp -m tcp --dport 8080 -m mac --mac-source 02:4b:0a:d5:00:13 -m conntrack --ctstate NEW,ESTABLISHED {self.tag} -j ACCEPT",
+            # Recorder to the app's port, and the app's replies. The app runs, so
+            # what goes to it must leave by its port.
+            f"{b} -s 10.213.0.19 -d 10.213.0.18 -p tcp -m tcp --dport 8080 -m physdev --physdev-out veth0a -m mac --mac-source 02:4b:0a:d5:00:13 -m conntrack --ctstate NEW,ESTABLISHED {self.tag} -j ACCEPT",
             f"{b} -s 10.213.0.18 -d 10.213.0.19 -p tcp -m tcp --sport 8080 -m physdev --physdev-in veth0a -m mac --mac-source 02:42:0a:d5:00:12 -m conntrack --ctstate ESTABLISHED {self.tag} -j ACCEPT",
             # Verifier to the app's port.
-            f"{b} -s 10.213.0.20 -d 10.213.0.18 -p tcp -m tcp --dport 8080 -m mac --mac-source 02:4b:0a:d5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {self.tag} -j ACCEPT",
+            f"{b} -s 10.213.0.20 -d 10.213.0.18 -p tcp -m tcp --dport 8080 -m physdev --physdev-out veth0a -m mac --mac-source 02:4b:0a:d5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {self.tag} -j ACCEPT",
             f"{b} -s 10.213.0.18 -d 10.213.0.20 -p tcp -m tcp --sport 8080 -m physdev --physdev-in veth0a -m mac --mac-source 02:42:0a:d5:00:12 -m conntrack --ctstate ESTABLISHED {self.tag} -j ACCEPT",
             # Verifier to the recorder's Playwright port.
             f"{b} -s 10.213.0.20 -d 10.213.0.19 -p tcp -m tcp --dport 4317 -m mac --mac-source 02:4b:0a:d5:00:14 -m conntrack --ctstate NEW,ESTABLISHED {self.tag} -j ACCEPT",
@@ -709,10 +836,27 @@ class TestRules:
     def test_once_the_helpers_run_binds_each_permit_to_its_bridge_port_too(self):
         rules = net.generate_rules(self.desc, {"app": "veth0a", "recorder": "veth0r", "verifier": "veth0v"}, KOI_UID)
         text = joined(rules["KOI-VERIFY"])
-        assert text[0].count("-m physdev --physdev-in veth0r -m mac --mac-source 02:4b:0a:d5:00:13") == 1
-        assert text[2].count("-m physdev --physdev-in veth0v -m mac --mac-source 02:4b:0a:d5:00:14") == 1
+        assert text[0].count("-m physdev --physdev-in veth0r --physdev-out veth0a -m mac --mac-source 02:4b:0a:d5:00:13") == 1
+        assert text[2].count("-m physdev --physdev-in veth0v --physdev-out veth0a -m mac --mac-source 02:4b:0a:d5:00:14") == 1
         assert all("--physdev-in" in rule for rule in text)
         assert "--physdev-in veth0r" in joined(rules["KOI-VERIFY-IN"])[0]
+
+    def test_a_permit_between_containers_names_the_port_each_packet_must_leave_by(self):
+        """A container that answers ARP for the recorder's address gets the verifier's packets for the recorder sent to its MAC; the bridge forwards them to its port, and only --physdev-out keeps the permit from passing them."""
+        ports = {"app": "veth0a", "recorder": "veth0r", "verifier": "veth0v"}
+        rules = net.generate_rules(self.desc, ports, KOI_UID)
+        ip_role = {"10.213.0.18": "app", "10.213.0.19": "recorder", "10.213.0.20": "verifier"}
+        for rule in rules["KOI-VERIFY"]:
+            src, dst = ip_role[rule[rule.index("-s") + 1]], ip_role[rule[rule.index("-d") + 1]]
+            assert rule[rule.index("--physdev-in") + 1] == ports[src]
+            assert rule[rule.index("--physdev-out") + 1] == ports[dst]
+        # The host's own traffic has no bridge port to name on the way out, and
+        # the replies it takes in arrive at the host, not at a port.
+        assert not any("--physdev-out" in r for chain in ("KOI-VERIFY-IN", "KOI-VERIFY-OUT") for r in rules[chain])
+        # A port that is not known yet is left out, never guessed.
+        partial = net.generate_rules(self.desc, {"app": "veth0a", "recorder": "veth0r", "verifier": None}, KOI_UID)
+        to_verifier = [r for r in partial["KOI-VERIFY"] if r[r.index("-d") + 1] == "10.213.0.20"]
+        assert to_verifier and not any("--physdev-out" in r for r in to_verifier)
 
     def test_permits_nothing_else(self):
         rules = net.generate_rules(self.desc, {}, KOI_UID)
@@ -936,7 +1080,12 @@ class TestProvision:
             "ip6tables FORWARD: inserted -i kv+ -j DROP first",
             "ip6tables FORWARD: inserted -o kv+ -j DROP first",
             "ip6tables OUTPUT: inserted -o kv+ -j DROP first",
+            "created ebtables chain KOI-VERIFY-L2",
+            "ebtables FORWARD: inserted --logical-in kv+ -j KOI-VERIFY-L2 first",
         ]
+        assert bare.l2.ebtables["FORWARD"] == [["--logical-in", "kv+", "-j", "KOI-VERIFY-L2"]]
+        assert bare.l2.ebtables["KOI-VERIFY-L2"] == [["-p", "IPv4", "-j", "RETURN"], ["-p", "ARP", "-j", "RETURN"], ["-j", "DROP"]]
+        assert result["bridge"] == {"guard": True, "pins": True, "problems": []}
         assert bare.attest()["ipv4"]["problems"] == []
 
     def test_a_second_run_changes_nothing(self, box):
@@ -994,7 +1143,7 @@ class TestProvision:
         permit = f"-i {BRIDGE} -o {BRIDGE} -s 10.213.0.19 -d 10.213.0.18 -p tcp --dport 8080 -m comment --comment koi-run={RUN} -j ACCEPT"
         bare.fw.command("iptables", ["-I", "KOI-VERIFY", "1", *permit.split()])
         result = bare.provision()
-        assert result["changed"] == []
+        assert [c for c in result["changed"] if "ebtables" not in c] == []
         assert bare.rules("KOI-VERIFY")[0] == render(permit.split())
 
     def test_finishes_a_swap_an_earlier_run_left_half_done(self, box):
@@ -1077,7 +1226,11 @@ class TestApply:
         ports = {"app": "vethapp", "recorder": None, "verifier": None}
         assert result == {"runId": RUN, "rules": 9, "ports": ports}
         rules = installed(desc, ports)
-        assert box.changes() == [" ".join(c) for c in net.insert_commands(rules)]
+        # The app's MAC is pinned to its port before the first permit goes in.
+        assert box.changes() == [
+            "bridge fdb replace 02:42:0a:d5:00:12 dev vethapp master static sticky",
+            *[" ".join(c) for c in net.insert_commands(rules)],
+        ]
         for chain, chain_rules in rules.items():
             assert box.rules(chain) == [render(r) for r in chain_rules] + box.rules(chain)[len(chain_rules):]
         report = box.attest()
@@ -1100,7 +1253,7 @@ class TestApply:
         box.docker(desc, running=net.ROLES)
         result = box.apply(desc)
         assert result["ports"] == {"app": "vethapp", "recorder": "vethrecorder", "verifier": "vethverifier"}
-        assert all("--physdev-in" in c for c in box.changes() if "KOI-VERIFY-OUT" not in c)
+        assert all("--physdev-in" in c for c in box.changes() if c.startswith("iptables") and "KOI-VERIFY-OUT" not in c)
         assert any(f"nsenter --net=/var/run/docker/netns/{r} -- ip -j link show" in box.calls for r in net.ROLES)
 
     def test_a_second_apply_replaces_the_runs_rules(self, box):
@@ -1123,7 +1276,8 @@ class TestApply:
         # its bridge port) replaced, the rest the same, none twice.
         permits = [r for r in box.rules("KOI-VERIFY") if "--comment" in r]
         assert len(permits) == 6
-        assert len([r for r in permits if "vethapp" in r]) == 2
+        # In the app's two replies (--physdev-in) and the two permits to it (--physdev-out).
+        assert len([r for r in permits if "vethapp" in r]) == 4
         assert len([r for r in first if "vethapp" in r]) == 0
         assert box.attest()["ipv4"]["permits"] is True
         # The state still described the old generation while it went, and
@@ -1133,12 +1287,13 @@ class TestApply:
         assert state["ports"] == {"app": "vethapp", "recorder": None, "verifier": None}
 
     # Where a second apply can die: before each of the nine deletes of the
-    # old generation, at the state write, and before each of the nine
-    # inserts of the new one.
+    # old generation, at the state write, before the app's pin, and before
+    # each of the nine inserts of the new one.
     CRASH_POINTS = [
         *[(f"before delete {i + 1}", i) for i in range(9)],
         ("at the state write", "state"),
-        *[(f"before insert {i + 1}", 9 + i) for i in range(9)],
+        ("before the pin", 9),
+        *[(f"before insert {i + 1}", 10 + i) for i in range(9)],
     ]
 
     @pytest.mark.parametrize("point", [p for _, p in CRASH_POINTS], ids=[name for name, _ in CRASH_POINTS])
@@ -1168,7 +1323,7 @@ class TestApply:
         box.fw.watching = False
         assert box.fw.unconfined_after == []
         if point != "state":
-            assert (" -D " if point < 9 else " -I ") in str(died.value)
+            assert (" -D " if point < 9 else "bridge fdb replace " if point == 9 else " -I ") in str(died.value)
         # The state still holds the subnet, and describes every rule of the
         # run that is installed.
         state = json.loads(box.state_file().read_text())
@@ -1181,7 +1336,8 @@ class TestApply:
         assert box.apply(desc)["rules"] == 9
         permits = [r for r in box.rules("KOI-VERIFY") if "--comment" in r]
         assert len(permits) == 6
-        assert len([r for r in permits if "vethapp" in r]) == 2
+        # In the app's two replies (--physdev-in) and the two permits to it (--physdev-out).
+        assert len([r for r in permits if "vethapp" in r]) == 4
         assert box.attest()["ipv4"]["permits"] is True
         assert box.revoke(RUN) == {"runId": RUN, "removed": 9, "flushed": ["10.213.0.16/28"]}
         assert box.clean()
@@ -1209,7 +1365,8 @@ class TestApply:
         assert box.rules("DOCKER-USER")[0] == ["-j", "KOI-VERIFY"]
         permits = [r for r in box.rules("KOI-VERIFY") if f"koi-run={RUN}" in r]
         assert len(permits) == 6
-        assert len([r for r in permits if "vethapp" in r]) == 2
+        # In the app's two replies (--physdev-in) and the two permits to it (--physdev-out).
+        assert len([r for r in permits if "vethapp" in r]) == 4
         assert box.attest()["ipv4"] == {"chains": True, "jump": True, "defaults": True, "permits": True, "problems": []}
 
     def test_leaves_another_runs_rules_alone(self, box):
@@ -1351,9 +1508,7 @@ class TestApply:
     def test_refuses_a_running_helper_whose_port_is_on_another_bridge(self, box):
         desc = descriptor()
         box.docker(desc, running=net.ROLES)
-        links = json.loads(box.answers["ip -j link show"])
-        links[1]["master"] = "koi-previews0"
-        box.answers["ip -j link show"] = json.dumps(links)
+        box.links[1]["master"] = "koi-previews0"
         with pytest.raises(net.Refused, match="vethrecorder is on koi-previews0"):
             box.apply(desc)
         assert box.changes() == []
@@ -1543,7 +1698,13 @@ class TestAttest:
         assert report["pool"] == "10.213.0.0/20"
         assert report["ipv4"] == {"chains": True, "jump": True, "defaults": True, "permits": True, "problems": []}
         assert report["ipv6"] == {"defaults": True, "problems": []}
-        assert report["sysctl"] == {"br_netfilter": True, "bridge_nf_call_iptables": True, "bridge_nf_call_ip6tables": True}
+        assert report["sysctl"] == {
+            "br_netfilter": True,
+            "bridge_nf_call_iptables": True,
+            "bridge_nf_call_ip6tables": True,
+            "bridge_nf_filter_vlan_tagged": True,
+        }
+        assert report["bridge"] == {"guard": True, "pins": True, "problems": []}
         assert report["runs"] == []
         assert report["rules"]["KOI-VERIFY"] == [" ".join(render(r)) for r in net.BASE_FORWARD]
         json.dumps(report)
@@ -1574,7 +1735,12 @@ class TestAttest:
             "chain INPUT has no rule -i kv+ -j KOI-VERIFY-IN",
         ]
         assert report["ipv6"] == {"defaults": False, "problems": ["ip6tables OUTPUT has no rule -o kv+ -j DROP"]}
-        assert report["sysctl"] == {"br_netfilter": False, "bridge_nf_call_iptables": False, "bridge_nf_call_ip6tables": False}
+        assert report["sysctl"] == {
+            "br_netfilter": False,
+            "bridge_nf_call_iptables": False,
+            "bridge_nf_call_ip6tables": False,
+            "bridge_nf_filter_vlan_tagged": False,
+        }
         assert report["rules"]["KOI-VERIFY-IN"] == []
 
     def test_a_chain_listing_that_fails_for_another_reason_is_an_error(self, box):
@@ -1736,6 +1902,239 @@ class TestAttest:
         # Docker's own jump sits before them in FORWARD and only returns.
         box.fw.command("ip6tables", ["-I", "FORWARD", "1", "-j", "DOCKER-USER"])
         assert box.attest()["ipv6"] == {"defaults": True, "problems": []}
+
+
+class TestKernelMessage:
+    """Kernel 7.0 with iptables-nft 1.8.10 reports a missing chain as "Incompatible with this kernel"."""
+
+    def test_provision_apply_and_revoke_work_when_a_missing_chain_is_reported_that_way(self, box):
+        box.fw.incompatible = True
+        assert box.provision()["changed"] == []
+        desc = descriptor()
+        box.docker(desc, running=("app",))
+        assert box.apply(desc)["rules"] == 9
+        assert box.attest()["ipv4"]["permits"] is True
+        assert box.revoke(RUN)["removed"] == 9
+        assert box.clean()
+        # Each "missing" was checked against a listing of the whole table.
+        assert "iptables -w 5 -S" in box.calls
+
+    def test_the_message_for_a_chain_that_exists_is_an_error(self, box):
+        box.fw.incompatible = True
+        box.failing["iptables -w 5 -S KOI-VERIFY"] = net.Failed(
+            "iptables -w 5 -S KOI-VERIFY exited 1: iptables: Incompatible with this kernel.", returncode=1
+        )
+        with pytest.raises(net.Failed, match="Incompatible"):
+            box.attest()
+        with pytest.raises(net.Failed, match="Incompatible"):
+            box.provision()
+
+    def test_a_table_listing_that_names_no_built_in_chain_proves_nothing(self, box):
+        box.fw.incompatible = True
+        box.answers["iptables -w 5 -S"] = "-N KOI-VERIFY\n"
+        with pytest.raises(net.Failed, match="does not list the INPUT, FORWARD and OUTPUT chains"):
+            net.listing(box.run, "KOI-VERIFY-NEW")
+        # Without the message, nothing changes: "No chain" is missing as before.
+        box.fw.incompatible = False
+        assert net.listing(box.run, "KOI-VERIFY-NEW") is None
+
+
+class TestBridgeSysctls:
+    def test_provision_turns_on_the_filtering_of_vlan_tagged_frames(self, box, monkeypatch):
+        values = {"net.bridge.bridge-nf-filter-vlan-tagged": "0"}
+        written = []
+        monkeypatch.setattr(net, "read_sysctl", lambda name: values.get(name, "1"))
+        monkeypatch.setattr(net, "write_sysctl", lambda name, value: written.append((name, value)) or values.update({name: value}))
+        assert box.attest()["sysctl"]["bridge_nf_filter_vlan_tagged"] is False
+        result = box.provision()
+        assert written == [("net.bridge.bridge-nf-filter-vlan-tagged", "1")]
+        assert result["changed"] == ["set net.bridge.bridge-nf-filter-vlan-tagged to 1"]
+        assert result["sysctl"]["bridge_nf_filter_vlan_tagged"] is True
+        assert box.provision()["changed"] == []
+
+    def test_without_br_netfilter_there_is_nothing_to_set_and_attest_says_so(self, box, monkeypatch):
+        monkeypatch.setattr(net, "read_sysctl", lambda name: None)
+        assert box.provision()["changed"] == []
+        report = box.attest()["sysctl"]
+        assert report["br_netfilter"] is False
+        assert report["bridge_nf_filter_vlan_tagged"] is False
+
+
+class TestLayer2:
+    """Only plain IPv4 and ARP cross a kv+ bridge: br_netfilter never shows iptables a frame under two VLAN tags."""
+
+    def test_attest_names_a_missing_jump_a_jump_behind_another_rule_and_a_changed_chain(self, box):
+        assert box.attest()["bridge"]["guard"] is True
+        box.l2.ebtables["FORWARD"].insert(0, ["-j", "ACCEPT"])
+        box.l2.ebtables["KOI-VERIFY-L2"].insert(2, ["-p", "802_1Q", "-j", "RETURN"])
+        report = box.attest()["bridge"]
+        assert report["guard"] is False
+        assert report["problems"] == [
+            "ebtables FORWARD does not start with --logical-in kv+ -j KOI-VERIFY-L2: its first rule is -j ACCEPT",
+            "ebtables chain KOI-VERIFY-L2 holds -p IPv4 -j RETURN; -p ARP -j RETURN; -p 802_1Q -j RETURN; -j DROP, not the allowlist",
+        ]
+        del box.l2.ebtables["KOI-VERIFY-L2"]
+        box.l2.ebtables["FORWARD"] = []
+        assert box.attest()["bridge"]["problems"] == [
+            "ebtables FORWARD has no rule --logical-in kv+ -j KOI-VERIFY-L2",
+            "ebtables chain KOI-VERIFY-L2 does not exist",
+        ]
+
+    def test_a_protocol_given_as_a_number_is_the_same_rule(self):
+        assert net.l2_rule(["-p", "0x0800", "-j", "RETURN"]) == net.l2_rule(["-p", "IPv4", "-j", "RETURN"])
+        assert net.l2_rule(["-p", "ARP", "-j", "RETURN"]) == ["-p", "0x0806", "-j", "RETURN"]
+        assert net.l2_rule(["-p", "802_1Q", "-j", "RETURN"]) != net.l2_rule(["-p", "IPv4", "-j", "RETURN"])
+
+    def test_provision_repairs_the_chain_dropping_first_and_puts_the_jump_back_in_front(self, box):
+        box.l2.ebtables["KOI-VERIFY-L2"] = [["-j", "ACCEPT"]]
+        box.l2.ebtables["FORWARD"] = [["-j", "ACCEPT"], ["--logical-in", "kv+", "-j", "KOI-VERIFY-L2"]]
+        box.calls.clear()
+        result = box.provision()
+        assert result["changed"] == [
+            "rebuilt ebtables chain KOI-VERIFY-L2",
+            "ebtables FORWARD: inserted --logical-in kv+ -j KOI-VERIFY-L2 first",
+            "ebtables FORWARD: removed a later copy of --logical-in kv+ -j KOI-VERIFY-L2",
+        ]
+        # The drop goes in above what was there before anything that lets a frame through.
+        assert [c for c in box.changes() if c.startswith("ebtables")][:4] == [
+            "ebtables -t filter -I KOI-VERIFY-L2 1 -j DROP",
+            "ebtables -t filter -I KOI-VERIFY-L2 1 -p ARP -j RETURN",
+            "ebtables -t filter -I KOI-VERIFY-L2 1 -p IPv4 -j RETURN",
+            "ebtables -t filter -D KOI-VERIFY-L2 4",
+        ]
+        assert box.l2.ebtables["KOI-VERIFY-L2"] == [["-p", "IPv4", "-j", "RETURN"], ["-p", "ARP", "-j", "RETURN"], ["-j", "DROP"]]
+        assert box.l2.ebtables["FORWARD"] == [["--logical-in", "kv+", "-j", "KOI-VERIFY-L2"], ["-j", "ACCEPT"]]
+        assert result["bridge"]["guard"] is True
+        assert box.provision()["changed"] == []
+
+
+class TestPins:
+    """Once an endpoint runs, its MAC is a static sticky entry on its own port, and the recorder's address a permanent neighbour of the host."""
+
+    RECORDER_MAC = "02:4b:0a:d5:00:13"
+
+    def test_apply_pins_each_running_endpoint_before_the_first_permit(self, box):
+        desc = descriptor()
+        box.docker(desc, running=net.ROLES)
+        box.apply(desc)
+        changes = box.changes()
+        pins = [
+            "bridge fdb replace 02:42:0a:d5:00:12 dev vethapp master static sticky",
+            "bridge fdb replace 02:4b:0a:d5:00:13 dev vethrecorder master static sticky",
+            "bridge fdb replace 02:4b:0a:d5:00:14 dev vethverifier master static sticky",
+            f"ip neigh replace 10.213.0.19 lladdr 02:4b:0a:d5:00:13 dev {BRIDGE} nud permanent",
+        ]
+        assert changes[: len(pins)] == pins
+        assert all(c.startswith("iptables -w 5 -I ") for c in changes[len(pins):])
+        assert box.pins() == (
+            [("02:42:0a:d5:00:12", "vethapp"), ("02:4b:0a:d5:00:13", "vethrecorder"), ("02:4b:0a:d5:00:14", "vethverifier")],
+            [("10.213.0.19", "02:4b:0a:d5:00:13")],
+        )
+        assert box.attest()["bridge"] == {"guard": True, "pins": True, "problems": []}
+
+    def test_a_frame_from_another_port_cannot_move_a_pin(self, box):
+        desc = descriptor()
+        box.docker(desc, running=("app", "recorder"))
+        box.apply(desc)
+        box.links.append({"ifindex": 999, "ifname": "vethattacker", "master": BRIDGE})
+        box.l2.learned(self.RECORDER_MAC, "vethattacker", BRIDGE)
+        assert ("02:4b:0a:d5:00:13", "vethrecorder") in box.pins()[0]
+        assert box.attest()["bridge"]["pins"] is True
+
+    def test_attest_names_a_pin_that_is_missing_or_moved_and_a_neighbour_that_changed(self, box):
+        desc = descriptor()
+        box.docker(desc, running=("app", "recorder"))
+        box.apply(desc)
+        box.links.append({"ifindex": 999, "ifname": "vethattacker", "master": BRIDGE})
+        box.l2.bridge_command(["bridge", "fdb", "del", "02:42:0a:d5:00:12", "dev", "vethapp", "master"], box.links)
+        box.l2.bridge_command(["bridge", "fdb", "replace", self.RECORDER_MAC, "dev", "vethattacker", "master", "static", "sticky"], box.links)
+        box.l2.neigh_command(["ip", "neigh", "replace", "10.213.0.19", "lladdr", "02:66:00:00:00:01", "dev", BRIDGE, "nud", "permanent"])
+        report = box.attest()["bridge"]
+        assert report["pins"] is False
+        assert report["problems"] == [
+            f"run {RUN}: 02:42:0a:d5:00:12 is not pinned to vethapp on {BRIDGE}; the bridge has it nowhere",
+            f"run {RUN}: 02:4b:0a:d5:00:13 is not pinned to vethrecorder on {BRIDGE}; the bridge has it vethattacker static, vethattacker static",
+            f"run {RUN}: the host does not hold 10.213.0.19 at 02:4b:0a:d5:00:13 on {BRIDGE} as a permanent neighbour",
+        ]
+        # A learned entry where the pin should be is no pin either.
+        box.apply(desc)
+        assert box.attest()["bridge"]["pins"] is True
+        box.l2.fdb = [e for e in box.l2.fdb if e["mac"] != self.RECORDER_MAC]
+        box.l2.learned(self.RECORDER_MAC, "vethattacker", BRIDGE)
+        assert box.attest()["bridge"]["problems"] == [
+            f"run {RUN}: 02:4b:0a:d5:00:13 is not pinned to vethrecorder on {BRIDGE}; the bridge has it vethattacker learned"
+        ]
+
+    def test_attest_names_a_pin_no_state_describes_and_skips_a_port_that_is_gone(self, box):
+        desc = descriptor()
+        box.docker(desc, running=("app", "recorder"))
+        box.apply(desc)
+        # The recorder stopped: Docker removed its port, and the kernel the pin with it.
+        box.links = [link for link in box.links if link["ifname"] != "vethrecorder"]
+        box.l2.fdb = [e for e in box.l2.fdb if e["ifname"] != "vethrecorder"]
+        assert box.attest()["bridge"]["pins"] is True
+        # A static entry or a permanent neighbour on a kv bridge that no run's state calls for.
+        box.links.append({"ifindex": 998, "ifname": "vethstray", "master": OTHER_BRIDGE})
+        box.l2.bridge_command(["bridge", "fdb", "replace", "02:4b:0a:d5:00:99", "dev", "vethstray", "master", "static", "sticky"], box.links)
+        box.l2.neigh_command(["ip", "neigh", "replace", "10.213.0.35", "lladdr", "02:4b:0a:d5:00:99", "dev", OTHER_BRIDGE, "nud", "permanent"])
+        assert box.attest()["bridge"]["problems"] == [
+            f"bridge {OTHER_BRIDGE} has a static entry no run's state describes: 02:4b:0a:d5:00:99 on vethstray",
+            f"bridge {OTHER_BRIDGE} has a static entry no run's state describes: 02:4b:0a:d5:00:99 on vethstray",
+            f"bridge {OTHER_BRIDGE} has a permanent neighbour no run's state describes: 10.213.0.35 at 02:4b:0a:d5:00:99",
+        ]
+
+    def test_a_second_apply_moves_a_pin_to_a_new_port_and_drops_what_the_ports_no_longer_call_for(self, box):
+        desc = descriptor()
+        box.docker(desc, running=net.ROLES)
+        box.apply(desc)
+        # The verifier was made again for the next point: a new port, and the old one is still there.
+        box.links.append({"ifindex": 997, "ifname": "vethverifier2", "master": BRIDGE})
+        key = "nsenter --net=/var/run/docker/netns/verifier -- ip -j link show"
+        inside = json.loads(box.answers[key])
+        inside[0]["link_index"] = 997
+        box.answers[key] = json.dumps(inside)
+        box.apply(desc)
+        assert ("02:4b:0a:d5:00:14", "vethverifier2") in box.pins()[0]
+        assert ("02:4b:0a:d5:00:14", "vethverifier") not in box.pins()[0]
+        # The recorder stopped: its pin and the host's neighbour go.
+        box.docker(desc, running=("app",))
+        box.apply(desc)
+        assert box.pins() == ([("02:42:0a:d5:00:12", "vethapp")], [])
+        assert box.attest()["bridge"]["pins"] is True
+
+    def test_revoke_removes_the_runs_pins_and_leaves_another_runs_alone(self, box):
+        desc = descriptor()
+        box.docker(desc, running=net.ROLES)
+        box.apply(desc)
+        other = other_descriptor()
+        box.docker(other, running=net.ROLES)
+        box.apply(other)
+        assert len(box.pins()[0]) == 6
+        box.calls.clear()
+        box.revoke(RUN)
+        assert box.pins() == (
+            [("02:42:0a:d5:00:22", "vethapp2"), ("02:4b:0a:d5:00:23", "vethrecorder2"), ("02:4b:0a:d5:00:24", "vethverifier2")],
+            [("10.213.0.35", "02:4b:0a:d5:00:23")],
+        )
+        unpins = [c for c in box.changes() if c.startswith(("bridge", "ip neigh"))]
+        assert unpins == [
+            "bridge fdb del 02:42:0a:d5:00:12 dev vethapp master",
+            "bridge fdb del 02:4b:0a:d5:00:13 dev vethrecorder master",
+            "bridge fdb del 02:4b:0a:d5:00:14 dev vethverifier master",
+            f"ip neigh del 10.213.0.19 dev {BRIDGE}",
+        ]
+        # They go after the permits, and before the state file, so a revoke that stops can be run again.
+        changes = box.changes()
+        assert changes.index(unpins[0]) > max(i for i, c in enumerate(changes) if c.startswith("iptables -w 5 -D "))
+        assert box.attest()["bridge"] == {"guard": True, "pins": True, "problems": []}
+
+    def test_revoke_without_a_state_file_finds_the_bridge_in_the_rules(self, box):
+        desc = descriptor()
+        box.docker(desc, running=("app", "recorder"))
+        box.apply(desc)
+        box.state_file().unlink()
+        box.revoke(RUN)
+        assert box.pins() == ([], [])
 
 
 class TestMain:

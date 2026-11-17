@@ -23,7 +23,7 @@ import sys
 if sys.version_info < (3, 10):
     sys.exit("koi packet test: needs python3 3.10 or newer")
 PY
-for tool in docker nsenter tcpdump conntrack ip ss curl runuser sudo ping; do
+for tool in docker nsenter tcpdump conntrack ip ss curl runuser sudo ping ebtables bridge; do
 	if ! command -v "$tool" >/dev/null; then
 		echo "koi packet test: $tool is not installed" >&2
 		exit 2

@@ -39,11 +39,17 @@ const APP = 'koi-hello-pr-7-aaaaaaaaaaaaaaaa1';
 
 function attestation(changes: Partial<VerifyAttestation> = {}): VerifyAttestation {
 	return {
-		policy: 1,
+		policy: 2,
 		pool: '10.213.0.0/26',
 		ipv4: { chains: true, jump: true, defaults: true, permits: true, problems: [] },
 		ipv6: { defaults: true, problems: [] },
-		sysctl: { br_netfilter: true, bridge_nf_call_iptables: true, bridge_nf_call_ip6tables: true },
+		bridge: { guard: true, pins: true, problems: [] },
+		sysctl: {
+			br_netfilter: true,
+			bridge_nf_call_iptables: true,
+			bridge_nf_call_ip6tables: true,
+			bridge_nf_filter_vlan_tagged: true,
+		},
 		runs: [],
 		...changes,
 	};
@@ -291,7 +297,7 @@ describe('attestation', () => {
 		expect(
 			attestationProblems(
 				attestation({
-					policy: 2,
+					policy: 1,
 					pool: '10.0.0.0/20',
 					ipv4: {
 						chains: true,
@@ -305,12 +311,13 @@ describe('attestation', () => {
 						br_netfilter: true,
 						bridge_nf_call_iptables: false,
 						bridge_nf_call_ip6tables: true,
+						bridge_nf_filter_vlan_tagged: true,
 					},
 				}),
 				'10.213.0.0/26',
 			),
 		).toEqual([
-			'the helper installs policy version 2, and koid expects 1',
+			'the helper installs policy version 1, and koid expects 2',
 			"the helper's pool is 10.0.0.0/20 and KOI_VERIFY_POOL is 10.213.0.0/26; both come from /etc/koi/verify/env",
 			'chain DOCKER-USER has no rule -j KOI-VERIFY',
 			'ip6tables OUTPUT has no rule -o kv+ -j DROP',
@@ -331,6 +338,46 @@ describe('attestation', () => {
 		).toEqual([
 			"the helper's pool is not set and KOI_VERIFY_POOL is 10.213.0.0/26; both come from /etc/koi/verify/env",
 			'br_netfilter is not loaded',
+		]);
+	});
+
+	test('names the layer 2 allowlist, the MAC pins and the VLAN sysctl, and an older helper that says nothing of them', () => {
+		expect(
+			attestationProblems(
+				attestation({
+					bridge: {
+						guard: true,
+						pins: false,
+						problems: [`run ${RUN}: 02:4b:0a:d5:00:03 is not pinned to veth1 on kv0123456789ab`],
+					},
+					sysctl: {
+						br_netfilter: true,
+						bridge_nf_call_iptables: true,
+						bridge_nf_call_ip6tables: true,
+						bridge_nf_filter_vlan_tagged: false,
+					},
+				}),
+				'10.213.0.0/26',
+			),
+		).toEqual([
+			`run ${RUN}: 02:4b:0a:d5:00:03 is not pinned to veth1 on kv0123456789ab`,
+			'net.bridge.bridge-nf-filter-vlan-tagged is not 1',
+		]);
+		const older = parseAttestation(
+			JSON.stringify({
+				...attestation({ policy: 1 }),
+				bridge: undefined,
+				sysctl: {
+					br_netfilter: true,
+					bridge_nf_call_iptables: true,
+					bridge_nf_call_ip6tables: true,
+				},
+			}),
+		);
+		expect(attestationProblems(older, '10.213.0.0/26')).toEqual([
+			'the helper installs policy version 1, and koid expects 2',
+			'the helper does not report the layer 2 allowlist and the MAC pins',
+			'net.bridge.bridge-nf-filter-vlan-tagged is not 1',
 		]);
 	});
 

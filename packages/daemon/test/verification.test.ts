@@ -198,11 +198,17 @@ provenAt: ${AT}
 
 function attestation(pool: string): VerifyAttestation {
 	return {
-		policy: 1,
+		policy: 2,
 		pool,
 		ipv4: { chains: true, jump: true, defaults: true, permits: true, problems: [] },
 		ipv6: { defaults: true, problems: [] },
-		sysctl: { br_netfilter: true, bridge_nf_call_iptables: true, bridge_nf_call_ip6tables: true },
+		bridge: { guard: true, pins: true, problems: [] },
+		sysctl: {
+			br_netfilter: true,
+			bridge_nf_call_iptables: true,
+			bridge_nf_call_ip6tables: true,
+			bridge_nf_filter_vlan_tagged: true,
+		},
 		runs: [],
 	};
 }

@@ -1269,11 +1269,35 @@ snapshot every deploy keeps, and the controller that `koi verify run` drives
   Everything else on a `kv+` bridge is dropped: new connections from the app,
   anything to the host, UDP, DNS, multicast, link-local, invalid packets, and
   all IPv6. Each permit names the run's bridge, the source address and the
-  source MAC, and the source's bridge port once the container runs. The rules
+  source MAC, and the source's bridge port once the container runs. A permit
+  between two containers also names the port the packet must leave by
+  (`--physdev-out`) once the receiving container runs. The rules
   live in three chains, `KOI-VERIFY` (from `DOCKER-USER`, so it sees bridged
   traffic before Docker's own rules), `KOI-VERIFY-IN` (from `INPUT`) and
   `KOI-VERIFY-OUT` (from `OUTPUT`), each ending in default denies. A run's
   permits go above the denies and carry a `koi-run=<runId>` comment.
+- Below iptables, three things keep another container on the bridge from
+  receiving what is meant for an endpoint. First, only plain IPv4 and ARP
+  cross a `kv+` bridge. br_netfilter shows iptables a packet under one VLAN
+  tag only with `net.bridge.bridge-nf-filter-vlan-tagged=1`, and a packet
+  under two tags never, yet the receiving kernel strips tags with VLAN id 0
+  and takes the packet. So ebtables' `FORWARD` jumps first to a chain,
+  `KOI-VERIFY-L2`, that returns IPv4 and ARP and drops everything else:
+  tagged frames, PPPoE and IPv6. The sysctl is on as well. Second, once an
+  endpoint runs, its MAC is a static, sticky entry in the bridge's
+  forwarding table on its own port (`bridge fdb replace <mac> dev <port>
+  master static sticky`). The bridge learns where a MAC is from the source
+  of every frame, ARP included, which iptables never sees, so without the
+  pin a container that sent frames from the recorder's MAC would get the
+  recorder's traffic. A sticky entry does not move. Third, the host keeps
+  the recorder's address at the recorder's MAC as a permanent neighbour
+  (`ip neigh replace ... nud permanent`). An ARP reply cannot change it, so
+  koid's connection to the recorder on TCP 4318 always goes to the recorder's
+  MAC, and from there only to its port. Between containers, an ARP reply can
+  still make the verifier send the recorder's packets to another MAC; the
+  bridge sends them to that container's port, and the permit's
+  `--physdev-out` drops them there. The pins and the neighbour go with
+  `revoke`, and a pin goes with its port when a container stops.
 - koid cannot change iptables, so it asks a root-owned helper,
   `/usr/local/libexec/koi-verify-net` (`host/verify/koi_verify_net.py`,
   Python, standard library only), through `sudo -n`. A sudoers rule lets `koi`
@@ -1283,15 +1307,21 @@ snapshot every deploy keeps, and the controller that `koi verify run` drives
   brings an older layout up to date: it builds a changed chain again beside
   the old one, moves the jump to it, and only then removes the old one, under
   the same lock as the other commands, so kv+ traffic is denied at every
-  instant and a run's permits survive. `apply` takes one JSON descriptor on
+  instant and a run's permits survive. It also puts `KOI-VERIFY-L2` and its
+  jump first in ebtables' `FORWARD` (a changed chain gets the allowlist
+  inserted above what it holds, the drop first), and sets
+  `net.bridge.bridge-nf-filter-vlan-tagged` to 1. koi-firewall runs it at
+  every boot, so both hold across reboots. `apply` takes one JSON descriptor on
   stdin (the run id, bridge, subnet, app port and three endpoints with role,
   container, address and MAC), checks every field against a fixed shape,
   refuses a subnet outside the pool or overlapping another run or a host
   route, checks the Docker network and each endpoint against Docker itself,
   removes the generation an earlier `apply` of the run installed, writes the
-  run's state file and then installs the run's rules as one generation, so
-  the installed rules are ones the state describes at every instant and a
-  crash part way leaves nothing `attest` refuses. The helper binds a permit
+  run's state file, pins each running endpoint's MAC to its port and the
+  recorder's address to its MAC on the host, and then installs the run's
+  rules as one generation, so the installed rules are ones the state
+  describes at every instant and a crash part way leaves nothing `attest`
+  refuses. The helper binds a permit
   to a bridge port only once the container runs, so koid runs `apply` again
   after it starts the recorder, and after each verifier is seen running
   (`VerificationNetwork.reapply`). For a verifier, koid then requires the
@@ -1299,7 +1329,8 @@ snapshot every deploy keeps, and the controller that `koi verify run` drives
   older than koid prints no ports, so its points are blocked until the helper
   is installed again.
   `revoke <runId>` removes
-  that generation and flushes the subnet's conntrack entries; the state file
+  that generation and the pins on the run's bridge, and flushes the subnet's
+  conntrack entries; the state file
   goes only once the flush has succeeded, and a revoke that finds rules
   without a state file records their subnet before it removes any of them.
   Both `apply` and `revoke` first finish or discard a chain swap an
@@ -1310,9 +1341,17 @@ snapshot every deploy keeps, and the controller that `koi verify run` drives
   hold nothing above them but the permits of recorded runs, whether the
   jumps are reached before any rule that could accept kv+ traffic (`FORWARD`
   to `DOCKER-USER`, whose first rule must be the `KOI-VERIFY` jump; the
-  `INPUT` and `OUTPUT` jumps; the IPv6 denies), the bridge filtering
-  sysctls, the runs it holds and the bridge port each endpoint's permits are
-  bound to. Listings are parsed into a canonical form,
+  `INPUT` and `OUTPUT` jumps; the IPv6 denies), whether `KOI-VERIFY-L2` is
+  the allowlist and first in `FORWARD` (`bridge.guard`), whether every
+  endpoint the state calls running has its MAC pinned to its port and the
+  recorder its permanent neighbour, with no pin or permanent neighbour on a
+  `kv+` bridge that no state describes (`bridge.pins`; a port that is gone
+  is not looked for), the bridge filtering sysctls, the runs it holds and
+  the bridge port each endpoint's permits are bound to. A missing chain is
+  one the listing of the whole table does not name: iptables 1.8.10 on
+  kernel 7.0 reports a chain that does not exist as "Incompatible with this
+  kernel" once the filter table has an `OUTPUT` chain, a message it also
+  gives for real errors. Listings are parsed into a canonical form,
   never compared as text:
   `iptables -S` prints a rule in its own order, with a `/32` on a bare
   address, upper case MACs and a quoted comment. Each option's values are
@@ -1327,7 +1366,9 @@ snapshot every deploy keeps, and the controller that `koi verify run` drives
   left through it: the helper's `revoke` also finishes a chain swap an
   interrupted `provision` left, which `attest` reports as a problem until
   then. Only after that does koid judge the policy version, the pool the
-  helper reads, the chains, the IPv6 denies, `br_netfilter` and its sysctls,
+  helper reads, the chains, the IPv6 denies, the layer 2 allowlist and the
+  pins, `br_netfilter` and its sysctls (`bridge-nf-filter-vlan-tagged`
+  among them),
   the slice, `KOI_RECORDER_IMAGE` and that the image is on the box, the
   recorder's seccomp profile, and that Chromium starts with its sandbox in the
   recorder image under the recorder's confinement (a `docker run` of the image
@@ -1355,7 +1396,7 @@ snapshot every deploy keeps, and the controller that `koi verify run` drives
   reports unavailable.
 - The firewall unit koid requires, `koi-firewall.service`, does not depend on
   verification. It installs the preview rules first, and a failure there stops
-  koid. It then loads `br_netfilter`, sets its sysctls and runs the helper's
+  koid. It then loads `br_netfilter`, sets its three sysctls and runs the helper's
   `provision`, and a failure in any of those is logged in the unit's journal
   and does not fail the unit: koid starts, serves previews, and the check above
   reports what is missing. Nothing is left open by that. The denies match only

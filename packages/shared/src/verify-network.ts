@@ -9,7 +9,7 @@ import { VerifyIdSchema } from './verify.ts';
 
 // The version of the helper's rules koid expects. The helper prints its own
 // in attest; another one means the host and koid disagree on the policy.
-export const VERIFY_POLICY_VERSION = 1;
+export const VERIFY_POLICY_VERSION = 2;
 
 // The bridge of a run network: kv and twelve hex digits. Interface names are
 // at most 15 characters, and the firewall's defaults match kv+.
@@ -175,7 +175,12 @@ export type RunNetworkRecord = z.infer<typeof RunNetworkRecordSchema>;
 // more. koid reads the booleans and the problems: chains, that the three
 // chains exist; defaults, that each ends in its default denies; jump, that
 // each is reached before any rule that could let kv+ traffic past; permits,
-// that nothing sits above the denies but the permits of recorded runs.
+// that nothing sits above the denies but the permits of recorded runs;
+// bridge.guard, that only plain IPv4 and ARP cross a kv+ bridge; bridge.pins,
+// that each running endpoint's MAC is pinned to its port and the recorder's
+// address to its MAC on the host, and nothing else is pinned. A helper from
+// before policy 2 prints no bridge and no bridge_nf_filter_vlan_tagged, and
+// koid counts both as missing.
 export const VerifyAttestationSchema = z.object({
 	policy: z.number().int(),
 	pool: z.string().nullable(),
@@ -187,10 +192,14 @@ export const VerifyAttestationSchema = z.object({
 		problems: z.array(z.string()),
 	}),
 	ipv6: z.object({ defaults: z.boolean(), problems: z.array(z.string()) }),
+	bridge: z
+		.object({ guard: z.boolean(), pins: z.boolean(), problems: z.array(z.string()) })
+		.optional(),
 	sysctl: z.object({
 		br_netfilter: z.boolean(),
 		bridge_nf_call_iptables: z.boolean(),
 		bridge_nf_call_ip6tables: z.boolean(),
+		bridge_nf_filter_vlan_tagged: z.boolean().optional(),
 	}),
 	runs: z.array(z.string()),
 	// For each run it holds, the bridge port each endpoint's permits are

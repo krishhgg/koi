@@ -301,17 +301,31 @@ def mac_bytes(mac):
     return bytes(int(b, 16) for b in mac.split(":"))
 
 
-def frame(src_mac, dst_mac, src_ip, dst_ip, proto, payload, vlan0=False):
-    """An Ethernet frame holding one IPv4 packet; with vlan0, an 802.1Q tag with VLAN id 0."""
+# What goes between the MACs and the IPv4 packet. VLAN id 0 is a priority
+# tag, which the receiving kernel strips. qinq and adq are two tags (802.1Q
+# twice, or 802.1ad outside 802.1Q), which br_netfilter never hands to
+# iptables whatever its sysctls say. pppoe is a PPPoE session frame.
+ENCAPS = {
+    "": b"",
+    "vlan0": struct.pack("!HH", 0x8100, 0),
+    "qinq": struct.pack("!HHHH", 0x8100, 0, 0x8100, 0),
+    "adq": struct.pack("!HHHH", 0x88A8, 0, 0x8100, 0),
+}
+
+
+def frame(src_mac, dst_mac, src_ip, dst_ip, proto, payload, encap=""):
+    """An Ethernet frame holding one IPv4 packet, under the tags or the PPPoE header `encap` names."""
     ip_header = struct.pack(
         "!BBHHHBBH4s4s", 0x45, 0, 20 + len(payload), secrets.randbits(16), 0x4000, 64, proto, 0,
         socket.inet_aton(src_ip), socket.inet_aton(dst_ip),
     )
     ip_header = ip_header[:10] + struct.pack("!H", checksum(ip_header)) + ip_header[12:]
     eth = mac_bytes(dst_mac) + mac_bytes(src_mac)
-    if vlan0:
-        eth += struct.pack("!HH", 0x8100, 0)
-    return eth + struct.pack("!H", 0x0800) + ip_header + payload
+    if encap == "pppoe":
+        packet = ip_header + payload
+        # Version and type 1, session 1, the PPP protocol for IPv4.
+        return eth + struct.pack("!HBBHHH", 0x8864, 0x11, 0, 1, len(packet) + 2, 0x0021) + packet
+    return eth + ENCAPS[encap] + struct.pack("!H", 0x0800) + ip_header + payload
 
 
 def l4_checksum(src_ip, dst_ip, proto, segment):
@@ -332,12 +346,12 @@ def udp_datagram(src_ip, dst_ip, sport, dport, data):
 
 
 def parse_ipv4(raw):
-    """(src, dst, proto, l4 bytes) of a frame carrying IPv4, tagged or not, else None."""
+    """(src, dst, proto, l4 bytes) of a frame carrying IPv4, under any number of VLAN tags or none, else None."""
     ethertype = struct.unpack("!H", raw[12:14])[0]
     offset = 14
-    if ethertype == 0x8100:
-        ethertype = struct.unpack("!H", raw[16:18])[0]
-        offset = 18
+    while ethertype in (0x8100, 0x88A8) and len(raw) >= offset + 4:
+        ethertype = struct.unpack("!H", raw[offset + 2: offset + 4])[0]
+        offset += 4
     if ethertype != 0x0800 or len(raw) < offset + 20:
         return None
     ihl = (raw[offset] & 0x0F) * 4
@@ -364,7 +378,7 @@ def probe_forge(args):
     else:
         payload = tcp_syn(args.src_ip, args.dst_ip, sport, args.dport)
         proto = 6
-    raw = frame(args.src_mac, args.dst_mac, args.src_ip, args.dst_ip, proto, payload, vlan0=args.vlan0)
+    raw = frame(args.src_mac, args.dst_mac, args.src_ip, args.dst_ip, proto, payload, encap=args.encap)
     synack = False
     deadline = time.time() + args.timeout
     sent = 0
@@ -388,19 +402,44 @@ def probe_forge(args):
     emit({"sent": sent, "synack": synack})
 
 
+def arp_frame(own_mac, victim_mac, victim_ip, claim_ip, op):
+    """An ARP request (op 1) or reply (op 2) to the victim, saying `claim_ip` is at `own_mac`."""
+    target_mac = b"\0" * 6 if op == 1 else mac_bytes(victim_mac)
+    return (mac_bytes(victim_mac) + mac_bytes(own_mac) + struct.pack("!H", 0x0806)
+            + struct.pack("!HHBBH", 1, 0x0800, 6, 4, op) + mac_bytes(own_mac) + socket.inet_aton(claim_ip)
+            + target_mac + socket.inet_aton(victim_ip))
+
+
 def probe_intercept(args):
-    """Teaches the bridge that MAC `poison` is on this port, then watches for frames carrying `marker`."""
+    """Tries to get frames carrying `marker` sent to this port, then watches for them.
+
+    With --poison, teaches the bridge that that MAC is on this port, with
+    frames from it, ARP among them. With --victim-mac, --victim-ip and
+    --claim, tells the victim that the claimed address is at this
+    interface's own MAC, with ARP requests and replies.
+    """
     s = packet_socket(args.dev)
-    poison = mac_bytes(args.poison)
-    # A frame of a local experimental ethertype, broadcast, from the poisoned MAC.
-    lure = b"\xff" * 6 + poison + struct.pack("!H", 0x88B5) + b"koi-packet-test".ljust(46, b"\0")
+    lures = []
+    if args.poison:
+        poison = mac_bytes(args.poison)
+        # A frame of a local experimental ethertype, broadcast, from the poisoned MAC.
+        lures.append(b"\xff" * 6 + poison + struct.pack("!H", 0x88B5) + b"koi-packet-test".ljust(46, b"\0"))
+        # And a gratuitous ARP from it, which iptables never sees.
+        lures.append(b"\xff" * 6 + poison + struct.pack("!H", 0x0806) + struct.pack("!HHBBH", 1, 0x0800, 6, 4, 1)
+                     + poison + socket.inet_aton(args.poison_ip) + b"\0" * 6 + socket.inet_aton(args.poison_ip))
+    if args.claim:
+        with open(f"/sys/class/net/{args.dev}/address", encoding="ascii") as f:
+            own = f.read().strip()
+        for op in (1, 2):
+            lures.append(arp_frame(own, args.victim_mac, args.victim_ip, args.claim, op))
     deadline = time.time() + args.seconds
     found = None
     last = 0.0
     emit({"ready": True})
     while time.time() < deadline and found is None:
         if time.time() - last > 0.05:
-            s.send(lure)
+            for lure in lures:
+                s.send(lure)
             last = time.time()
         try:
             got = s.recv(65535)
@@ -461,11 +500,15 @@ def probe_main(argv):
     a.add_argument("--dport", type=int, required=True)
     a.add_argument("--dev", default="eth0")
     a.add_argument("--udp", action="store_true")
-    a.add_argument("--vlan0", action="store_true")
+    a.add_argument("--encap", choices=["", "pppoe", *ENCAPS], default="")
     a.add_argument("--token", default="koi-forged")
     a.add_argument("--timeout", type=float, default=PROBE_TIMEOUT)
     a = sub.add_parser("_intercept")
-    a.add_argument("--poison", required=True)
+    a.add_argument("--poison", default="")
+    a.add_argument("--poison-ip", dest="poison_ip", default="0.0.0.0")
+    a.add_argument("--victim-mac", dest="victim_mac", default="")
+    a.add_argument("--victim-ip", dest="victim_ip", default="")
+    a.add_argument("--claim", default="")
     a.add_argument("--marker", required=True)
     a.add_argument("--seconds", type=float, default=6.0)
     a.add_argument("--dev", default="eth0")
@@ -834,7 +877,8 @@ class PacketTest:
         if os.geteuid() != 0:
             raise Abort("run as root")
         self.facts()
-        for tool in ("docker", "iptables-save", "ip6tables-save", "nsenter", "conntrack", "tcpdump", "sudo", "runuser"):
+        for tool in ("docker", "iptables-save", "ip6tables-save", "ebtables", "ebtables-save", "bridge", "nsenter",
+                     "conntrack", "tcpdump", "sudo", "runuser"):
             if shutil.which(tool) is None:
                 raise Abort(f"{tool} is not installed")
         if not os.path.exists(HELPER):
@@ -850,7 +894,7 @@ class PacketTest:
 
     def provision_twice(self):
         def ruleset():
-            text = run(["iptables-save"]).stdout + run(["ip6tables-save"]).stdout
+            text = run(["iptables-save"]).stdout + run(["ip6tables-save"]).stdout + run(["ebtables-save"]).stdout
             return [re.sub(r"\[\d+:\d+\]", "", line) for line in text.splitlines() if not line.startswith("#")]
 
         before = ruleset()
@@ -900,7 +944,7 @@ class PacketTest:
             raise Abort(f"apply of {r.id} failed")
         attest = json.loads(helper("attest").stdout)
         ports = (attest.get("ports") or {}).get(r.id) or {}
-        problems = attest["ipv4"]["problems"] + attest["ipv6"]["problems"]
+        problems = attest["ipv4"]["problems"] + attest["ipv6"]["problems"] + (attest.get("bridge") or {}).get("problems", [])
         bad = [role for role in bound if not isinstance(ports.get(role), str)]
         ok = r.id in attest["runs"] and not problems and not bad
         self.check(f"{label}: apply, attest lists the run, ports bound {list(bound) or 'none'}", "ok",
@@ -1325,15 +1369,15 @@ class PacketTest:
             self.check(f"{role} (its own process) cannot open raw or packet sockets", "eperm",
                        "eperm" if denied else "allowed", json.dumps(res))
 
-    def forge(self, name, src_ip, src_mac, dst_ip, dst_mac, port, target, listener, udp=False, vlan0=False,
+    def forge(self, name, src_ip, src_mac, dst_ip, dst_mac, port, target, listener, udp=False, encap="",
               expect="blocked", known=False):
         """Frames sent by the attacker container; whether they reached the target's interface, and any answer."""
-        # A filter on ports does not see through a VLAN tag, so tagged probes capture everything.
-        stop = self.capture("" if vlan0 else f"dst port {port}", container=target)
+        # A filter on ports does not see through a VLAN tag or PPPoE, so those probes capture everything.
+        stop = self.capture("" if encap else f"dst port {port}", container=target)
         before = counters()
         since = time.time()
         args = ["_forge", "--src-ip", src_ip, "--src-mac", src_mac, "--dst-ip", dst_ip, "--dst-mac", dst_mac,
-                "--dport", str(port)] + (["--udp", "--token", "forged-udp"] if udp else []) + (["--vlan0"] if vlan0 else [])
+                "--dport", str(port)] + (["--udp", "--token", "forged-udp"] if udp else []) + (["--encap", encap] if encap else [])
         res = in_container(self.attacker, *args)
         time.sleep(0.5)
         drops = rose(before, counters())
@@ -1363,6 +1407,7 @@ class PacketTest:
         table and not the firewall.
         """
         a = self.a
+        self.relearn_neighbours()
         for name in (a.app, a.recorder, a.verifier):
             if docker("inspect", "--format", "{{.State.Running}}", name, check=False).stdout.strip() == "true":
                 in_ns(name, "_ping", a.gateway, "--timeout", "0.2")
@@ -1386,14 +1431,28 @@ class PacketTest:
                    ver_mac, 9999, a.verifier, self.l_ver, udp=True)
         # 802.1Q priority-tagged frames (VLAN id 0). The receiving kernel strips
         # such a tag and takes the packet as untagged. br_netfilter hands a
-        # tagged frame to iptables only with bridge-nf-filter-vlan-tagged=1.
+        # frame under one tag to iptables only with
+        # bridge-nf-filter-vlan-tagged=1, and one under two tags never; the
+        # helper's layer 2 allowlist drops both before iptables is asked.
         self.report.note(f"bridge-nf-filter-vlan-tagged={read_sysctl('net.bridge.bridge-nf-filter-vlan-tagged')}")
         self.forge("attacker vlan-0 tagged udp -> recorder udp/9999", self.attacker_ip, self.attacker_mac,
-                   a.recorder_ip, rec_mac, 9999, a.recorder, self.l_rec, udp=True, vlan0=True)
+                   a.recorder_ip, rec_mac, 9999, a.recorder, self.l_rec, udp=True, encap="vlan0")
         self.forge("attacker vlan-0 tagged SYN -> recorder tcp/4318", self.attacker_ip, self.attacker_mac,
-                   a.recorder_ip, rec_mac, 4318, a.recorder, self.l_rec, vlan0=True)
+                   a.recorder_ip, rec_mac, 4318, a.recorder, self.l_rec, encap="vlan0")
         self.forge("attacker vlan-0 tagged SYN forging verifier -> recorder tcp/4318", a.verifier_ip, ver_mac,
-                   a.recorder_ip, rec_mac, 4318, a.recorder, self.l_rec, vlan0=True)
+                   a.recorder_ip, rec_mac, 4318, a.recorder, self.l_rec, encap="vlan0")
+        self.forge("attacker double vlan-0 tagged udp -> recorder udp/9999", self.attacker_ip, self.attacker_mac,
+                   a.recorder_ip, rec_mac, 9999, a.recorder, self.l_rec, udp=True, encap="qinq")
+        self.forge("attacker 802.1ad+802.1Q tagged udp -> recorder udp/9999", self.attacker_ip, self.attacker_mac,
+                   a.recorder_ip, rec_mac, 9999, a.recorder, self.l_rec, udp=True, encap="adq")
+        self.forge("attacker double vlan-0 tagged SYN forging verifier -> recorder tcp/4317", a.verifier_ip, ver_mac,
+                   a.recorder_ip, rec_mac, 4317, a.recorder, self.l_rec, encap="qinq")
+        # A PPPoE session frame: the receiving kernel has no session to take
+        # it into, so even unfiltered it reaches no socket; the allowlist
+        # keeps it off the target's port as well.
+        self.report.note(f"bridge-nf-filter-pppoe-tagged={read_sysctl('net.bridge.bridge-nf-filter-pppoe-tagged')}")
+        self.forge("attacker pppoe udp -> recorder udp/9999", self.attacker_ip, self.attacker_mac,
+                   a.recorder_ip, rec_mac, 9999, a.recorder, self.l_rec, udp=True, encap="pppoe")
 
     def unbound_window(self):
         """Before a container runs, its permits match its address and MAC only (docs/verify.md says so)."""
@@ -1404,21 +1463,45 @@ class PacketTest:
                    known=True)
 
     def interception(self):
-        """A permitted flow's packets go to whichever port the bridge learned the destination MAC on."""
+        """A permitted flow's packets go to whichever port the bridge sends the destination MAC to.
+
+        Two ways to have them sent to the attacker: frames from the
+        destination's MAC, so the bridge learns it on the attacker's port
+        (the pins stop that), and ARP that tells the sender the destination's
+        address is at the attacker's MAC (--physdev-out stops that between
+        containers, the host's permanent neighbour for the host).
+        """
         a = self.a
+        rec_mac, ver_mac = helper_mac(a.recorder_ip), helper_mac(a.verifier_ip)
+        with open(f"/sys/class/net/{a.bridge}/address", encoding="ascii") as f:
+            bridge_mac = f.read().strip()
+        verifier_hold = [*ns_argv(a.verifier), sys.executable, "-I", SELF, "_hold", a.recorder_ip, "4317"]
+        host_hold = ["runuser", "-u", "koi", "--", sys.executable, "-I", self.probe, "_hold", a.recorder_ip, "4318"]
+        poison = ["--poison", rec_mac, "--poison-ip", a.recorder_ip]
+        self.intercept("attacker poisoning the bridge with the recorder's MAC reads verifier -> recorder:4317 data",
+                       verifier_hold, poison)
+        self.intercept("attacker poisoning the bridge with the recorder's MAC reads host as koi -> recorder:4318 data",
+                       host_hold, poison)
+        self.intercept("attacker ARP-claiming the recorder's address to the verifier reads verifier -> recorder:4317",
+                       verifier_hold, ["--victim-mac", ver_mac, "--victim-ip", a.verifier_ip, "--claim", a.recorder_ip])
+        self.intercept("attacker ARP-claiming the verifier's address to the recorder reads the recorder's replies",
+                       verifier_hold, ["--victim-mac", rec_mac, "--victim-ip", a.recorder_ip, "--claim", a.verifier_ip])
+        self.intercept("attacker ARP-claiming the recorder's address to the host reads host as koi -> recorder:4318",
+                       host_hold, ["--victim-mac", bridge_mac, "--victim-ip", a.gateway, "--claim", a.recorder_ip])
+
+    def intercept(self, name, hold_argv, attack):
+        """A held connection sends eight markers while the attacker runs `attack`; whether the attacker saw one."""
         marker = f"koi-secret-{secrets.token_hex(4)}"
-        hold = subprocess.Popen([*ns_argv(a.verifier), sys.executable, "-I", SELF, "_hold", a.recorder_ip, "4317"],
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        hold = subprocess.Popen(hold_argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         first = json.loads(hold.stdout.readline())
         if first.get("result") != "open":
             hold.kill()
-            self.check("attacker poisoning the bridge with the recorder's MAC reads verifier -> recorder:4317 data",
-                       "not-read", "not-run", f"the verifier could not connect: {first}")
+            self.check(name, "not-read", "not-run", f"could not connect: {first}")
             return
         with open(SELF, encoding="utf-8") as f:
             source = f.read()
-        att = subprocess.Popen(["docker", "exec", "-i", self.attacker, "python3", "-I", "-", "_intercept", "--poison",
-                                helper_mac(a.recorder_ip), "--marker", marker, "--seconds", "6"],
+        att = subprocess.Popen(["docker", "exec", "-i", self.attacker, "python3", "-I", "-", "_intercept", *attack,
+                                "--marker", marker, "--seconds", "6"],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         att.stdin.write(source)
         att.stdin.close()
@@ -1442,11 +1525,51 @@ class PacketTest:
         hold.kill()
         hold.wait()
         got = json.loads(out.strip().splitlines()[-1])
-        self.check("attacker poisoning the bridge with the recorder's MAC reads verifier -> recorder:4317 data",
-                   "not-read", "read" if got.get("intercepted") else "not-read",
+        self.check(name, "not-read", "read" if got.get("intercepted") else "not-read",
                    f"connection {first.get('result')}; frame {got.get('frame')}; "
-                   f"verifier got {sum(r.get('result') == 'echo' for r in results)}/8 echoes")
+                   f"sender got {sum(r.get('result') == 'echo' for r in results)}/8 echoes")
         self.relearn()
+
+    def relearn_neighbours(self):
+        """Forgets every neighbour a spoofed ARP may have left: in each container, and on the host for run A's bridge.
+
+        `ip neigh flush` leaves permanent entries, the helper's pin among them.
+        """
+        a = self.a
+        for name in (a.app, a.recorder, a.verifier):
+            if docker("inspect", "--format", "{{.State.Running}}", name, check=False).stdout.strip() == "true":
+                ip_in(name, "neigh", "flush", "all")
+        run(["ip", "neigh", "flush", "dev", a.bridge], check=False)
+
+    def pins(self):
+        """Each running endpoint's MAC is a static sticky entry on its own port, and the recorder's address a permanent neighbour."""
+        a = self.a
+        attest = json.loads(helper("attest").stdout)
+        ports = (attest.get("ports") or {}).get(a.id) or {}
+        entries = json.loads(run(["bridge", "-j", "fdb", "show", "br", a.bridge]).stdout or "[]")
+        bad = []
+        for role, mac in (("app", a.app_mac), ("recorder", helper_mac(a.recorder_ip)), ("verifier", helper_mac(a.verifier_ip))):
+            mine = [e for e in entries if e.get("mac") == mac]
+            if not mine or not all(e.get("ifname") == ports.get(role) and e.get("state") == "static"
+                                   and "sticky" in (e.get("flags") or []) for e in mine):
+                bad.append(f"{role} {mac}: {mine}")
+        neigh = json.loads(run(["ip", "-4", "-j", "neigh", "show", "dev", a.bridge]).stdout or "[]")
+        held = [e for e in neigh if e.get("dst") == a.recorder_ip]
+        if not any(e.get("lladdr") == helper_mac(a.recorder_ip) and "PERMANENT" in (e.get("state") or []) for e in held):
+            bad.append(f"neighbour {a.recorder_ip}: {held}")
+        bridge = attest.get("bridge") or {}
+        ok = not bad and bridge.get("guard") is True and bridge.get("pins") is True
+        self.check("run A: endpoint MACs pinned to their ports, recorder a permanent neighbour, attested", "pinned",
+                   "pinned" if ok else "missing", f"{'; '.join(bad)[:300] or 'fdb and neighbour as wanted'}; attest bridge={bridge}")
+
+    def layer2(self):
+        """The helper's provision left the allowlist in front of ebtables FORWARD and the VLAN sysctl at 1."""
+        listing = run(["ebtables", "-t", "filter", "-L"]).stdout
+        rules = re.findall(r"^(--logical-in kv\+ -j KOI-VERIFY-L2|-p \S+ -j RETURN|-j DROP)$", listing, re.M)
+        vlan = read_sysctl("net.bridge.bridge-nf-filter-vlan-tagged")
+        ok = rules[:1] == ["--logical-in kv+ -j KOI-VERIFY-L2"] and len(rules) >= 4 and vlan == "1"
+        self.check("layer 2 allowlist in ebtables FORWARD, bridge-nf-filter-vlan-tagged=1", "ok", "ok" if ok else "missing",
+                   f"ebtables {rules}; vlan-tagged={vlan}")
 
     def teardown(self):
         """koid's order: revoke, then take the app off the network, remove the helpers and the network."""
@@ -1484,6 +1607,13 @@ class PacketTest:
                  "dropped", self.l_rec)
         left = [line for line in run(["iptables-save"]).stdout.splitlines() if f"koi-run={a.id}" in line]
         self.check("teardown: no rule of the run is left", "none", "none" if not left else f"{len(left)}-left", "iptables-save")
+        static = [e for e in json.loads(run(["bridge", "-j", "fdb", "show", "br", a.bridge]).stdout or "[]")
+                  if e.get("state") == "static"]
+        permanent = [e for e in json.loads(run(["ip", "-4", "-j", "neigh", "show", "dev", a.bridge]).stdout or "[]")
+                     if "PERMANENT" in (e.get("state") or [])]
+        self.check("teardown: the run's MAC pins and the recorder's neighbour are gone", "none",
+                   "none" if not static and not permanent else f"{len(static)}+{len(permanent)}-left",
+                   f"static {[(e.get('mac'), e.get('ifname')) for e in static]}; permanent {[e.get('dst') for e in permanent]}")
         docker("network", "disconnect", a.network, a.app, check=False)
         docker("rm", "--force", "--volumes", a.recorder, a.verifier, self.attacker, check=False)
         rm = docker("network", "rm", a.network, check=False)
@@ -1568,6 +1698,8 @@ class PacketTest:
             self.verifier_listeners_up()
             if self.verbose:
                 self.show_rules()
+            self.layer2()
+            self.pins()
             self.capabilities()
             self.permitted()
             self.denied_inside()

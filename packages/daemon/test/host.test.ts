@@ -285,11 +285,17 @@ describe('verificationCapability', () => {
 		timedOut: false,
 	});
 	const attestation = {
-		policy: 1,
+		policy: 2,
 		pool: '10.213.0.0/20',
 		ipv4: { chains: true, jump: true, defaults: true, permits: true, problems: [] },
 		ipv6: { defaults: true, problems: [] },
-		sysctl: { br_netfilter: true, bridge_nf_call_iptables: true, bridge_nf_call_ip6tables: true },
+		bridge: { guard: true, pins: true, problems: [] },
+		sysctl: {
+			br_netfilter: true,
+			bridge_nf_call_iptables: true,
+			bridge_nf_call_ip6tables: true,
+			bridge_nf_filter_vlan_tagged: true,
+		},
 		runs: [],
 	};
 	const recorderImage = `sha256:${'7'.repeat(64)}`;
@@ -745,7 +751,7 @@ describe('verificationCapability', () => {
 	test('is unavailable when the attestation says the host is not ready, naming everything', async () => {
 		const bad = {
 			...attestation,
-			policy: 2,
+			policy: 1,
 			pool: '10.0.0.0/20',
 			ipv4: {
 				chains: false,
@@ -755,10 +761,16 @@ describe('verificationCapability', () => {
 				problems: ['chain KOI-VERIFY does not exist'],
 			},
 			ipv6: { defaults: false, problems: ['ip6tables INPUT has no rule -i kv+ -j DROP'] },
+			bridge: {
+				guard: false,
+				pins: true,
+				problems: ['ebtables chain KOI-VERIFY-L2 does not exist'],
+			},
 			sysctl: {
 				br_netfilter: true,
 				bridge_nf_call_iptables: false,
 				bridge_nf_call_ip6tables: true,
+				bridge_nf_filter_vlan_tagged: false,
 			},
 		};
 		const result = await verificationCapability(
@@ -769,11 +781,13 @@ describe('verificationCapability', () => {
 		expect(result).toEqual({
 			available: false,
 			reason: [
-				'the helper installs policy version 2, and koid expects 1',
+				'the helper installs policy version 1, and koid expects 2',
 				"the helper's pool is 10.0.0.0/20 and KOI_VERIFY_POOL is 10.213.0.0/20; both come from /etc/koi/verify/env",
 				'chain KOI-VERIFY does not exist',
 				'ip6tables INPUT has no rule -i kv+ -j DROP',
+				'ebtables chain KOI-VERIFY-L2 does not exist',
 				'net.bridge.bridge-nf-call-iptables is not 1',
+				'net.bridge.bridge-nf-filter-vlan-tagged is not 1',
 			].join('; '),
 		});
 	});
@@ -1254,13 +1268,15 @@ describe('host/cloud-init.sh', () => {
 			expect(script).toContain("printf 'br_netfilter\\n' > /etc/modules-load.d/koi-verify.conf");
 			expect(script).toContain('net.bridge.bridge-nf-call-iptables = 1');
 			expect(script).toContain('net.bridge.bridge-nf-call-ip6tables = 1');
+			// A VLAN-tagged frame reaches iptables only with this one on.
+			expect(script).toContain('net.bridge.bridge-nf-filter-vlan-tagged = 1');
 			expect(script).toContain('sysctl -q -p /etc/sysctl.d/90-koi-verify.conf');
 			// And in the firewall unit, which runs before koid.
 			const firewall =
 				/cat > \/usr\/local\/sbin\/koi-firewall <<'FW'\n([\s\S]*?)\nFW\n/.exec(script)?.[1] ?? '';
 			expect(firewall).toContain('modprobe br_netfilter');
 			expect(firewall).toContain(
-				'sysctl -q -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1',
+				'sysctl -q -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 net.bridge.bridge-nf-filter-vlan-tagged=1',
 			);
 		});
 
