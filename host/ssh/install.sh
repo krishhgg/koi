@@ -146,6 +146,12 @@ restore() {
 		printf '%s\n' "$old_previous" > "$OLD_SSHD_CONF"
 	fi
 }
+# sshd -t refuses every configuration while its privilege separation
+# directory is missing. With socket activation (ssh.socket on Ubuntu 24.04)
+# sshd has not run since boot until someone connects, and the directory comes
+# from the service's RuntimeDirectory, so on a box reached only through SSM it
+# is gone after every start. Make it as the service would.
+[ -d /run/sshd ] || install -d -o root -g root -m 0755 /run/sshd
 # The checks, in sshd.sh's order (koi_check_sshd). The files are read as
 # sshd reads them, every Include in sshd's order, before sshd is run on
 # them: the block must be the first Match sshd reads, and no other Match
