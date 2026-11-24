@@ -47,7 +47,8 @@ jobs:
         with:
           bun-version-file: package.json
       - run: bun install --frozen-lockfile
-      # wake.tf zips the built bundle, so validate needs it to exist.
+      # The koi module's wake.tf zips the built bundle, so validate needs it
+      # to exist.
       - run: scripts/build-lambda.sh
       - uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
       - run: tofu fmt -check -recursive infra

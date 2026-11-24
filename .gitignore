@@ -12,6 +12,9 @@ __pycache__/
 
 # OpenTofu
 infra/.terraform/
+# Written by scripts/build-lambda.sh and by the module's archive_file.
+infra/modules/koi/files/handler.mjs
+infra/modules/koi/files/wake.zip
 # Written by infra/bootstrap.sh; the bucket name carries the account id.
 infra/backend.hcl
 infra/.terraform.lock.hcl

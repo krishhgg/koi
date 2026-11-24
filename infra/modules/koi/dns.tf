@@ -3,7 +3,7 @@
 
 resource "aws_route53_record" "wildcard" {
   for_each = toset(["A", "AAAA"])
-  zone_id  = data.aws_route53_zone.root.zone_id
+  zone_id  = local.zone_id
   name     = "*.${var.domain}"
   type     = each.value
 
@@ -16,7 +16,7 @@ resource "aws_route53_record" "wildcard" {
 
 resource "aws_route53_record" "apex" {
   for_each = toset(["A", "AAAA"])
-  zone_id  = data.aws_route53_zone.root.zone_id
+  zone_id  = local.zone_id
   name     = var.domain
   type     = each.value
 
@@ -28,9 +28,16 @@ resource "aws_route53_record" "apex" {
 }
 
 resource "aws_route53_record" "origin" {
-  zone_id = data.aws_route53_zone.root.zone_id
+  zone_id = local.zone_id
   name    = local.origin_host
   type    = "A"
   ttl     = 60
   records = [aws_eip.box.public_ip]
+
+  lifecycle {
+    precondition {
+      condition     = var.create_zone != (var.zone_id != null)
+      error_message = "Set zone_id to the hosted zone of the domain, or create_zone = true; not both."
+    }
+  }
 }

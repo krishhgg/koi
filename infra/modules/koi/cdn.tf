@@ -16,10 +16,14 @@ data "aws_cloudfront_origin_request_policy" "all_viewer_except_host" {
   name = "Managed-AllViewerExceptHostHeader"
 }
 
+# CloudFront takes its certificate from us-east-1 only, so this and its
+# validation use the us_east_1 provider whatever region the box is in.
 resource "aws_acm_certificate" "edge" {
+  provider                  = aws.us_east_1
   domain_name               = "*.${var.domain}"
   subject_alternative_names = [var.domain]
   validation_method         = "DNS"
+  tags                      = var.tags
 
   lifecycle {
     create_before_destroy = true
@@ -36,7 +40,7 @@ resource "aws_route53_record" "acm" {
   }
 
   allow_overwrite = true
-  zone_id         = data.aws_route53_zone.root.zone_id
+  zone_id         = local.zone_id
   name            = each.value.name
   type            = each.value.type
   ttl             = 60
@@ -44,6 +48,7 @@ resource "aws_route53_record" "acm" {
 }
 
 resource "aws_acm_certificate_validation" "edge" {
+  provider                = aws.us_east_1
   certificate_arn         = aws_acm_certificate.edge.arn
   validation_record_fqdns = [for r in aws_route53_record.acm : r.fqdn]
 }
@@ -51,7 +56,7 @@ resource "aws_acm_certificate_validation" "edge" {
 # Lets CloudFront call the wake function's URL with SigV4, so the URL itself
 # is not publicly invokable.
 resource "aws_cloudfront_origin_access_control" "wake" {
-  name                              = "koi-wake"
+  name                              = local.wake_name
   origin_access_control_origin_type = "lambda"
   signing_behavior                  = "always"
   signing_protocol                  = "sigv4"
@@ -62,12 +67,20 @@ locals {
 }
 
 resource "aws_cloudfront_distribution" "edge" {
+  #checkov:skip=CKV_AWS_68:No WAF. The box serves pull-request previews to reviewers, and the managed rule sets would block requests a preview app legitimately makes; koid only counts requests for live previews as activity.
+  #checkov:skip=CKV2_AWS_47:No WAF, as for CKV_AWS_68, so no Log4j rule set either.
+  #checkov:skip=CKV_AWS_86:No access log bucket. Previews are short-lived review builds, and Caddy on the box logs what reaches it.
+  #checkov:skip=CKV_AWS_310:The wake function is the failover: CloudFront serves it on 502 and 504 from the box (custom_error_response below). An origin group cannot carry that.
+  #checkov:skip=CKV_AWS_374:Reviewers may be anywhere; nothing here is region-restricted.
+  #checkov:skip=CKV2_AWS_32:A response headers policy would overwrite the security headers each preview app sets for itself.
+  #checkov:skip=CKV_AWS_305:A reverse proxy for many hostnames has no root object; every path goes to the box.
   enabled         = true
   is_ipv6_enabled = true
-  comment         = "koi previews"
+  comment         = "${var.name_prefix} previews"
   http_version    = "http2and3"
   price_class     = "PriceClass_100"
   aliases         = ["*.${var.domain}", var.domain]
+  tags            = var.tags
 
   origin {
     origin_id   = "box"

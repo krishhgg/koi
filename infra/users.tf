@@ -1,6 +1,8 @@
 # ---------------------------------------------------------------------------
-# koi-cli: what `koi up` needs and nothing else. Its access key is created by
-# infra/bootstrap.sh, outside the state file.
+# koi-cli: what `koi up` needs and nothing else, from the module's operator
+# policy. Its access key is created by infra/bootstrap.sh, outside the state
+# file. Only the personal root has it; an account with Identity Center gives
+# people a permission set with the same policy instead.
 #
 # There is deliberately no deploy user. Any policy broad enough to run
 # `tofu apply` (create roles, attach policies) is broad enough to grant itself
@@ -9,49 +11,13 @@
 # ---------------------------------------------------------------------------
 
 resource "aws_iam_user" "cli" {
+  #checkov:skip=CKV_AWS_273:The personal account has no Identity Center, and `koi up` runs unattended from agents that cannot renew an SSO session. Company roots use the module's operator_policy_json in a permission set instead.
   name = "koi-cli"
 }
 
-data "aws_iam_policy_document" "cli" {
-  statement {
-    sid       = "UploadSource"
-    actions   = ["s3:PutObject"]
-    resources = ["${aws_s3_bucket.uploads.arn}/*"]
-  }
-  statement {
-    sid     = "RunOnBox"
-    actions = ["ssm:SendCommand"]
-    resources = [
-      aws_instance.box.arn,
-      "arn:aws:ssm:${var.region}::document/AWS-RunShellScript",
-    ]
-  }
-  # Command results are not resource-scopable.
-  statement {
-    sid       = "ReadCommandResults"
-    actions   = ["ssm:GetCommandInvocation", "ssm:ListCommandInvocations"]
-    resources = ["*"]
-  }
-  statement {
-    sid       = "StartBox"
-    actions   = ["ec2:StartInstances"]
-    resources = [aws_instance.box.arn]
-  }
-  # Describe calls are not resource-scopable.
-  statement {
-    sid       = "DescribeBox"
-    actions   = ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus", "ssm:DescribeInstanceInformation"]
-    resources = ["*"]
-  }
-  statement {
-    sid       = "PreviewList"
-    actions   = ["ssm:GetParameter"]
-    resources = [aws_ssm_parameter.previews.arn]
-  }
-}
-
 resource "aws_iam_user_policy" "cli" {
+  #checkov:skip=CKV_AWS_40:One user with one narrow policy; a group would add a resource and change nothing it may do.
   name   = "koi-cli"
   user   = aws_iam_user.cli.name
-  policy = data.aws_iam_policy_document.cli.json
+  policy = module.koi.operator_policy_json
 }

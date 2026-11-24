@@ -1,3 +1,8 @@
+# The personal deployment: the koi module (modules/koi) in the account
+# infra/bootstrap.sh runs in, plus the koi-cli user (users.tf). Another root,
+# such as a company's, calls the same module with its own providers, backend
+# and tags (README, "Operating it").
+
 provider "aws" {
   region = var.region
 
@@ -8,44 +13,34 @@ provider "aws" {
   }
 }
 
-data "aws_caller_identity" "current" {}
+# For the ACM certificate, which CloudFront takes from us-east-1 only.
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
 
+  default_tags {
+    tags = {
+      Project = "koi"
+    }
+  }
+}
+
+# The hosted zone was made by hand, outside this state.
 data "aws_route53_zone" "root" {
   name = var.domain
 }
 
-data "aws_vpc" "default" {
-  default = true
-}
-
-data "aws_subnets" "default" {
-  filter {
-    name   = "vpc-id"
-    values = [data.aws_vpc.default.id]
+module "koi" {
+  source = "./modules/koi"
+  providers = {
+    aws           = aws
+    aws.us_east_1 = aws.us_east_1
   }
-  filter {
-    name   = "default-for-az"
-    values = ["true"]
-  }
-}
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-  owners      = ["099720109477"] # Canonical
-
-  filter {
-    name   = "name"
-    values = [var.ubuntu_ami_name]
-  }
-  filter {
-    name   = "state"
-    values = ["available"]
-  }
-}
-
-locals {
-  account_id   = data.aws_caller_identity.current.account_id
-  origin_host  = "origin.${var.domain}"
-  uploads_name = "koi-uploads-${local.account_id}"
-  previews_ssm = "/koi/previews"
+  domain          = var.domain
+  zone_id         = data.aws_route53_zone.root.zone_id
+  instance_type   = var.instance_type
+  root_volume_gb  = var.root_volume_gb
+  ubuntu_ami_name = var.ubuntu_ami_name
+  verify_pool     = var.verify_pool
 }

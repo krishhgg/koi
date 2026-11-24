@@ -1244,7 +1244,10 @@ describe('host/cloud-init.sh', () => {
 			);
 			expect(unit('koid.service')).toContain('EnvironmentFile=-/etc/koi/verify/env');
 			// The infra variable and the provisioning script hand it over like the domain.
-			const box = readFileSync(resolve(import.meta.dir, '../../../infra/box.tf'), 'utf8');
+			const box = readFileSync(
+				resolve(import.meta.dir, '../../../infra/modules/koi/box.tf'),
+				'utf8',
+			);
 			expect(box).toContain(['"KOI_VERIFY_POOL=$', '{var.verify_pool}",'].join(''));
 			const provision = readFileSync(
 				resolve(import.meta.dir, '../../../scripts/provision-host.sh'),
@@ -1252,7 +1255,7 @@ describe('host/cloud-init.sh', () => {
 			);
 			expect(provision).toContain('KOI_VERIFY_POOL=%s');
 			const variables = readFileSync(
-				resolve(import.meta.dir, '../../../infra/variables.tf'),
+				resolve(import.meta.dir, '../../../infra/modules/koi/variables.tf'),
 				'utf8',
 			);
 			expect(variables).toContain('default     = "10.213.0.0/20"');

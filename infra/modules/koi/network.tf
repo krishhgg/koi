@@ -9,9 +9,12 @@ data "aws_ec2_managed_prefix_list" "cloudfront_origin_facing" {
 }
 
 resource "aws_security_group" "box" {
-  name        = "koi-box"
+  #checkov:skip=CKV_AWS_382:Egress is the workload: builds fetch packages and previews call their providers. Previews reach the internet only through the egress proxy inside Docker (host/egress), which is where it is confined.
+  name = local.box_name
+  # Changing the description replaces the group, so it stays as first
+  # written whatever the name prefix.
   description = "koi preview box: HTTPS from CloudFront only"
-  vpc_id      = data.aws_vpc.default.id
+  vpc_id      = local.vpc_id
 
   # The prefix list weighs about 55 rules against the 60-rule default quota,
   # so this group has room for very little else.
@@ -32,7 +35,14 @@ resource "aws_security_group" "box" {
     ipv6_cidr_blocks = ["::/0"]
   }
 
-  tags = {
-    Name = "koi-box"
+  tags = merge(var.tags, {
+    Name = local.box_name
+  })
+
+  lifecycle {
+    precondition {
+      condition     = (var.vpc_id == null) == (var.subnet_id == null)
+      error_message = "Set vpc_id and subnet_id together, or neither for the default VPC."
+    }
   }
 }
