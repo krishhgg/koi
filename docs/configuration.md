@@ -253,7 +253,10 @@ The installer changes the machine as `host/cloud-init.sh` changes the AWS box
 (see Trust model and limits in the README): it sets Docker's default cgroup
 parent to `koi.slice`, which puts every container on the machine under koi's
 memory ceiling and restarts Docker once, adds iptables rules, and runs Caddy
-on port 443. Give it a machine, or a VM, of its own.
+on port 443. Give it a machine, or a VM, of its own. It stops before changing
+anything on a machine that already has a Caddy it did not set up: an
+`/etc/caddy/Caddyfile`, the `caddy` package, or a `caddy.service` that runs
+another config. Its setup would replace that unit and remove that file.
 
 When it finishes, the installer prints what is left to do once: the DNS record
 or `/etc/hosts` lines, the CA, the ports, and for an SSH host the key to

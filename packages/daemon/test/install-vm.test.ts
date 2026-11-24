@@ -74,6 +74,8 @@ async function run(b: Box, body: string, stubs = '') {
 			`CADDY_DIR='${b.dir}/etc/koi/caddy'`,
 			`CADDY_ENV='${b.dir}/etc/koi/caddy/env'`,
 			`DNS_FILE='${b.dir}/etc/koi/caddy/dns.caddy'`,
+			`STOCK_CADDYFILE='${b.dir}/etc/caddy/Caddyfile'`,
+			`CADDY_UNIT='${b.dir}/etc/systemd/system/caddy.service'`,
 			`calls='${b.calls}'`,
 			`printf 'ID=ubuntu\\nVERSION_ID="24.04"\\n' > "$OS_RELEASE"`,
 			'id() { case "$1" in -u) echo 0 ;; alice | bob) return 0 ;; *) return 1 ;; esac; }',
@@ -86,6 +88,8 @@ async function run(b: Box, body: string, stubs = '') {
 			'journalctl() { echo "journalctl $*" >> "$calls"; echo "koid: the box is not provisioned"; }',
 			'curl() { echo "curl $*" >> "$calls"; }',
 			'sleep() { :; }',
+			// No caddy package; a test that wants one says so.
+			'dpkg-query() { return 1; }',
 			stubs,
 			body,
 		].join('\n'),
@@ -344,6 +348,45 @@ describe('host/install-vm.sh, run whole', () => {
 		expect(r.code).toBe(1);
 		expect(r.stderr).toContain("there is no account 'mallory' on this host");
 		expect(r.calls).toEqual([]);
+	});
+
+	test('leaves a Caddy that koi did not set up alone, before anything is changed', async () => {
+		for (const [setup, why] of [
+			[
+				'mkdir -p "$(dirname "$STOCK_CADDYFILE")" && echo \':80\' > "$STOCK_CADDYFILE"',
+				'/etc/caddy/Caddyfile is there',
+			],
+			[
+				// biome-ignore lint/suspicious/noTemplateCurlyInString: bash's syntax, not a template of this file
+				'dpkg-query() { [ "$*" = \'-W -f=${db:Status-Status} caddy\' ] && echo installed; }',
+				'the caddy package is installed',
+			],
+			[
+				'mkdir -p "$(dirname "$CADDY_UNIT")" && printf \'[Service]\\nExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile\\n\' > "$CADDY_UNIT"',
+				'/etc/systemd/system/caddy.service runs another config',
+			],
+		] as const) {
+			const b = await box();
+			const r = await run(b, `${setup}\nmain --local`);
+			expect([setup, r.code, r.calls]).toEqual([setup, 1, []]);
+			expect(r.stderr).toContain('this machine has a Caddy that koi did not set up (');
+			expect(r.stderr).toContain(`${why}). koi's setup replaces caddy.service`);
+			expect(r.stderr).toContain('install koi in a VM instead');
+		}
+	});
+
+	test("runs again on a koi host, whose Caddy is koi's", async () => {
+		const b = await box();
+		await mkdir(join(b.dir, 'etc/systemd/system'), { recursive: true });
+		await writeFile(
+			join(b.dir, 'etc/systemd/system/caddy.service'),
+			'[Service]\nExecStart=/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile\n',
+		);
+		// A package removed with its files left is not a Caddy that runs.
+		const r = await run(b, 'main --local', 'dpkg-query() { echo config-files; }');
+		expect(r.stderr).toBe('');
+		expect(r.code).toBe(0);
+		expect(r.calls).toContain('systemctl restart koid.service');
 	});
 
 	test('a koid that never answers fails the install with its log', async () => {

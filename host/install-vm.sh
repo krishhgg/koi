@@ -33,6 +33,10 @@ EGRESS_ENV=/etc/koi/egress/env
 CADDY_DIR=/etc/koi/caddy
 CADDY_ENV=$CADDY_DIR/env
 DNS_FILE=$CADDY_DIR/dns.caddy
+# A Caddy set up by something other than koi: the package's Caddyfile, and
+# the unit cloud-init.sh replaces.
+STOCK_CADDYFILE=/etc/caddy/Caddyfile
+CADDY_UNIT=/etc/systemd/system/caddy.service
 # Where Caddy keeps its own CA's root (XDG_DATA_HOME=/var/lib in its unit).
 CADDY_ROOT=/var/lib/caddy/pki/authorities/local/root.crt
 KOID_HEALTH=http://127.0.0.1:7777/__koi/health
@@ -129,6 +133,28 @@ check_bundle() {
 	done
 	(cd "$BUNDLE" && sha256sum --strict --quiet -c SHA256SUMS) ||
 		die "the bundle in $BUNDLE does not match its SHA256SUMS; copy it again"
+}
+
+# cloud-init.sh replaces caddy.service and removes /etc/caddy/Caddyfile, so on
+# a machine that runs a Caddy for something else it would take that Caddy
+# over. A Caddy koi set up has neither that file nor the package, and its unit
+# runs koid's Caddyfile, so a run again goes on.
+check_caddy() {
+	local found=''
+	if [ -e "$STOCK_CADDYFILE" ]; then
+		found="$STOCK_CADDYFILE is there"
+	else
+		case $(dpkg-query -W -f='${db:Status-Status}' caddy 2>/dev/null) in
+		'' | not-installed | config-files) ;;
+		*) found='the caddy package is installed' ;;
+		esac
+	fi
+	if [ -z "$found" ] && [ -e "$CADDY_UNIT" ] &&
+		! grep -qF -- '--config /var/lib/koi-caddy/Caddyfile' "$CADDY_UNIT"; then
+		found="$CADDY_UNIT runs another config"
+	fi
+	[ -z "$found" ] ||
+		die "this machine has a Caddy that koi did not set up ($found). koi's setup replaces caddy.service and removes /etc/caddy/Caddyfile, which would take that Caddy down; install koi in a VM instead"
 }
 
 # host/cloud-init.sh as the AWS box gets it, with the host's own TLS mode
@@ -300,6 +326,7 @@ main() {
 	check_platform
 	check_bundle
 	check_users
+	check_caddy
 	provision
 	install_bundle
 	write_dns_files
