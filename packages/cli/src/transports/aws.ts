@@ -198,7 +198,7 @@ export async function resolveSettings(
 }
 
 // AWS-RunShellScript ends the standard error of a command that exits non-zero
-// with its own line, "failed to run commands: exit status N". It is not
+// (and only then) with its own line, "failed to run commands: exit status N". It is not
 // koid's: left in, koid's JSON error no longer parses (ctlErrorText) and
 // "no such preview" no longer reads as itself. The exit status is in
 // ResponseCode already.
@@ -293,7 +293,8 @@ export function awsTransport(
 					`the output of koid ctl ${args[0] ?? ''} was cut off by SSM, which returns only the first ${SSM_STDOUT_LIMIT} characters, so koi cannot use it`,
 				);
 			}
-			return { code, stdout, stderr: withoutSsmStatus(out.StandardErrorContent ?? '') };
+			const stderr = out.StandardErrorContent ?? '';
+			return { code, stdout, stderr: code === 0 ? stderr : withoutSsmStatus(stderr) };
 		}
 		throw new BoxUnavailableError(`koid ctl ${args[0] ?? ''} did not finish`);
 	};
