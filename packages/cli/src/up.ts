@@ -272,21 +272,34 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 
 		const buildMs =
 			limits.buildTimeoutMinutes * 60_000 + limits.healthTimeoutSeconds * 1000 + BUILD_MARGIN_MS;
-		const { record, deployment } = await follow(label, request.id, buildMs, deps);
+		const followed = await follow(label, request.id, buildMs, deps);
+		const record = followed?.record;
+		const deployment = followed?.deployment;
+		const error =
+			record === undefined
+				? `${label} was removed by koi down while koi up waited for its build`
+				: record.error;
 		const result: UpResult = {
 			schemaVersion: 1,
 			label,
 			url,
-			status: record.status === 'running' ? 'running' : 'failed',
+			status: record?.status === 'running' ? 'running' : 'failed',
 			commit,
 			...(options.pr !== undefined ? { pr: options.pr } : {}),
 			...(merge !== undefined ? { merge } : {}),
 			...(deployment !== undefined ? { deployment } : {}),
-			...(record.loginKey !== undefined ? { loginKey: record.loginKey } : {}),
+			...(record?.loginKey !== undefined ? { loginKey: record.loginKey } : {}),
 			keysUrl: keysPageUrl(deps.domain, label),
-			...(record.error !== undefined ? { error: record.error } : {}),
+			...(error !== undefined ? { error } : {}),
 		};
-		if (options.comment && options.pr !== undefined && ownerRepo !== undefined) {
+		// No comment on a preview koi down removed: whoever removed it meant
+		// to, and a comment that GitHub refused would lose this result.
+		if (
+			options.comment &&
+			options.pr !== undefined &&
+			ownerRepo !== undefined &&
+			record !== undefined
+		) {
 			result.comment = await deps.github(ownerRepo).upsertComment(
 				options.pr,
 				commentMarker(label),
@@ -452,26 +465,26 @@ function noBaseBranch(): string {
 
 // Polls the preview's status until this request has finished, passing along
 // its build log, and returns the record and the identity of the deployment
-// then serving. The first poll learns which attempt at the request koid is
-// on. Each poll after asks for the lines of that attempt's log from where the
-// last page ended (koid's `next`), so no line is skipped or shown twice
-// however many arrive between polls, and no other request's line is shown.
-// Until the build opens its log there are no lines. When koid builds this
-// request again, the new attempt's log is shown from its start.
+// then serving, or undefined when koi down removed the preview first. The
+// first poll learns which attempt at the request koid is on. Each poll after
+// asks for the lines of that attempt's log from where the last page ended
+// (koid's `next`), so no line is skipped or shown twice however many arrive
+// between polls, and no other request's line is shown. Until the build opens
+// its log there are no lines. When koid builds this request again, the new
+// attempt's log is shown from its start.
 //
 // An attempt may wait QUEUE_WAIT_MS in koid's queue, then buildMs from when
 // koi first sees it out of the queue. Time spent behind other builds does not
 // count against the build's own limit.
 //
 // A status read that fails in a way that can pass is tried again, for up to
-// STATUS_RETRY_MS. Any other failure, such as koid no longer having the
-// preview, ends the wait.
+// STATUS_RETRY_MS. Any other failure ends the wait.
 async function follow(
 	label: string,
 	id: string,
 	buildMs: number,
 	deps: UpDeps,
-): Promise<Pick<StatusReply, 'record' | 'deployment'>> {
+): Promise<Pick<StatusReply, 'record' | 'deployment'> | undefined> {
 	let attempt: string | undefined;
 	let next = 0;
 	let wait = true;
@@ -489,6 +502,7 @@ async function follow(
 			label,
 			attempt === undefined ? ['status', label] : ['status', label, attempt, String(next)],
 		);
+		if ('removed' in read) return undefined;
 		if ('unavailable' in read) {
 			failing = { since: failing?.since ?? deps.now().getTime(), why: read.unavailable };
 			if (deps.now().getTime() - failing.since > STATUS_RETRY_MS) {
@@ -551,13 +565,15 @@ async function follow(
 	}
 }
 
-// One status read: koid's reply, or why it could not be had this time.
-// Throws on a failure that asking again will not fix.
+// One status read: koid's reply, why it could not be had this time, or that
+// the preview is gone. koid recorded the request before it accepted it, and
+// only koi down removes a record. Throws on a failure that asking again will
+// not fix.
 async function readStatus(
 	box: Box,
 	label: string,
 	args: string[],
-): Promise<{ reply: StatusReply } | { unavailable: string }> {
+): Promise<{ reply: StatusReply } | { unavailable: string } | { removed: true }> {
 	let r: CtlResult;
 	try {
 		r = await box.ctl(args);
@@ -568,11 +584,8 @@ async function readStatus(
 	if (r.code === CTL_EXIT.unavailable) return { unavailable: ctlErrorText(r) };
 	if (r.code !== CTL_EXIT.ok) {
 		const why = ctlErrorText(r) || `koid ctl status exited ${r.code}`;
-		throw new Error(
-			why === NO_SUCH_PREVIEW
-				? `koid no longer has ${label}; someone may have removed it with koi down`
-				: `stopped following ${label}: ${why}`,
-		);
+		if (why === NO_SUCH_PREVIEW) return { removed: true };
+		throw new Error(`stopped following ${label}: ${why}`);
 	}
 	return { reply: StatusReplySchema.parse(JSON.parse(r.stdout)) };
 }

@@ -580,8 +580,7 @@ describe('up from the working tree', () => {
 		expect(clients.commands).toEqual([]);
 	});
 
-	test('stops at once when koid no longer has the preview', async () => {
-		// As when someone runs koi down for the label during the build.
+	test('ends failed at once when koi down removes the preview during the build', async () => {
 		const r = await upThroughKoid(
 			async (k) => {
 				k.record = previewRecord({
@@ -596,9 +595,12 @@ describe('up from the working tree', () => {
 				if (read === 2) k.record = undefined;
 			},
 		);
-		expect(r.error?.message).toMatch(
-			/^koid no longer has hello-feature-x-[a-z]{8}; someone may have removed it with koi down$/,
+		expect(r.error).toBeUndefined();
+		expect(r.result?.status).toBe('failed');
+		expect(r.result?.error).toMatch(
+			/^hello-feature-x-[a-z]{8} was removed by koi down while koi up waited for its build$/,
 		);
+		expect(r.result?.deployment).toBeUndefined();
 		expect(r.lines).toEqual(['step 1']);
 		expect(r.polls).toHaveLength(4);
 	});
@@ -1375,6 +1377,24 @@ describe('up --pr against a real origin', () => {
 		expect(builtFrom(await up({ pr: 7, comment: true, head: true }, dh.d))).toBe(asPushed);
 		expect(dh.progress).toContain(`building ${asPushed}`);
 		expect(bodies[1]).toContain(`Built from ${asPushed}.`);
+	});
+
+	test('posts no comment for a preview koi down removed during the build', async () => {
+		const o = await pullRequestOrigin();
+		const fb = running(o.merge7);
+		// koid's answer to a status read once the record is gone. The
+		// github above throws on any comment.
+		const box: Box = {
+			...fb.box,
+			ctl: async (args) =>
+				args[0] === 'status'
+					? { code: 1, stdout: '', stderr: '{"error":"no such preview"}' }
+					: fb.box.ctl(args),
+		};
+		const result = await up({ pr: 7, comment: true }, run(o, box));
+		expect(result.status).toBe('failed');
+		expect(result.error).toMatch(/was removed by koi down while koi up waited for its build$/);
+		expect(result.comment).toBeUndefined();
 	});
 
 	test('stops before uploading when origin has no such pull request', async () => {

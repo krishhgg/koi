@@ -14,8 +14,12 @@ export interface ExecOptions {
 	onLine?: (line: string, stream: 'stdout' | 'stderr') => void;
 	// Written to the process's stdin, which is then closed.
 	stdin?: string | Uint8Array;
-	// Kills the process when aborted.
+	// Ends the process when aborted: SIGTERM, then SIGKILL if it has not
+	// exited after abortGraceMs. SIGTERM first because the docker CLI ends a
+	// plugin such as buildx only when it gets to handle the signal; killed
+	// outright, it can leave buildx building with the output pipes open.
 	signal?: AbortSignal | undefined;
+	abortGraceMs?: number;
 	// Keeps all of each stream, up to this many bytes. When a stream passes
 	// it, the process is killed and exec throws an ExecError, so the caller
 	// never gets part of the output as if it were all of it.
@@ -23,6 +27,10 @@ export interface ExecOptions {
 }
 
 const KEEP_BYTES = 256 * 1024;
+
+// How long an aborted process has to exit after SIGTERM, as docker stop
+// gives a container.
+const ABORT_GRACE_MS = 10_000;
 
 // maxBytes for a command whose output koid parses whole.
 export const WHOLE_OUTPUT = 32 * 1024 ** 2;
@@ -46,7 +54,14 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 					timedOut = true;
 					proc.kill('SIGKILL');
 				}, options.timeoutMs);
-	const abort = () => proc.kill('SIGKILL');
+	let killer: ReturnType<typeof setTimeout> | undefined;
+	const abort = () => {
+		// The grace below replaces the time limit: its SIGKILL could cut
+		// the shutdown short.
+		if (timer !== undefined) clearTimeout(timer);
+		proc.kill('SIGTERM');
+		killer = setTimeout(() => proc.kill('SIGKILL'), options.abortGraceMs ?? ABORT_GRACE_MS);
+	};
 	if (options.signal?.aborted) abort();
 	options.signal?.addEventListener('abort', abort, { once: true });
 	const onLine = options.onLine;
@@ -78,6 +93,7 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 		return result;
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
+		if (killer !== undefined) clearTimeout(killer);
 		options.signal?.removeEventListener('abort', abort);
 	}
 }

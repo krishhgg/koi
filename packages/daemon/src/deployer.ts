@@ -349,6 +349,11 @@ export class Deployer {
 	// Changed only under visitWrites.
 	private readonly renewals = new Map<string, number>();
 	private readonly unchecked = new Map<string, number[]>();
+	// The build of each label under way, for koi down to stop. buildQueue
+	// runs one build of a label at a time, so a label has at most one. A
+	// build leaves this at its cutover: what it does after that only tidies
+	// up, and koi down removes the preview as it does any other.
+	private readonly building = new Map<string, AbortController>();
 
 	constructor(private readonly deps: DeployerDeps) {}
 
@@ -481,6 +486,13 @@ export class Deployer {
 		const { deps } = this;
 		const { request } = accepted;
 		const { label, id } = request;
+		// Aborted when koi down removes the preview. The docker build and the
+		// health check end at once; any other step runs to its end, and the
+		// docker build, the health check or a read of the record (latest,
+		// cutover) after it stops the build.
+		const stop = new AbortController();
+		const { signal } = stop;
+		this.building.set(label, stop);
 		// The claim up() took on the upload. Released once the source is
 		// copied into the build directory, or when the attempt ends before
 		// that, so the store may drop the entry. Every way out of this
@@ -558,6 +570,7 @@ export class Deployer {
 				labels: { 'koi.preview': label, 'koi.request': id },
 				timeoutMs: plan.buildTimeoutMinutes * 60_000,
 				onLine: (line) => log.line(line),
+				signal,
 			});
 			const user = chooseUser(plan.user, await deps.docker.imageUser(image));
 			const imageDigest = await deps.docker.imageDigest(image);
@@ -591,7 +604,13 @@ export class Deployer {
 				}),
 			);
 			await this.setStatus(label, attempt, 'starting');
-			await this.waitHealthy(container, plan.port, plan.healthPath, plan.healthTimeoutSeconds);
+			await this.waitHealthy(
+				container,
+				plan.port,
+				plan.healthPath,
+				plan.healthTimeoutSeconds,
+				signal,
+			);
 			// Before the cutover, and before the work directory goes: what a
 			// verification run of this deployment will read. A failure here is
 			// logged, not fatal: the deployment serves, and a run of it is
@@ -625,13 +644,18 @@ export class Deployer {
 				env,
 				deployedAt: this.iso(),
 			};
-			await this.lifecycle.run(label, () =>
-				this.cutover(label, attempt, deployment, log, plan.loginKeyEnv !== undefined),
-			);
+			await this.lifecycle.run(label, async () => {
+				await this.cutover(label, attempt, deployment, log, plan.loginKeyEnv !== undefined);
+				// Deployed: koi down no longer has a build to stop.
+				this.building.delete(label);
+			});
 			await deps.docker
 				.pruneBuildCache(BUILD_CACHE_LIMIT)
 				.catch((err: unknown) => deps.log(`pruning the build cache: ${message(err)}`));
-		} catch (err) {
+		} catch (caught) {
+			// A step koi down stopped fails with an error of its own (docker
+			// buildx killed, say); the abort's reason says what happened.
+			const err: unknown = signal.aborted ? signal.reason : caught;
 			// Masked before the record keeps it: health-check failures carry
 			// the container's own output.
 			const reason = redact(message(err));
@@ -662,6 +686,7 @@ export class Deployer {
 				triedImage ? image : undefined,
 			).catch((e: unknown) => deps.log(`sync after build ${id} for ${label}: ${message(e)}`));
 		} finally {
+			this.building.delete(label);
 			await releaseUpload();
 			clearInterval(awake);
 			await opened
@@ -919,7 +944,14 @@ export class Deployer {
 		}
 	}
 
-	private async waitHealthy(container: string, port: number, path: string, timeoutSeconds: number) {
+	// `signal`, when given, ends the wait with its reason.
+	private async waitHealthy(
+		container: string,
+		port: number,
+		path: string,
+		timeoutSeconds: number,
+		signal?: AbortSignal,
+	) {
 		const { deps } = this;
 		const deadline = deps.now().getTime() + timeoutSeconds * 1000;
 		// A slow start can outlast the idle limit, and nothing routes the
@@ -927,6 +959,7 @@ export class Deployer {
 		// awake.
 		let awakeAt = deps.now().getTime();
 		for (;;) {
+			signal?.throwIfAborted();
 			if (deps.now().getTime() - awakeAt >= 30_000) {
 				awakeAt = deps.now().getTime();
 				await deps.keepAwake();
@@ -1251,6 +1284,12 @@ export class Deployer {
 	// them: whatever carries the label once its record is gone is left over,
 	// from this or an earlier removal or expiry. A preview under a lease is
 	// refused unless `force` is set: a run holds it.
+	//
+	// A build of the label under way is stopped (see build): it records and
+	// routes nothing, removes what it made, and frees its slot. down does not
+	// wait for that: the build may be in a step that ends on its own, and it
+	// takes the lifecycle lock for its cutover. A build still queued finds
+	// the record gone when its turn comes, and skips itself.
 	async down(label: string, options: { force?: boolean } = {}): Promise<boolean> {
 		return this.lifecycle.run(label, async () => {
 			const { docker, store } = this.deps;
@@ -1262,6 +1301,10 @@ export class Deployer {
 				);
 			}
 			if (record !== undefined) await store.remove(label);
+			// Once the record is gone, so that the build finds it gone at every
+			// later step. What the build made goes with what is listed below,
+			// or with the build's own discard if it made it after that.
+			this.building.get(label)?.abort(new Superseded('koi down removed the preview'));
 			const leftovers = leftoversOf(record?.deployment);
 			for (const c of await docker.list()) {
 				if (c.label === label) leftovers.containers.push(c.name);

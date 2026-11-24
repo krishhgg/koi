@@ -1881,6 +1881,99 @@ describe('down', () => {
 		expect(t.lastRoutes()).toEqual([]);
 		expect(await t.deployer.down('hello-pr-7')).toBe(false);
 	});
+
+	test('stops a docker build in progress, which frees its slot and leaves nothing behind', async () => {
+		const t = await setup();
+		// The first build runs until something ends it.
+		const building = new Gate();
+		t.docker.onBuild = () => {
+			t.docker.onBuild = undefined;
+			return building.pass();
+		};
+		t.addRequest(request());
+		await t.deployer.up('aaaaaaaaaaaaaaaa1');
+		await building.reached;
+		const stopped = await t.store.get('hello-pr-7');
+		expect(stopped?.status).toBe('building');
+		// A retry of the label waits behind it, and another preview waits for
+		// the slot it holds.
+		const retry = request({ id: 'bbbbbbbbbbbbbbbb2' });
+		t.addRequest(retry);
+		expect(await t.deployer.up(retry.id)).toEqual({ label: 'hello-pr-7', queued: true });
+		const other = request({ id: 'oooooooooooooooo9', label: 'other', pr: 8 });
+		t.addRequest(other);
+		expect(await t.deployer.up(other.id)).toEqual({ label: 'other', queued: true });
+		expect(await t.deployer.down('hello-pr-7')).toBe(true);
+		await eventually(() => t.docker.builds[0]?.signal?.aborted === true);
+		// The other preview gets the slot and deploys.
+		await t.deployer.settled('other');
+		expect((await t.store.get('other'))?.status).toBe('running');
+		await t.deployer.settled('hello-pr-7');
+		// Neither request of the label wrote its record back, built again,
+		// started a container or left an image, and both let go of their
+		// uploads.
+		expect(await t.store.get('hello-pr-7')).toBeUndefined();
+		expect(t.docker.builds.map((b) => b.labels['koi.preview'])).toEqual(['hello-pr-7', 'other']);
+		expect(t.docker.runs.map((r) => r.labels['koi.preview'])).toEqual(['other']);
+		expect([...t.docker.images].filter((i) => i.startsWith('koi-preview/hello-pr-7:'))).toEqual([]);
+		expect(t.lastRoutes().map((r) => r.label)).toEqual(['other']);
+		expect(t.uploadEvents).toContain('release aaaaaaaaaaaaaaaa1');
+		expect(t.uploadEvents).toContain('release bbbbbbbbbbbbbbbb2');
+		expect(t.logs).toContain(
+			'build bbbbbbbbbbbbbbbb2 for hello-pr-7: superseded before it started',
+		);
+		// The build that was stopped says why in its log.
+		expect(await readFile(logPath(t.stateDir, stopped), 'utf8')).toContain(
+			'superseded: koi down removed the preview',
+		);
+		expect(await readdir(join(t.stateDir, 'builds', 'hello-pr-7'))).toEqual([]);
+	});
+
+	test('stops a build in its health check', async () => {
+		const t = await setup();
+		t.setHealthy(() => false);
+		const probing = t.hold('probe');
+		t.addRequest(request());
+		await t.deployer.up('aaaaaaaaaaaaaaaa1');
+		await probing.reached;
+		const record = await t.store.get('hello-pr-7');
+		expect(record?.status).toBe('starting');
+		expect(await t.deployer.down('hello-pr-7')).toBe(true);
+		probing.release();
+		await t.deployer.settled('hello-pr-7');
+		expect(await t.store.get('hello-pr-7')).toBeUndefined();
+		expect(t.docker.containers.size).toBe(0);
+		expect(t.docker.images.size).toBe(0);
+		expect(t.lastRoutes()).toEqual([]);
+		// Ended by koi down, not by its container going.
+		const log = await readFile(logPath(t.stateDir, record), 'utf8');
+		expect(log).toContain('superseded: koi down removed the preview');
+		expect(log).not.toContain('the container stopped before it answered');
+	});
+
+	test('drops a request still queued behind another preview', async () => {
+		const t = await setup();
+		// Another preview's build holds the slot.
+		const gate = t.hold('keepAwake');
+		t.addRequest(request({ id: 'oooooooooooooooo9', label: 'other', pr: 8 }));
+		await t.deployer.up('oooooooooooooooo9');
+		await gate.reached;
+		t.addRequest(request());
+		expect(await t.deployer.up('aaaaaaaaaaaaaaaa1')).toEqual({
+			label: 'hello-pr-7',
+			queued: true,
+		});
+		expect(await t.deployer.down('hello-pr-7')).toBe(true);
+		gate.release();
+		await t.deployer.settled('other');
+		await t.deployer.settled('hello-pr-7');
+		expect(await t.store.get('hello-pr-7')).toBeUndefined();
+		expect(t.docker.builds.map((b) => b.labels['koi.preview'])).toEqual(['other']);
+		expect(t.uploadEvents).toContain('release aaaaaaaaaaaaaaaa1');
+		expect(t.logs).toContain(
+			'build aaaaaaaaaaaaaaaa1 for hello-pr-7: superseded before it started',
+		);
+	});
 });
 
 describe('reconcile', () => {
