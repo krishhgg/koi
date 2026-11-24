@@ -64,7 +64,9 @@ objects, with no system or global git config, no work tree, index or
 renames on, a rename limit of 7,000). Attributes come from the `.gitattributes` files in
 the base's tree and nowhere else (`git --attr-source=<base>`), as `git merge` reads them
 with the base checked out in a fresh clone, and no merge driver runs. So the same two
-parents give the same tree on any machine. GitHub merges with the same algorithm, but
+parents give the same tree on any machine. A shallow checkout that has both tips but
+not the commit they share is deepened from origin, 100, 1,000 and 10,000 commits at a
+time and then whole, for up to 10 minutes. GitHub merges with the same algorithm, but
 may read attributes from elsewhere, and LFS or union settings can make its tree differ
 from koi's; koi does not promise the same tree as GitHub's.
 

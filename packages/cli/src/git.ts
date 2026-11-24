@@ -32,9 +32,11 @@ export interface Git {
 	// Merges a pull request's head into a base commit, as GitHub makes
 	// refs/pull/N/merge, when the two merge cleanly: the commit, made as
 	// localMerge describes, or the files that conflict. The merge reads
-	// nothing of the checkout but its objects (see mergeIsolated). Throws
-	// when git cannot merge them at all: a git older than 2.40, or a head and
-	// base with no commit in common.
+	// nothing of the checkout but its objects (see mergeIsolated). A shallow
+	// checkout that lacks the commit the two have in common is deepened from
+	// origin until it has it (see DEEPEN_STEPS). Throws when git cannot merge
+	// them at all: a git older than 2.40, or a head and base with no commit
+	// in common.
 	mergeCommit(base: string, head: string): Promise<{ commit: string } | { conflicts: string[] }>;
 	// An uncompressed tar of a commit's tree.
 	archive(commit: string, out: string): Promise<void>;
@@ -212,10 +214,17 @@ export function cliGit(
 				)
 			).split('\n');
 			const format = (await git('rev-parse', '--show-object-format')).trim();
+			const deepen = async (step: number | 'all', timeoutMs: number) => {
+				// By commit, so that the histories deepened are the ones merged,
+				// whatever the branches on origin are at by now.
+				const how = step === 'all' ? '--unshallow' : `--deepen=${step}`;
+				const args = ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', how, 'origin'];
+				await ok(await at([...args, base, head]), { timeoutMs });
+			};
 			const work = await mkdtemp(join(tmpdir(), 'koi-merge-'));
 			try {
 				return await mergeIsolated(
-					{ run, dir: join(work, 'repo'), objects, shallow, format },
+					{ run, dir: join(work, 'repo'), objects, shallow, format, deepen },
 					base,
 					head,
 				);
@@ -280,6 +289,13 @@ export function cliGit(
 // How long git may take to merge a pull request's head into its base.
 const MERGE_TIMEOUT_MS = 10 * 60_000;
 
+// How a shallow checkout is deepened to find the commit a pull request's
+// head and base have in common: by these many commits from where its
+// history stops, one step after another, then the whole history. All the
+// steps together may take DEEPEN_BUDGET_MS.
+const DEEPEN_STEPS = [100, 1_000, 10_000] as const;
+const DEEPEN_BUDGET_MS = 10 * 60_000;
+
 // The settings git merges by, pinned, so that nothing set for the user's
 // checkout or machine changes the tree. Each is git's default:
 // renormalizing off, renames found (up to 7,000 files, git's limit for a
@@ -327,6 +343,9 @@ interface MergeIn {
 	objects: string;
 	shallow: string;
 	format: string;
+	// Fetches more of the base's and head's history from origin into the
+	// checkout: `step` more commits, or all of it.
+	deepen: (step: number | 'all', timeoutMs: number) => Promise<void>;
 }
 
 // koi's merge of a pull request, made in a temporary bare repository that
@@ -375,17 +394,29 @@ async function mergeIsolated(
 	const made = await m.run([...init, m.dir], { env: isolatedEnv() });
 	if (made.code !== 0) throw new ExecError(init, made);
 
-	if ((await lstatOrMissing(m.shallow)) !== undefined) {
-		await copyFile(m.shallow, join(m.dir, 'shallow'));
+	// The commit the head left the base at. A shallow checkout can hold both
+	// tips and not that commit, so it is deepened until it does.
+	const deadline = performance.now() + DEEPEN_BUDGET_MS;
+	for (const step of [...DEEPEN_STEPS, 'all' as const, undefined]) {
+		const isShallow = (await lstatOrMissing(m.shallow)) !== undefined;
+		if (isShallow) await copyFile(m.shallow, join(m.dir, 'shallow'));
+		else await rm(join(m.dir, 'shallow'), { force: true });
+		const found = await git(['merge-base', base, head]);
+		if (found.code === 0) break;
+		if (found.code !== 1 || found.timedOut) throw new ExecError(['git', 'merge-base'], found);
+		if (!isShallow || step === undefined) {
+			throw new Error(
+				`the pull request's head ${head} and the base ${base} have no commit in common, so git cannot merge them`,
+			);
+		}
+		const left = deadline - performance.now();
+		if (left <= 0) {
+			throw new Error(
+				`this shallow checkout does not have the commit the pull request's head ${head} left the base ${base} at, and koi fetched more history for ${DEEPEN_BUDGET_MS / 60_000} minutes without finding it. Fetch the rest (git fetch --unshallow origin), then run koi up again`,
+			);
+		}
+		await m.deepen(step, Math.min(FETCH_TIMEOUT_MS, left));
 	}
-	// The commit the head left the base at.
-	const found = await git(['merge-base', base, head]);
-	if (found.code === 1 && !found.timedOut) {
-		throw new Error(
-			`the pull request's head ${head} and the base ${base} have no commit in common, so git cannot merge them`,
-		);
-	}
-	if (found.code !== 0 || found.timedOut) throw new ExecError(['git', 'merge-base'], found);
 
 	const mergeTree = [
 		`--attr-source=${base}`,

@@ -426,6 +426,92 @@ describe('mergeCommit', () => {
 			conflicts: ['base.txt'],
 		});
 	});
+
+	// exec, recording the git fetches it runs.
+	function fetchesOf() {
+		const fetches: string[][] = [];
+		const run = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+			if (cmd.includes('fetch')) fetches.push(cmd);
+			return exec(cmd, options);
+		};
+		return { run, fetches };
+	}
+
+	// A clone of main at depth one that then fetched a pull request's head
+	// at depth one, as a CI job that checks out the base might.
+	async function shallowWithHead(origin: string, pr: number): Promise<string> {
+		const dir = join(await mkdtemp(join(tmpdir(), 'koi-shallow-')), 'checkout');
+		await execOk([
+			'git',
+			'clone',
+			'-q',
+			'--depth',
+			'1',
+			'--branch',
+			'main',
+			`file://${origin}`,
+			dir,
+		]);
+		await execOk([
+			'git',
+			'-C',
+			dir,
+			'fetch',
+			'-q',
+			'--depth',
+			'1',
+			'origin',
+			`refs/pull/${pr}/head`,
+		]);
+		return dir;
+	}
+
+	test('deepens a shallow checkout that has both tips but not the commit they share', async () => {
+		const o = await pullRequestOrigin();
+		// main's tip and the pull request's head, without init, where the
+		// head left main.
+		const dir = await shallowWithHead(o.origin, 7);
+		expect((await exec(['git', '-C', dir, 'merge-base', o.base, o.head7])).code).toBe(1);
+		const f = fetchesOf();
+		const made = await cliGit(dir, f.run).mergeCommit(o.base, o.head7);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		expect(await execOk(['git', '-C', dir, 'rev-parse', `${made.commit}^{tree}`])).toMatchObject({
+			stdout: `${await o.author('rev-parse', `${o.merge7}^{tree}`)}\n`,
+		});
+		expect(f.fetches.map((c) => c.slice(3))).toEqual([
+			[
+				'fetch',
+				'--quiet',
+				'--no-tags',
+				'--no-write-fetch-head',
+				'--deepen=100',
+				'origin',
+				o.base,
+				o.head7,
+			],
+		]);
+	});
+
+	test('refuses a head with no commit in common with the base, after fetching all a shallow checkout lacks', async () => {
+		const o = await pullRequestOrigin();
+		await o.author('checkout', '-q', '--orphan', 'unrelated');
+		const unrelated = await o.commit('other.txt', 'unrelated\n', 'unrelated');
+		await o.author('push', '-q', o.origin, `${unrelated}:refs/pull/9/head`);
+		const refusal = `the pull request's head ${unrelated} and the base ${o.base} have no commit in common, so git cannot merge them`;
+		// A shallow checkout is deepened until its history is whole.
+		const dir = await shallowWithHead(o.origin, 9);
+		const shallow = fetchesOf();
+		await expect(cliGit(dir, shallow.run).mergeCommit(o.base, unrelated)).rejects.toThrow(refusal);
+		expect(shallow.fetches.length).toBe(1);
+		expect((await exec(['git', '-C', dir, 'rev-parse', '--is-shallow-repository'])).stdout).toBe(
+			'false\n',
+		);
+		// A whole one is not fetched from at all.
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/9/head');
+		const whole = fetchesOf();
+		await expect(cliGit(o.user, whole.run).mergeCommit(o.base, unrelated)).rejects.toThrow(refusal);
+		expect(whole.fetches).toEqual([]);
+	});
 });
 
 describe('koiFiles', () => {
