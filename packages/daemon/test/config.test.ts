@@ -19,6 +19,8 @@ describe('loadConfig', () => {
 			recipesDir: '/usr/local/share/koi/recipes',
 			caddyfile: '/var/lib/koi-caddy/Caddyfile',
 			caddyAdmin: 'http://127.0.0.1:2019',
+			tls: 'route53',
+			tlsDnsFile: '/etc/caddy/koi-dns.caddy',
 			dockerRoot: '/var/lib/docker',
 			network: 'koi-previews',
 			buildNetwork: 'koi-build',
@@ -34,6 +36,19 @@ describe('loadConfig', () => {
 			recorderSeccomp: '/usr/local/share/koi/recorder-seccomp.json',
 			verifierImages: [],
 		});
+	});
+
+	test('takes how Caddy gets certificates from KOI_TLS, Route 53 when unset or empty', () => {
+		expect(loadConfig({ ...SPOOL, KOI_TLS: '' }).tls).toBe('route53');
+		for (const tls of ['route53', 'internal', 'acme-http', 'acme-dns'] as const) {
+			expect(loadConfig({ ...SPOOL, KOI_TLS: tls }).tls).toBe(tls);
+		}
+		expect(() => loadConfig({ ...SPOOL, KOI_TLS: 'letsencrypt' })).toThrow();
+		const dns = loadConfig({ ...SPOOL, KOI_TLS: 'acme-dns', KOI_TLS_DNS_FILE: '/srv/dns.caddy' });
+		expect(dns.tlsDnsFile).toBe('/srv/dns.caddy');
+		// The path goes into the Caddyfile as one token.
+		expect(() => loadConfig({ ...SPOOL, KOI_TLS_DNS_FILE: '/srv/a b.caddy' })).toThrow();
+		expect(() => loadConfig({ ...SPOOL, KOI_TLS_DNS_FILE: '/srv/x}\n:80 {' })).toThrow();
 	});
 
 	test('reads every setting from the environment, ports as numbers', () => {

@@ -135,3 +135,36 @@ describe('koi pages', () => {
 		expect(((await res.json()) as { ok: boolean }).ok).toBe(true);
 	});
 });
+
+describe('tls-ask', () => {
+	const ask = (name: string) => req(`/__koi/tls-ask?domain=${name}`, '127.0.0.1:7777');
+
+	test('lets Caddy get a certificate for a preview koid has a record of, and nothing else', async () => {
+		for (const kind of ['running', 'stopped', 'building', 'failed', 'expired'] as const) {
+			const { opts, visits, started } = options({ kind } as PreviewView);
+			const res = await handle(ask('hello.previews.example.net'), opts);
+			expect([kind, res.status]).toEqual([kind, 200]);
+			// Asking is not a visit and wakes nothing.
+			expect(visits).toEqual([]);
+			expect(started).toEqual([]);
+		}
+		const { opts } = options({ kind: 'unknown' });
+		expect((await handle(ask('hello.previews.example.net'), opts)).status).toBe(404);
+	});
+
+	test("says no to a name outside the domain, a bad label or no name, and yes to koi's own pages", async () => {
+		const { opts } = options({ kind: 'running' });
+		for (const name of [
+			'hello.example.org',
+			'previews.example.net',
+			'a.b.previews.example.net',
+			'',
+		]) {
+			expect([name, (await handle(ask(name), opts)).status]).toEqual([name, 404]);
+		}
+		expect((await handle(req('/__koi/tls-ask', '127.0.0.1:7777'), opts)).status).toBe(404);
+		const unknown = options({ kind: 'unknown' }).opts;
+		const withKeys = { ...unknown, pages: { keys: async () => new Response('keys page') } };
+		expect((await handle(ask('keys.previews.example.net'), withKeys)).status).toBe(200);
+	});
+});

@@ -4,6 +4,7 @@ import {
 	MAX_HEALTH_TIMEOUT_SECONDS,
 	RESERVED_LABELS,
 } from '@koi/shared';
+import { TLS_ASK_PATH } from './caddy.ts';
 import type { Deployer, PreviewView } from './deployer.ts';
 import { page } from './pages.ts';
 
@@ -41,6 +42,7 @@ export function createHttpServer(options: HttpOptions) {
 
 export async function handle(request: Request, options: HttpOptions): Promise<Response> {
 	const url = new URL(request.url);
+	if (url.pathname === TLS_ASK_PATH) return tlsAsk(url, options);
 	const host = labelFromHost(request.headers.get('host'), options.domain);
 	// koi's own subdomains are never previews: health reports the box, and
 	// everything else goes to their page.
@@ -77,6 +79,22 @@ export async function handle(request: Request, options: HttpOptions): Promise<Re
 	const view = await options.deployer.view(label);
 	wakeIfStopped(label, view, options);
 	return pageFor(view);
+}
+
+// Caddy's question before it gets a certificate on demand (acme-http in
+// caddy.ts): may it get one for the name in ?domain=. Yes for koi's own
+// pages and for a preview koid has a record of, no for anything else, so
+// that a visitor cannot make the host ask the ACME server for names of
+// their choosing and run into its rate limits. Caddy asks koid directly;
+// asked through Caddy it says no more than /__koi/health does.
+async function tlsAsk(url: URL, options: HttpOptions): Promise<Response> {
+	const label = labelFromHost(url.searchParams.get('domain'), options.domain);
+	const own = label !== null && options.pages?.[label] !== undefined;
+	const known = own || (label !== null && (await options.deployer.view(label)).kind !== 'unknown');
+	return new Response(null, {
+		status: known ? 200 : 404,
+		headers: { 'cache-control': 'no-store' },
+	});
 }
 
 // Starts a stopped preview in the background. ensureRunning expires an

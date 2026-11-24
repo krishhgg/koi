@@ -53,6 +53,51 @@ describe('renderCaddyfile', () => {
 		);
 	});
 
+	test('renders the same file as before for the AWS box, which sets no TLS mode', () => {
+		const routes = [{ label: 'hello', upstream: '172.19.0.2:8080' }];
+		expect(renderCaddyfile({ ...base, routes, tls: { kind: 'route53' } })).toBe(
+			renderCaddyfile({ ...base, routes }),
+		);
+		expect(renderCaddyfile({ ...base, routes })).not.toContain('on_demand');
+	});
+
+	test("takes each other host's TLS mode in place of Route 53, and nothing else changes", () => {
+		const routes = [{ label: 'hello', upstream: '172.19.0.2:8080' }];
+		const route53 = renderCaddyfile({ ...base, routes });
+		const block = /\ttls \{\n\t\tdns route53[\s\S]*?\n\t\}\n/.exec(route53)?.[0] ?? '';
+		expect(block).not.toBe('');
+		const internal = renderCaddyfile({ ...base, routes, tls: { kind: 'internal' } });
+		expect(internal).toBe(
+			route53
+				.replace(block, '\ttls internal\n')
+				.replace('\tadmin 127.0.0.1:2019\n}', '\tadmin 127.0.0.1:2019\n\tskip_install_trust\n}'),
+		);
+		const dns = renderCaddyfile({
+			...base,
+			routes,
+			tls: { kind: 'acme-dns', file: '/etc/caddy/koi-dns.caddy' },
+		});
+		expect(dns).toBe(route53.replace(block, '\ttls {\n\t\timport /etc/caddy/koi-dns.caddy\n\t}\n'));
+		// On demand, with koid's answer to which names are previews'.
+		const http = renderCaddyfile({ ...base, routes, tls: { kind: 'acme-http' } });
+		expect(http).toBe(
+			route53
+				.replace(block, '\ttls {\n\t\ton_demand\n\t}\n')
+				.replace(
+					'\tadmin 127.0.0.1:2019\n}',
+					'\tadmin 127.0.0.1:2019\n\ton_demand_tls {\n\t\task http://127.0.0.1:7777/__koi/tls-ask\n\t}\n}',
+				),
+		);
+	});
+
+	test('refuses a DNS provider file that would not be one Caddyfile token', () => {
+		for (const file of ['relative.caddy', '/a b', '/x}\n:80 {', '/{env.X}']) {
+			expect(() =>
+				renderCaddyfile({ ...base, routes: [], tls: { kind: 'acme-dns', file } }),
+			).toThrow('bad DNS provider file');
+		}
+	});
+
 	test('refuses labels and upstreams that could inject config', () => {
 		expect(() =>
 			renderCaddyfile({ ...base, routes: [{ label: 'x }\n:80 {', upstream: '172.19.0.2:80' }] }),
