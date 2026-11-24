@@ -2464,6 +2464,32 @@ describe('restore', () => {
 		expect(t.docker.starts).toEqual([]);
 		expect(t.lastRoutes()).toEqual(routes);
 	});
+
+	test.each([
+		['Caddy', (t: Awaited<ReturnType<typeof setup>>) => t.rejectNextApply('connection refused')],
+		['the egress proxy', (t: Awaited<ReturnType<typeof setup>>) => t.rejectMaps(3)],
+	])(
+		'a start that %s failed before Docker ran it is tried again at the next boot',
+		async (_, fail) => {
+			const t = await setup({ proxy: true });
+			await t.up(request());
+			const container = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+			t.docker.stopAll();
+			const deployer = t.restart();
+			await deployer.reconcile();
+			await deployer.expire();
+			await deployer.stopOversized();
+			// The sync before the start fails.
+			fail(t);
+			expect(await deployer.restore()).toEqual([]);
+			expect(t.docker.starts).toEqual([]);
+			expect((await t.store.get('hello-pr-7'))?.error).toBeUndefined();
+			const { deployer: next, started } = await stopAndStart(t);
+			expect(started).toEqual(['hello-pr-7']);
+			expect(t.docker.starts).toEqual([container]);
+			expect(await next.view('hello-pr-7')).toEqual({ kind: 'running' });
+		},
+	);
 });
 
 // Where the build log of a record's attempt is.
@@ -2595,7 +2621,9 @@ describe('the egress proxy address map', () => {
 		t.rejectMaps(3);
 		await t.deployer.ensureRunning(A);
 		expect(t.docker.starts).toEqual([]);
-		expect((await t.store.get(A))?.error).toContain('the egress proxy did not take');
+		expect(t.logs).toContainEqual(expect.stringContaining('the egress proxy did not take'));
+		// A failure of the proxy, not of the preview: the next boot tries it.
+		expect((await t.store.get(A))?.error).toBeUndefined();
 	});
 
 	test('a sync inspects the containers, so one that died leaves the map', async () => {

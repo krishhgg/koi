@@ -279,6 +279,16 @@ const INTERRUPTED =
 // accepted again after that.
 class Superseded extends Error {}
 
+// Caddy or the egress proxy did not take the routes a container start
+// needs (startFresh). It says nothing about the preview, so start() does
+// not record it as a failed start, which restore would skip at every later
+// boot.
+class RoutingFailed extends Error {}
+
+function routingFailed(err: unknown): never {
+	throw new RoutingFailed(message(err), { cause: err });
+}
+
 // Locks, outermost first:
 // - buildQueue (per label) runs one build of a label at a time, in the order
 //   the requests were accepted. It is held for the whole build, so it never
@@ -1041,15 +1051,22 @@ export class Deployer {
 			} catch (err) {
 				const reason = redact(`${WAKE_FAILED}${message(err)}`).slice(0, 2000);
 				deps.log(`starting ${label}: ${message(err)}`);
-				// A record that cannot be written (a full disk, say) must not
-				// keep the container running, unrouted, below.
-				await deps.store
-					.update(label, (r) =>
-						r.deployment?.container === d.container
-							? { ...r, error: reason, updatedAt: this.iso() }
-							: r,
-					)
-					.catch((e: unknown) => deps.log(`recording that ${label} did not start: ${message(e)}`));
+				// Recorded only when Docker or the health check failed: restore
+				// skips a preview whose start failed, and a routing failure
+				// passes once Caddy or the egress proxy recovers. A record that
+				// cannot be written (a full disk, say) must not keep the
+				// container running, unrouted, below.
+				if (!(err instanceof RoutingFailed)) {
+					await deps.store
+						.update(label, (r) =>
+							r.deployment?.container === d.container
+								? { ...r, error: reason, updatedAt: this.iso() }
+								: r,
+						)
+						.catch((e: unknown) =>
+							deps.log(`recording that ${label} did not start: ${message(e)}`),
+						);
+				}
 				// Stopped rather than left running unrouted, once routes without
 				// it are applied: Docker may give a stopped container's address
 				// to another preview. No retry here: the next visit tries again.
@@ -1230,13 +1247,16 @@ export class Deployer {
 	// sync first takes dead containers out of the routes and the proxy's map,
 	// and the proxy confirms, before the start. If the new container's
 	// address is one the confirmed map still names, its holder died between
-	// the two, and the map goes to the proxy again at once.
+	// the two, and the map goes to the proxy again at once. A sync that
+	// fails throws RoutingFailed.
 	private async startFresh(container: string, start: () => Promise<void>): Promise<void> {
 		await this.routing.run(async () => {
-			await this.syncNow();
+			await this.syncNow().catch(routingFailed);
 			await start();
 			const { ip } = await this.deps.docker.inspect(container, this.deps.network);
-			if (ip !== undefined && this.told[ip] !== undefined) await this.syncNow();
+			if (ip !== undefined && this.told[ip] !== undefined) {
+				await this.syncNow().catch(routingFailed);
+			}
 		});
 	}
 
