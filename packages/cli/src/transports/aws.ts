@@ -113,12 +113,17 @@ export function clients(profile: string, region: string): Clients {
 // its domain in the config file.
 const DOMAIN_TAG = 'Domain';
 
-// The tags discovery finds the box by, in order. infra/modules/koi tags it
-// koi:role=box whatever its name prefix, and leaves Project to the caller's
-// default_tags, which another account may set to its own project name. A box
-// applied before koi:role existed has only Project=koi and Name=koi-box, so
-// those are asked for when no box has koi:role. An explicit target names its
-// instance, and none of this runs.
+// The instance tag infra/modules/koi sets to the uploads bucket's name, which
+// carries its name prefix. A box applied before the tag existed was made by
+// the personal root, whose bucket is koi-uploads-<account>.
+const BUCKET_TAG = 'koi:bucket';
+
+// The tags discovery finds the box by. infra/modules/koi tags it koi:role=box
+// whatever its name prefix, and leaves Project to the caller's default_tags,
+// which another account may set to its own project name. A box applied before
+// koi:role existed has only Project=koi and Name=koi-box. Both are asked for,
+// so a box of either kind next to one of the other is two boxes, not a quiet
+// pick. An explicit target names its instance, and none of this runs.
 const BOX_TAGS: Filter[][] = [
 	[{ Name: 'tag:koi:role', Values: ['box'] }],
 	[
@@ -132,8 +137,8 @@ const BOX_STATES: Filter = {
 };
 
 // Settings from the environment, discovering what is not set: the box by its
-// tags (BOX_TAGS), the domain from the box's Domain tag, the bucket from the
-// account id. This is the legacy path from before config files, and what
+// tags (BOX_TAGS), the domain from the box's Domain tag, the bucket from its
+// koi:bucket tag, else from the account id. This is the legacy path from before config files, and what
 // `koi config import-aws` writes down.
 export async function resolveSettings(
 	env: Record<string, string | undefined>,
@@ -144,6 +149,9 @@ export async function resolveSettings(
 	const c = make(profile, region);
 	let instanceId = env.KOI_INSTANCE_ID;
 	let domain = env.KOI_DOMAIN;
+	// The box as DescribeInstances answered, when it was asked: its tags name
+	// the domain and the bucket.
+	let box: Instance | undefined;
 	if (instanceId === undefined || domain === undefined) {
 		const describe = async (input: { Filters: Filter[] } | { InstanceIds: string[] }) => {
 			const out = await c.ec2.send(new DescribeInstancesCommand(input));
@@ -151,10 +159,13 @@ export async function resolveSettings(
 		};
 		let instances: Instance[] = [];
 		if (instanceId === undefined) {
+			const found = new Map<string, Instance>();
 			for (const tags of BOX_TAGS) {
-				instances = await describe({ Filters: [...tags, BOX_STATES] });
-				if (instances.length > 0) break;
+				for (const i of await describe({ Filters: [...tags, BOX_STATES] })) {
+					found.set(i.InstanceId ?? '', i);
+				}
 			}
+			instances = [...found.values()];
 		} else {
 			instances = await describe({ InstanceIds: [instanceId] });
 		}
@@ -165,8 +176,9 @@ export async function resolveSettings(
 			}
 			instanceId = ids[0] as string;
 		}
+		box = instances[0];
 		if (domain === undefined) {
-			const tag = instances[0]?.Tags?.find((t) => t.Key === DOMAIN_TAG)?.Value;
+			const tag = box?.Tags?.find((t) => t.Key === DOMAIN_TAG)?.Value;
 			if (tag === undefined || tag === '') {
 				throw new Error(
 					`the koi box ${instanceId} has no ${DOMAIN_TAG} tag; apply the current koi module (infra/modules/koi), which tags it with var.domain, or set KOI_DOMAIN`,
@@ -176,6 +188,8 @@ export async function resolveSettings(
 		}
 	}
 	let bucket = env.KOI_BUCKET;
+	if (bucket === undefined)
+		bucket = box?.Tags?.find((t) => t.Key === BUCKET_TAG)?.Value || undefined;
 	if (bucket === undefined) {
 		const who = await c.sts.send(new GetCallerIdentityCommand({}));
 		bucket = `koi-uploads-${who.Account}`;

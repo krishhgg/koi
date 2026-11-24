@@ -55,16 +55,20 @@ describe('ctlCommand', () => {
 
 // EC2 and STS as resolveSettings sees them: the boxes DescribeInstances
 // returns, each tagged with the preview domain as infra/modules/koi tags it
-// (no tag when domain is null). With only = 'koi:role' or 'Project', a query
-// by tags answers only when it asks for that tag, as for a box that has only
-// the one or only the other. Every DescribeInstances input lands in described.
+// (no tag when domain is null), and with koi:bucket when bucket is set. With
+// only = 'koi:role' or 'Project', a query by tags answers only when it asks
+// for that tag, as for a box that has only the one or only the other. legacy
+// names boxes that only a query by Project finds, next to those in instances.
+// Every DescribeInstances input lands in described.
 function fakeClients(
 	instances: string[],
 	{
 		account = '123456789012',
 		domain = 'previews.example.com' as string | null,
+		bucket = undefined as string | undefined,
 		described = [] as unknown[],
 		only = undefined as 'koi:role' | 'Project' | undefined,
+		legacy = [] as string[],
 	} = {},
 ): Clients {
 	const send = async (cmd: { constructor: { name: string }; input: unknown }) => {
@@ -75,9 +79,13 @@ function fakeClients(
 			if (only !== undefined && input.Filters !== undefined && !asks.includes(`tag:${only}`)) {
 				return { Reservations: [] };
 			}
-			const Tags = domain === null ? [] : [{ Key: 'Domain', Value: domain }];
+			const Tags = [
+				...(domain === null ? [] : [{ Key: 'Domain', Value: domain }]),
+				...(bucket === undefined ? [] : [{ Key: 'koi:bucket', Value: bucket }]),
+			];
+			const ids = asks.includes('tag:Project') ? [...instances, ...legacy] : instances;
 			return {
-				Reservations: [{ Instances: instances.map((InstanceId) => ({ InstanceId, Tags })) }],
+				Reservations: [{ Instances: ids.map((InstanceId) => ({ InstanceId, Tags })) }],
 			};
 		}
 		if (cmd.constructor.name === 'GetCallerIdentityCommand') return { Account: account };
@@ -99,20 +107,29 @@ describe('resolveSettings', () => {
 		});
 	});
 
-	test('finds the box by koi:role, whatever Project says, and asks nothing more', async () => {
-		const described: unknown[] = [];
+	test('finds the box by koi:role, whatever Project says', async () => {
 		const { settings } = await resolveSettings({}, () =>
-			fakeClients(['i-0abc'], { described, only: 'koi:role' }),
+			fakeClients(['i-0abc'], { only: 'koi:role' }),
 		);
 		expect(settings.instanceId).toBe('i-0abc');
-		expect(described).toEqual([
-			{
-				Filters: [
-					{ Name: 'tag:koi:role', Values: ['box'] },
-					{ Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
-				],
-			},
-		]);
+	});
+
+	test('counts a box that has both koi:role and Project=koi once', async () => {
+		const { settings } = await resolveSettings({}, () => fakeClients(['i-0abc']));
+		expect(settings.instanceId).toBe('i-0abc');
+	});
+
+	test('refuses to pick between a koi:role box and an older box found by Project', async () => {
+		await expect(
+			resolveSettings({}, () => fakeClients(['i-0new'], { legacy: ['i-0old'] })),
+		).rejects.toThrow(/expected one koi box, found 2; set KOI_INSTANCE_ID/);
+	});
+
+	test("reads the bucket from the box's koi:bucket tag, which carries the module's prefix", async () => {
+		const { settings } = await resolveSettings({}, () =>
+			fakeClients(['i-0abc'], { bucket: 'acme-koi-uploads-123456789012' }),
+		);
+		expect(settings.bucket).toBe('acme-koi-uploads-123456789012');
 	});
 
 	test('finds a box applied before koi:role by Project and Name', async () => {

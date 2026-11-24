@@ -165,13 +165,15 @@ resource "aws_instance" "box" {
   }
 
   # Without a config file the CLI finds the box by koi:role and reads the
-  # preview domain from Domain, so a team needs no settings beyond an AWS
+  # preview domain from Domain and the uploads bucket, whose name carries the
+  # prefix, from koi:bucket, so a team needs no settings beyond an AWS
   # profile. koi:role rather than Project, which the caller's default_tags
   # may set to anything.
   tags = merge(var.tags, {
-    Name       = local.box_name
-    Domain     = var.domain
-    "koi:role" = "box"
+    Name         = local.box_name
+    Domain       = var.domain
+    "koi:role"   = "box"
+    "koi:bucket" = local.uploads_name
   })
 
   lifecycle {
