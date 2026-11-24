@@ -191,7 +191,9 @@ OpenTofu.
    that account.
 
 4. Install koid. The scripts read the deployment from the environment instead of
-   `tofu output` of `infra/`, so they never touch the other root's state:
+   `tofu output` of `infra/`, so they never touch the other root's state. Set all
+   four: with `KOI_INSTANCE_ID` set, a script stops when another is missing instead of
+   reading it from `infra/`:
 
    ```sh
    export AWS_PROFILE=<admin profile in that account> AWS_REGION=us-east-1

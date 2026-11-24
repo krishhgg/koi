@@ -7,7 +7,8 @@
 #
 # The deployment comes from KOI_INSTANCE_ID, KOI_DOMAIN and KOI_VERIFY_POOL
 # where they are set, and from `tofu output` of infra/ (the personal root)
-# where they are not. AWS_PROFILE picks the credentials. AWS_REGION picks the
+# where they are not; with KOI_INSTANCE_ID set, all three must be set.
+# AWS_PROFILE picks the credentials. AWS_REGION picks the
 # region, else the region output of infra/ when the deployment comes from
 # there, else the profile's region (scripts/host-settings.sh, koi_region).
 #
