@@ -33,10 +33,11 @@ EGRESS_ENV=/etc/koi/egress/env
 CADDY_DIR=/etc/koi/caddy
 CADDY_ENV=$CADDY_DIR/env
 DNS_FILE=$CADDY_DIR/dns.caddy
-# A Caddy set up by something other than koi: the package's Caddyfile, and
-# the unit cloud-init.sh replaces.
+# The Caddyfile of a Caddy set up by something other than koi, which
+# cloud-init.sh removes.
 STOCK_CADDYFILE=/etc/caddy/Caddyfile
-CADDY_UNIT=/etc/systemd/system/caddy.service
+# How koi's caddy.service (cloud-init.sh) starts Caddy, as systemctl shows it.
+KOI_CADDY_START='argv[]=/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile ;'
 # Caddy's admin API, which cloud-init.sh puts on a socket koid opens as a
 # member of the caddy group, in the form KOI_CADDY_ADMIN and caddy take.
 CADDY_ADMIN=unix//run/caddy/admin.sock
@@ -152,9 +153,10 @@ check_caddy() {
 		*) found='the caddy package is installed' ;;
 		esac
 	fi
-	if [ -z "$found" ] && [ -e "$CADDY_UNIT" ] &&
-		! grep -qF -- '--config /var/lib/koi-caddy/Caddyfile' "$CADDY_UNIT"; then
-		found="$CADDY_UNIT runs another config"
+	# The unit systemd runs, wherever its file is and with any drop-in.
+	if [ -z "$found" ] && [ "$(systemctl show -P LoadState caddy.service 2>/dev/null)" = loaded ] &&
+		[[ $(systemctl show -P ExecStart caddy.service 2>/dev/null) != *" $KOI_CADDY_START "* ]]; then
+		found='caddy.service runs another Caddy or config'
 	fi
 	[ -z "$found" ] ||
 		die "this machine has a Caddy that koi did not set up ($found). koi's setup replaces caddy.service and removes /etc/caddy/Caddyfile, which would take that Caddy down; install koi in a VM instead"

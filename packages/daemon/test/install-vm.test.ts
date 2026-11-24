@@ -75,7 +75,6 @@ async function run(b: Box, body: string, stubs = '') {
 			`CADDY_ENV='${b.dir}/etc/koi/caddy/env'`,
 			`DNS_FILE='${b.dir}/etc/koi/caddy/dns.caddy'`,
 			`STOCK_CADDYFILE='${b.dir}/etc/caddy/Caddyfile'`,
-			`CADDY_UNIT='${b.dir}/etc/systemd/system/caddy.service'`,
 			`calls='${b.calls}'`,
 			`printf 'ID=ubuntu\\nVERSION_ID="24.04"\\n' > "$OS_RELEASE"`,
 			'id() { case "$1" in -u) echo 0 ;; alice | bob) return 0 ;; *) return 1 ;; esac; }',
@@ -83,7 +82,8 @@ async function run(b: Box, body: string, stubs = '') {
 			// Owners are root's and caddy's on the host; here the test's own.
 			// biome-ignore lint/suspicious/noTemplateCurlyInString: bash's syntax, not a template of this file
 			'install() { local a=(); while [ $# -gt 0 ]; do case $1 in -o | -g) shift 2 ;; *) a+=("$1"); shift ;; esac; done; command install "${a[@]}"; }',
-			'systemctl() { echo "systemctl $*" >> "$calls"; }',
+			// No caddy.service; a test that wants one says so.
+			'systemctl() { case $1 in show) [ "$3" = LoadState ] && echo not-found ;; *) echo "systemctl $*" >> "$calls" ;; esac; }',
 			'usermod() { echo "usermod $*" >> "$calls"; }',
 			'journalctl() { echo "journalctl $*" >> "$calls"; echo "koid: the box is not provisioned"; }',
 			'curl() { echo "curl $*" >> "$calls"; }',
@@ -98,6 +98,21 @@ async function run(b: Box, body: string, stubs = '') {
 	const lines = (await readFile(b.calls, 'utf8')).split('\n').filter((l) => l !== '');
 	const read = (path: string) => readFile(join(b.dir, path), 'utf8').catch(() => undefined);
 	return { code: r.code, stdout: r.stdout, stderr: r.stderr, calls: lines, read };
+}
+
+// A caddy.service that starts `argv`, as systemctl show prints its
+// ExecStart; other systemctl calls are recorded as before.
+function caddyUnit(argv: string): string {
+	const path = argv.split(' ')[0];
+	return [
+		'systemctl() {',
+		'\tcase "$*" in',
+		"\t'show -P LoadState caddy.service') echo loaded ;;",
+		`\t'show -P ExecStart caddy.service') echo '{ path=${path} ; argv[]=${argv} ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }' ;;`,
+		'\t*) echo "systemctl $*" >> "$calls" ;;',
+		'\tesac',
+		'}',
+	].join('\n');
 }
 
 describe('host/install-vm.sh arguments', () => {
@@ -368,8 +383,15 @@ describe('host/install-vm.sh, run whole', () => {
 				'the caddy package is installed',
 			],
 			[
-				'mkdir -p "$(dirname "$CADDY_UNIT")" && printf \'[Service]\\nExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile\\n\' > "$CADDY_UNIT"',
-				'/etc/systemd/system/caddy.service runs another config',
+				caddyUnit('/usr/bin/caddy run --config /etc/caddy/Caddyfile'),
+				'caddy.service runs another Caddy or config',
+			],
+			[
+				// koi's config named only in a later argument, or in a comment.
+				caddyUnit(
+					'/usr/bin/caddy run --config /etc/caddy/Caddyfile --watch # --config /var/lib/koi-caddy/Caddyfile',
+				),
+				'caddy.service runs another Caddy or config',
 			],
 		] as const) {
 			const b = await box();
@@ -383,13 +405,12 @@ describe('host/install-vm.sh, run whole', () => {
 
 	test("runs again on a koi host, whose Caddy is koi's", async () => {
 		const b = await box();
-		await mkdir(join(b.dir, 'etc/systemd/system'), { recursive: true });
-		await writeFile(
-			join(b.dir, 'etc/systemd/system/caddy.service'),
-			'[Service]\nExecStart=/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile\n',
-		);
 		// A package removed with its files left is not a Caddy that runs.
-		const r = await run(b, 'main --local', 'dpkg-query() { echo config-files; }');
+		const r = await run(
+			b,
+			`${caddyUnit('/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile')}\nmain --local`,
+			'dpkg-query() { echo config-files; }',
+		);
 		expect(r.stderr).toBe('');
 		expect(r.code).toBe(0);
 		expect(r.calls).toContain('systemctl restart koid.service');
