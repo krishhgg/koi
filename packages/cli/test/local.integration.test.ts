@@ -134,6 +134,9 @@ beforeAll(async () => {
 		}
 	}
 	if (await listening(443)) throw new Error('port 443 is taken; Caddy needs it here');
+	if (await listening(2019)) {
+		throw new Error("port 2019 is taken; this test checks that Caddy's admin API is not there");
+	}
 	dir = await mkdtemp(join(tmpdir(), 'koi-local-it-'));
 	await mkdir(join(dir, 'home'));
 	await mkdir(join(dir, 'run'), { mode: 0o750 });
