@@ -419,9 +419,11 @@ Nothing has to change for the deployment to keep working. When ready:
    domain, or know the domain.
 2. Run `koi config import-aws --name owner-aws`. It finds the deployment the
    way koi always has (the profile, the region, the one instance tagged
-   `Project=koi` and `Name=koi-box`, the bucket from the account id) and reads
-   the domain from `--domain`, `KOI_DOMAIN` or the instance's `Domain` tag, in
-   that order. Without any of the three it stops; it does not guess a domain.
+   `koi:role=box`, the bucket from the account id) and reads the domain from
+   `--domain`, `KOI_DOMAIN` or the instance's `Domain` tag, in that order.
+   Without any of the three it stops; it does not guess a domain. A box applied
+   before the module set `koi:role` is found by `Project=koi` and
+   `Name=koi-box` instead, when no instance has `koi:role`.
 3. It writes the target to the user's file and prints what it wrote. The first
    target written becomes `defaultTarget`. An existing target of the same name
    is kept unless you pass `--replace`. While it reads and writes the file, it
@@ -443,13 +445,78 @@ that it cannot check the host's domain.
 
 `koi config import-aws` rewrites the whole file, so comments in it are lost.
 
+## A box in another account
+
+A deployment made by another root, in another AWS account, works the same way:
+the target names that account's profile, the instance and the bucket, and koi
+asks AWS nothing about tags. What the root's `default_tags` set, `Project`
+included, does not matter to it.
+
+1. Give the profile the module's `operator_policy_json` (README, "From another
+   root"). In an account people sign in to through IAM Identity Center, that is
+   a permission set, and the profile is an SSO profile in `~/.aws/config`:
+
+   ```ini
+   [profile koi-company]
+   sso_session = company
+   sso_account_id = 111122223333
+   sso_role_name = KoiOperator
+   region = us-east-1
+
+   [sso-session company]
+   sso_start_url = https://example.awsapps.com/start
+   sso_region = us-east-1
+   sso_registration_scopes = sso:account:access
+   ```
+
+   Run `aws sso login --profile koi-company` before koi. Identity Center
+   decides how long a login lasts. Without a current one, koi stops with the
+   SDK's error, which says to run `aws sso login`, so an agent that runs koi
+   unattended needs someone to sign in again when the login ends. A profile with
+   static keys, `credential_process` or an assumed role works too: koi takes
+   whatever the AWS SDK's shared config files resolve for the profile.
+   `packages/cli/test/aws-credentials.test.ts` resolves a static-key profile
+   and an SSO profile through the CLI's own clients.
+
+2. Write the target, with the `instance_id` and `uploads_bucket` outputs of the
+   root:
+
+   ```yaml
+   version: 1
+   defaultTarget: company
+   targets:
+     company:
+       domain: previews.example.com
+       transport:
+         kind: aws-ssm
+       aws:
+         profile: koi-company
+         region: us-east-1
+         instanceId: i-0123456789abcdef0
+         uploadsBucket: koi-uploads-111122223333
+       power:
+         kind: ec2
+   ```
+
+   Or let koi find them: `KOI_AWS_PROFILE=koi-company koi config import-aws
+   --name company` finds the instance by its `koi:role=box` tag and the bucket
+   as `koi-uploads-<account id>`. With a `name_prefix` other than `koi`, set
+   `KOI_BUCKET` to the bucket for the import. Discovery needs
+   `ec2:DescribeInstances`, which the operator policy has, and
+   `sts:GetCallerIdentity`, which every principal has.
+
+3. Check with `koi config show`, then `koi up` prints the target before it
+   uploads anything.
+
+Keep a target per account and pick one with `--target` or `KOI_TARGET`.
+
 ## Without a config file
 
 With no config file and no `--target`, `KOI_TARGET` or alias, koi behaves as
 before this file existed: `KOI_AWS_PROFILE` (default `koi-cli`),
 `KOI_AWS_REGION` (default `us-east-1`), and `KOI_INSTANCE_ID`, `KOI_BUCKET`
 and `KOI_DOMAIN` when set; what is not set is discovered from the box's tags
-and the account. koi prints one notice per run pointing at `koi config
+(`koi:role=box`, else `Project=koi` and `Name=koi-box`) and the account. koi prints one notice per run pointing at `koi config
 import-aws`. This path is for compatibility; explicit targets never read the
 `Domain` tag.
 

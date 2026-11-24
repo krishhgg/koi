@@ -76,13 +76,22 @@ must not have a directory of that name.
 ### Credentials
 
 The CLI uses the AWS profile `koi-cli` (override with `KOI_AWS_PROFILE`). It can
-upload source, start the box, and run commands on it; nothing else. It finds the box
-by its tags, the preview domain from the box's `Domain` tag, and the upload bucket from
-the account id; `KOI_INSTANCE_ID`, `KOI_DOMAIN` and `KOI_BUCKET` override them. A
-per-user config file can name the deployment instead, and other hosts later; see
+upload source, start the box, and run commands on it; nothing else. The profile may
+hold static keys or sign in through IAM Identity Center (`aws sso login`). It finds the
+box by its `koi:role = box` tag, the preview domain from the box's `Domain` tag, and the
+upload bucket from the account id; `KOI_INSTANCE_ID`, `KOI_DOMAIN` and `KOI_BUCKET`
+override them. A per-user config file can name the deployment instead, including one
+in another AWS account, and other hosts later; see
 [docs/configuration.md](docs/configuration.md).
 
 ## Operating it
+
+The AWS deployment is an OpenTofu module, `infra/modules/koi`: the box, its security
+group and roles, the uploads bucket, the preview list parameter, the wake function,
+CloudFront, its certificate and the DNS records. `infra/` is the root that uses it for
+one personal account. It adds the backend, the providers with a `Project = koi` default
+tag, and the `koi-cli` IAM user. A root in another account uses the module the same
+way; see [From another root](#from-another-root).
 
 Before the first `infra/bootstrap.sh`, copy `infra/koi.auto.tfvars.example` to
 `infra/koi.auto.tfvars` and set `domain` to a domain whose Route 53 hosted zone is in
@@ -101,6 +110,90 @@ the box's `Domain` tag (which the CLI reads), the wake function's environment,
 Update the box before the CLI; see Updating the box and the CLI in
 [docs/design.md](docs/design.md).
 
+### From another root
+
+The module has no provider or backend block and no OpenTofu-only syntax, so a root in
+another account can call it with its own backend, providers and default tags, and no
+IAM users. A root that assumes a role, sets `Project` to another name, has the module
+create the zone and names a VPC and subnet validates with Terraform 1.9.0 and with
+OpenTofu.
+
+1. Copy the module with the files it links to. `files/cloud-init.sh` links to
+   `host/cloud-init.sh`, and `files/handler.mjs` is the wake function that
+   `scripts/build-lambda.sh` writes:
+
+   ```sh
+   scripts/build-lambda.sh
+   cp -rL infra/modules/koi <root>/modules/koi
+   ```
+
+   The copy holds both as plain files, so the other repository needs no Bun. Copy it
+   again when `host/cloud-init.sh` or `packages/lambda` changes. Planning writes
+   `files/wake.zip` next to them; ignore it there as `.gitignore` does here.
+
+2. Call it. The box goes in the region of the `aws` provider; the certificate goes in
+   us-east-1 through `aws.us_east_1`, because CloudFront takes it from there only.
+
+   ```hcl
+   provider "aws" {
+     alias  = "us_east_1"
+     region = "us-east-1"
+   }
+
+   module "koi" {
+     source    = "./modules/koi"
+     providers = { aws = aws, aws.us_east_1 = aws.us_east_1 }
+
+     domain      = "previews.example.com"
+     create_zone = true
+   }
+   ```
+
+   | Variable | Default | Meaning |
+   |---|---|---|
+   | `domain` | none | Previews live at `<label>.<domain>`. Use a registrable domain of its own: previews run pull-request code, and a subdomain of another site's domain is same-site with everything under it. |
+   | `zone_id`, `create_zone` | `null`, `false` | Set exactly one. `zone_id` names an existing hosted zone in the account; `create_zone = true` makes one, and the registrar must then point at its `name_servers` output before the certificate validates. |
+   | `name_prefix` | `koi` | Names `<prefix>-box`, `<prefix>-wake`, `<prefix>-uploads-<account>` and `/<prefix>/previews`. |
+   | `instance_type`, `root_volume_gb` | `t3.xlarge`, `80` | The box. |
+   | `vpc_id`, `subnet_id` | the default VPC | Set both or neither. The subnet needs a route to an internet gateway. |
+   | `tags` | `{}` | Added to every resource that takes tags, on top of the provider's `default_tags`. |
+   | `verify_pool` | `10.213.0.0/20` | See [docs/verify.md](docs/verify.md), "Run network". |
+   | `wake_reserved_concurrency` | `10` | Caps the wake function. Set `null` in an account still on the new-account Lambda quota of 10, where nothing can be reserved. |
+   | `ubuntu_ami_name` | Ubuntu 24.04 | The AMI name pattern for a new box. |
+
+   Outputs: `instance_id`, `uploads_bucket`, `previews_parameter`, `domain`,
+   `verify_pool`, `region`, `zone_id`, `name_servers`, `cloudfront_domain`,
+   `wake_function_url`, `box_public_ip` and `operator_policy_json`.
+
+3. Give people `operator_policy_json`, for example as the inline policy of an
+   Identity Center permission set. It allows what `koi up` needs and no more: start and
+   describe the box, run `AWS-RunShellScript` on that one instance through SSM, upload to
+   the bucket and read the preview list. It names the instance, so a rebuilt box needs
+   the permission set updated. The two host scripts need more, such as reading back
+   what they upload so the box can download it; run them with an admin session in
+   that account.
+
+4. Install koid. The scripts read the deployment from the environment instead of
+   `tofu output` of `infra/`, so they never touch the other root's state:
+
+   ```sh
+   export AWS_PROFILE=<admin profile in that account> AWS_REGION=us-east-1
+   export KOI_INSTANCE_ID=<instance_id> KOI_BUCKET=<uploads_bucket>
+   export KOI_PREVIEWS_PARAM=<previews_parameter> KOI_DOMAIN=<domain>
+   scripts/deploy-host.sh
+   ```
+
+   The box provisions itself at first boot. To provision it again, set
+   `KOI_VERIFY_POOL=<verify_pool>` as well and run `scripts/provision-host.sh`. Without
+   `AWS_REGION`, both scripts use the profile's region, then us-east-1.
+
+5. Point the CLI at the box with a target that names the profile, the instance and the
+   bucket ([docs/configuration.md](docs/configuration.md), "A box in another
+   account").
+
+The CLI finds a box without a config file by the `koi:role = box` tag the module sets,
+so a root whose `default_tags` set `Project` to something else does not hide it.
+
 ## Trust model and limits
 
 koi builds and runs code from pull requests that may be hostile and puts the result on
@@ -108,8 +201,9 @@ the public internet. [docs/design.md](docs/design.md) describes the isolation. T
 are its limits, each with the file that decides it.
 
 - Anyone with the CLI's AWS credentials can run any command on the box, as root. The
-  `koi-cli` policy grants `ssm:SendCommand` for the `AWS-RunShellScript` document on
-  the instance (`infra/users.tf`), and SSM runs such a script as root. The CLI itself
+  operator policy, which `koi-cli` has, grants `ssm:SendCommand` for the
+  `AWS-RunShellScript` document on the instance (`infra/modules/koi/operator.tf`), and
+  SSM runs such a script as root. The CLI itself
   only sends `koid ctl` commands (`packages/cli/src/box.ts`), but nothing holds the
   credentials to that.
 - Previews have no hard disk quota. The box's root filesystem is ext4, where Docker's
@@ -131,7 +225,7 @@ are its limits, each with the file that decides it.
   the restart stops every container. The installer adds iptables rules and installs
   Caddy, which serves `*.<domain>` on port 443 with a wildcard certificate from a
   DNS-01 challenge and does not redirect port 80 (`auto_https disable_redirects`); the
-  security group opens only 443 (`infra/network.tf`). A timer checks every minute and
+  security group opens only 443 (`infra/modules/koi/network.tf`). A timer checks every minute and
   powers the machine off (`systemctl poweroff`) once 10 minutes pass with no activity.
   A koi request, a build and an open connection to a preview all count as activity;
   koid looks for open connections every 30 seconds (`packages/daemon/src/main.ts`).
@@ -181,7 +275,7 @@ are its limits, each with the file that decides it.
 | `packages/daemon` | `koid`, the service on the box: builds, runs and routes previews, tracks activity, serves the keys page. |
 | `packages/lambda` | The wake function behind CloudFront: the "waking up" page and the API that starts the box. |
 | `schemas` | JSON Schemas of what `koi up`, `koi lease` and `koi release` print with `--json`, written by `bun scripts/json-schemas.ts`. |
-| `infra` | OpenTofu for the AWS pieces. |
+| `infra` | OpenTofu for the AWS pieces: the koi module (`modules/koi`) and the personal deployment's root. |
 | `host` | Box provisioning (`cloud-init.sh`), the egress proxy (`egress/`), the verification firewall helper (`verify/`), the SSH gateway for the CLI (`ssh/`), and the recorder (`recorder/`) and verifier (`verifier/`) images a verification run uses. |
 | `recipes` | Built-in recipes, one directory each. |
 | `examples/hello` | The smallest preview: a static page. |
