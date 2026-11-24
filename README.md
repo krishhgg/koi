@@ -26,6 +26,15 @@ koi down NAME [--force]   # remove a preview; --force removes a leased one
 Add `--json` to any command for machine-readable output on stdout; progress goes to
 stderr. Exit codes: 0 success, 1 failure, 2 bad usage.
 
+The JSON that `koi up`, `koi lease` and `koi release` print carries `schemaVersion`, now
+1 for each command. [schemas/](schemas/) holds a JSON Schema (draft 2020-12) of each,
+generated from the zod schemas the CLI's types come from. A command's `schemaVersion`
+changes only when koi removes a field or changes what one means. Adding an optional field
+keeps the version, so a program that reads the fields it knows keeps working. The schemas
+refuse fields they do not name, so a program that validates with them copies them from
+the koi commit it runs. `loginKey` in `koi up`'s output is a secret, and must never go
+into evidence or logs.
+
 `koi up --pr` builds GitHub's merge of the pull request into its base branch (the
 repository's `refs/pull/N/merge`): the pull request as merging it now would give, with
 the base branch's later changes. The output and the pull request comment say what was
@@ -167,10 +176,11 @@ are its limits, each with the file that decides it.
 
 | Path | What it is |
 |---|---|
-| `packages/shared` | Schemas and pure functions everything else validates with: labels, recipes, requests, preview records, providers. |
+| `packages/shared` | Schemas and pure functions everything else validates with: labels, recipes, requests, preview records, providers, and the CLI's `--json` output. |
 | `packages/cli` | The `koi` command. Compiles to one binary with `bun build --compile`. |
 | `packages/daemon` | `koid`, the service on the box: builds, runs and routes previews, tracks activity, serves the keys page. |
 | `packages/lambda` | The wake function behind CloudFront: the "waking up" page and the API that starts the box. |
+| `schemas` | JSON Schemas of what `koi up`, `koi lease` and `koi release` print with `--json`, written by `bun scripts/json-schemas.ts`. |
 | `infra` | OpenTofu for the AWS pieces. |
 | `host` | Box provisioning (`cloud-init.sh`), the egress proxy (`egress/`), the verification firewall helper (`verify/`), the SSH gateway for the CLI (`ssh/`), and the recorder (`recorder/`) and verifier (`verifier/`) images a verification run uses. |
 | `recipes` | Built-in recipes, one directory each. |
@@ -186,6 +196,10 @@ uv run --with mitmproxy==12.2.3 --with pytest pytest host/egress/test
 uv run --with pytest pytest host/verify/test   # the verification firewall helper
 uv run --with pytest pytest host/verifier      # the verifier's supervisor and runner clients
 ```
+
+After changing the `--json` output schemas in `packages/shared/src/cli-output.ts`, run
+`bun scripts/json-schemas.ts` and commit what it writes to `schemas/`. A test fails while
+the committed files differ from what the script writes.
 
 CI and a Greptile review run on every pull request. Greptile's configuration is in `.greptile/`.
 

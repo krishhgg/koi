@@ -535,8 +535,9 @@ same image. Previews deployed before koid kept these fields have no
 `deployment` until `koi up` replaces them.
 
 ```json
-{"label":"hello-pr-7","url":"https://hello-pr-7.previews.example.com","status":"running",
- "commit":"<40 hex>","pr":7,"merge":{"head":"<40 hex>","base":"<40 hex>","baseBranch":"main"},
+{"schemaVersion":1,"label":"hello-pr-7","url":"https://hello-pr-7.previews.example.com",
+ "status":"running","commit":"<40 hex>","pr":7,
+ "merge":{"head":"<40 hex>","base":"<40 hex>","baseBranch":"main"},
  "deployment":{"label":"hello-pr-7","deploymentId":"<20 chars>","imageDigest":"sha256:<64 hex>",
   "commit":"<40 hex>","merge":{"head":"<40 hex>","base":"<40 hex>","baseBranch":"main"}},
  "keysUrl":"https://keys.previews.example.com/?for=hello-pr-7"}
@@ -564,7 +565,8 @@ the preview's routes are not settled; `koi lease` can be run again. The reply,
 as JSON with `--json`, is the lease and the `DeploymentIdentity` it is bound to:
 
 ```json
-{"lease":{"leaseId":"<20 chars>","deploymentId":"<20 chars>","holder":"dev@laptop",
+{"schemaVersion":1,
+ "lease":{"leaseId":"<20 chars>","deploymentId":"<20 chars>","holder":"dev@laptop",
   "acquiredAt":"2026-10-06T10:00:00.000Z","expiresAt":"2026-10-06T10:30:00.000Z"},
  "deployment":{"label":"hello-pr-7","deploymentId":"<20 chars>","imageDigest":"sha256:<64 hex>",
   "commit":"<40 hex>"}}
@@ -574,7 +576,17 @@ A caller checks `deployment` against the one it expects and stops when they
 differ. Expiry is wall clock: koid keeps the lease in the preview's record, so
 it survives a koid restart and the box sleeping, and ends on time either way.
 koid drops an expired lease on its next expiry sweep; until then it is ignored.
-`koi release --json` prints `{"label","leaseId","released":true}`.
+`koi release --json` prints
+`{"schemaVersion":1,"label":"hello-pr-7","leaseId":"<20 chars>","released":true}`.
+
+The JSON Schemas of these three outputs are `schemas/koi-up.schema.json`,
+`schemas/koi-lease.schema.json` and `schemas/koi-release.schema.json`, generated
+from the zod schemas in `packages/shared/src/cli-output.ts`. Each output's
+`schemaVersion` is its own, and changes only when koi removes a field or changes
+what one means. Adding an optional field keeps the version. The schemas refuse
+fields they do not name, so a caller that validates with them copies them from
+the koi commit it runs. `loginKey` in `koi up`'s output is a secret, and must
+never go into evidence or logs.
 
 Leases coordinate callers that trust each other and carry no per-holder
 authorization. `holder` is whatever the caller says it is; koid does not check
