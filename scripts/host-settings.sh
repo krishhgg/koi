@@ -17,7 +17,11 @@
 koi_setting() {
 	if [ -n "${!1+set}" ]; then
 		if [ -z "${!1}" ]; then
-			echo "$1 is set but empty; unset it to read the $2 output of infra/" >&2
+			if [ -n "${KOI_INSTANCE_ID+set}" ] && [ "$1" != KOI_INSTANCE_ID ]; then
+				echo "$1 is set but empty; set it from the other root's $2 output" >&2
+			else
+				echo "$1 is set but empty; unset it to read the $2 output of infra/" >&2
+			fi
 			return 1
 		fi
 		printf '%s\n' "${!1}"

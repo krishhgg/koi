@@ -1458,6 +1458,16 @@ describe('scripts/host-settings.sh, run in bash', () => {
 			"KOI_INSTANCE_ID is set, so the deployment comes from another root, but KOI_DOMAIN is not; set it from that root's domain output",
 		);
 		expect(r.calls).toEqual([]);
+		// Set and empty: set it from that root, not unset it to read infra/.
+		const empty = await run('x=$(koi_setting KOI_DOMAIN domain)\necho "went on"', {
+			KOI_INSTANCE_ID: 'i-0fedcba9876543210',
+			KOI_DOMAIN: '',
+		});
+		expect(empty.code).not.toBe(0);
+		expect(empty.stderr).toContain(
+			"KOI_DOMAIN is set but empty; set it from the other root's domain output",
+		);
+		expect(empty.calls).toEqual([]);
 	});
 
 	test('takes the region from AWS_REGION, else from where the deployment comes from', async () => {
