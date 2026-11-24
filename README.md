@@ -110,6 +110,7 @@ the box's `Domain` tag (which the CLI reads), the wake function's environment,
 |---|---|
 | Create or change the AWS stack | `AWS_PROFILE=<admin> infra/bootstrap.sh` |
 | Re-run host provisioning on the running box | `AWS_PROFILE=<admin> scripts/provision-host.sh` |
+| Remove the AWS stack | `tofu -chdir=infra destroy`. The uploads bucket goes with what is left in it (one-day uploads only). A state applied before the module set `force_destroy` on that bucket needs one `tofu apply` first, or the destroy stops on `BucketNotEmpty` |
 | Install a new koid, recipes, egress proxy and SSH gateway | `AWS_PROFILE=<admin> scripts/deploy-host.sh` |
 | Set up, or update, a plain Linux VM as a host | `scripts/host-bundle.sh DIR`, copy `DIR` to the VM, then `sudo DIR/install-vm.sh --domain D --tls MODE` there |
 | Set up this machine as a host for `koi up --local` | `scripts/host-bundle.sh DIR`, then `sudo DIR/install-vm.sh --local --user "$USER"` |

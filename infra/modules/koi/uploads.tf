@@ -9,7 +9,9 @@ resource "aws_s3_bucket" "uploads" {
   bucket = local.uploads_name
   # Everything here is a one-day upload (the lifecycle rule below), so a
   # destroy removes what is left rather than stopping on BucketNotEmpty, which
-  # it otherwise does after the first deploy-host.sh or koi up.
+  # it otherwise does after the first deploy-host.sh or koi up. The provider reads
+  # this from state when it deletes, so a state applied without it needs one
+  # apply first.
   force_destroy = true
   tags          = var.tags
 }
