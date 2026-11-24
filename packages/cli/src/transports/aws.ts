@@ -150,9 +150,9 @@ export async function resolveSettings(
 	let instanceId = env.KOI_INSTANCE_ID;
 	let domain = env.KOI_DOMAIN;
 	// The box as DescribeInstances answered, when it was asked: its tags name
-	// the domain and the bucket.
+	// the domain and the bucket, so it is asked whenever either is unset.
 	let box: Instance | undefined;
-	if (instanceId === undefined || domain === undefined) {
+	if (instanceId === undefined || domain === undefined || env.KOI_BUCKET === undefined) {
 		const describe = async (input: { Filters: Filter[] } | { InstanceIds: string[] }) => {
 			const out = await c.ec2.send(new DescribeInstancesCommand(input));
 			return (out.Reservations ?? []).flatMap((r) => r.Instances ?? []);

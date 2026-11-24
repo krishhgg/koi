@@ -125,6 +125,17 @@ describe('resolveSettings', () => {
 		).rejects.toThrow(/expected one koi box, found 2; set KOI_INSTANCE_ID/);
 	});
 
+	test('reads the bucket tag of the box KOI_INSTANCE_ID names, with the domain given', async () => {
+		const described: unknown[] = [];
+		const { settings } = await resolveSettings(
+			{ KOI_INSTANCE_ID: 'i-1', KOI_DOMAIN: 'example.dev' },
+			() => fakeClients(['i-1'], { described, bucket: 'acme-koi-uploads-123456789012' }),
+		);
+		expect(settings.bucket).toBe('acme-koi-uploads-123456789012');
+		expect(settings.domain).toBe('example.dev');
+		expect(described).toEqual([{ InstanceIds: ['i-1'] }]);
+	});
+
 	test("reads the bucket from the box's koi:bucket tag, which carries the module's prefix", async () => {
 		const { settings } = await resolveSettings({}, () =>
 			fakeClients(['i-0abc'], { bucket: 'acme-koi-uploads-123456789012' }),
