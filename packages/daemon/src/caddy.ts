@@ -120,7 +120,7 @@ ${tlsBlock(tls)}	log {
 		format json
 	}
 
-	handle /__koi/* {
+${tls.kind === 'acme-http' ? ASK_CLOSED : ''}	handle /__koi/* {
 		reverse_proxy ${koid}
 	}
 
@@ -139,6 +139,14 @@ ${blocks.join('\n')}
 }
 `;
 }
+
+// Caddy's question to koid before a certificate on demand is for Caddy
+// alone: a visitor gets nothing at that path, whatever the host.
+const ASK_CLOSED = `	handle ${TLS_ASK_PATH} {
+		respond 404
+	}
+
+`;
 
 function tlsBlock(tls: CaddyTls): string {
 	switch (tls.kind) {

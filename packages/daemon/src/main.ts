@@ -273,6 +273,7 @@ async function daemon(): Promise<void> {
 	createHttpServer({
 		port: config.httpPort,
 		domain: config.domain,
+		tlsAsk: config.tls === 'acme-http',
 		deployer,
 		onVisit,
 		log,

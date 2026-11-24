@@ -106,6 +106,10 @@ describe('renderCaddyfile', () => {
 			offAws
 				.replace(block, '\ttls {\n\t\ton_demand\n\t}\n')
 				.replace(
+					'\thandle /__koi/* {',
+					'\thandle /__koi/tls-ask {\n\t\trespond 404\n\t}\n\n\thandle /__koi/* {',
+				)
+				.replace(
 					'\tadmin 127.0.0.1:2019\n}',
 					'\tadmin 127.0.0.1:2019\n\ton_demand_tls {\n\t\task http://127.0.0.1:7777/__koi/tls-ask\n\t}\n}',
 				),

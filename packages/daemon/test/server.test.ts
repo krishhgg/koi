@@ -19,6 +19,7 @@ function options(view: PreviewView) {
 			},
 			onVisit: (label: string) => visits.push(label),
 			log: () => {},
+			tlsAsk: true,
 		},
 	};
 }
@@ -166,5 +167,15 @@ describe('tls-ask', () => {
 		const unknown = options({ kind: 'unknown' }).opts;
 		const withKeys = { ...unknown, pages: { keys: async () => new Response('keys page') } };
 		expect((await handle(ask('keys.previews.example.net'), withKeys)).status).toBe(200);
+	});
+
+	test('is not there unless Caddy gets certificates on demand', async () => {
+		const unknown = options({ kind: 'unknown' }).opts;
+		const withKeys = {
+			...unknown,
+			tlsAsk: false,
+			pages: { keys: async () => new Response('keys page') },
+		};
+		expect((await handle(ask('keys.previews.example.net'), withKeys)).status).toBe(404);
 	});
 });
