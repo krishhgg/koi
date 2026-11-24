@@ -64,7 +64,7 @@
 			"additionalProperties": false
 		},
 		"deployment": {
-			"description": "The deployment serving the preview as koi up ended, absent while nothing serves. After a failed build it is the previous one, so a caller compares deployment.commit with commit.",
+			"description": "The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview.",
 			"type": "object",
 			"properties": {
 				"label": {

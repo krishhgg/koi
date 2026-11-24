@@ -51,7 +51,7 @@ export const UpResultSchema = z
 			"The parents of the merge in commit, when koi built GitHub's merge of a pull request. Absent for a working tree and with --head.",
 		),
 		deployment: DeploymentIdentitySchema.optional().describe(
-			'The deployment serving the preview as koi up ended, absent while nothing serves. After a failed build it is the previous one, so a caller compares deployment.commit with commit.',
+			"The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview.",
 		),
 		loginKey: LoginKeySchema.optional().describe(
 			'For apps with a sign-in, the key a reviewer types to get in. A secret: never copy it into evidence or logs.',
