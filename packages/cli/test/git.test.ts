@@ -474,7 +474,7 @@ describe('mergeCommit', () => {
 		return dir;
 	}
 
-	test('deepens a shallow checkout that has both tips but not the commit they share', async () => {
+	test('fetches the whole history of a shallow checkout that has both tips but not the commit they share', async () => {
 		const o = await pullRequestOrigin();
 		// main's tip and the pull request's head, without init, where the
 		// head left main.
@@ -492,12 +492,118 @@ describe('mergeCommit', () => {
 				'--quiet',
 				'--no-tags',
 				'--no-write-fetch-head',
-				'--deepen=100',
+				'--unshallow',
 				'origin',
 				o.base,
 				o.head7,
 			],
 		]);
+	});
+
+	test('merges from the newest commit the two share, not an older one a shallow boundary leaves in reach', async () => {
+		// older sets f to 1, and newer, its child, sets it to 2. baseSide and
+		// headSide are children of newer, and headSide sets f to 3. sideB and
+		// sideH are children of older. base merges sideB into baseSide, and
+		// head merges sideH into headSide. The newest commit base and head
+		// share is newer, so f merges to 3. From older, where f is 1, base's 2
+		// and head's 3 conflict.
+		const author = await mkdtemp(join(tmpdir(), 'koi-author-'));
+		const git = async (...args: string[]) =>
+			(
+				await execOk([
+					'git',
+					'-C',
+					author,
+					'-c',
+					'user.email=t@example.com',
+					'-c',
+					'user.name=t',
+					...args,
+				])
+			).stdout.trim();
+		const commit = async (file: string, text: string, message: string) => {
+			await writeFile(join(author, file), text);
+			await git('add', file);
+			await git('commit', '-q', '-m', message);
+			return git('rev-parse', 'HEAD');
+		};
+		await git('init', '-q', '-b', 'main');
+		const older = await commit('f', '1\n', 'older');
+		const newer = await commit('f', '2\n', 'newer');
+		await git('checkout', '-q', '--detach', older);
+		const sideB = await commit('b.txt', 'b\n', 'side of the base');
+		await git('checkout', '-q', '--detach', older);
+		const sideH = await commit('h.txt', 'h\n', 'side of the head');
+		await git('checkout', '-q', '--detach', newer);
+		const baseSide = await commit('base.txt', 'base\n', 'base');
+		await git('merge', '-q', '--no-ff', '-m', 'base merges its side', sideB);
+		const base = await git('rev-parse', 'HEAD');
+		await git('checkout', '-q', '--detach', newer);
+		const headSide = await commit('f', '3\n', 'head');
+		await git('merge', '-q', '--no-ff', '-m', 'head merges its side', sideH);
+		const head = await git('rev-parse', 'HEAD');
+		const tree = await git('merge-tree', '--write-tree', base, head);
+		expect(await git('show', `${tree}:f`)).toBe('3');
+
+		const origin = await mkdtemp(join(tmpdir(), 'koi-origin-'));
+		await execOk(['git', 'init', '-q', '--bare', '--initial-branch=main', origin]);
+		await git('push', '-q', origin, `${base}:refs/heads/main`, `${head}:refs/pull/5/head`);
+		// A checkout whose history stops at baseSide and headSide: it has
+		// older, through the sides, and not newer.
+		const dir = join(await mkdtemp(join(tmpdir(), 'koi-shallow-')), 'checkout');
+		await execOk(['git', 'clone', '-q', `file://${origin}`, dir]);
+		const user = (...args: string[]) => execOk(['git', '-C', dir, ...args]);
+		await user('fetch', '-q', 'origin', '+refs/pull/5/head:refs/remotes/origin/pr-5');
+		await writeFile(join(dir, '.git', 'shallow'), `${baseSide}\n${headSide}\n`);
+		// git in the checkout merges from older, and finds a conflict.
+		expect((await user('merge-base', '--all', base, head)).stdout).toBe(`${older}\n`);
+		const inCheckout = await exec(['git', '-C', dir, 'merge-tree', '--name-only', base, head]);
+		expect(inCheckout.code).toBe(1);
+		expect(inCheckout.stdout).toContain('\nf\n');
+
+		// The checkout has newer, behind the boundary: koi reads it without
+		// fetching anything.
+		const present = fetchesOf();
+		const made = await cliGit(dir, present.run).mergeCommit(base, head);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		expect((await user('rev-parse', `${made.commit}^{tree}`)).stdout).toBe(`${tree}\n`);
+		expect(present.fetches).toEqual([]);
+
+		// Without newer, koi fetches the whole history first.
+		await user('reflog', 'expire', '--expire=now', '--all');
+		await user('gc', '-q', '--prune=now');
+		expect((await exec(['git', '-C', dir, 'cat-file', '-e', newer])).code).not.toBe(0);
+		const fetched = fetchesOf();
+		const again = await cliGit(dir, fetched.run).mergeCommit(base, head);
+		expect(again).toEqual(made);
+		expect(fetched.fetches.map((c) => c.slice(3))).toEqual([
+			[
+				'fetch',
+				'--quiet',
+				'--no-tags',
+				'--no-write-fetch-head',
+				'--unshallow',
+				'origin',
+				base,
+				head,
+			],
+		]);
+		expect((await user('rev-parse', '--is-shallow-repository')).stdout).toBe('false\n');
+	});
+
+	test('refuses to merge in a shallow checkout that cannot fetch the history it lacks, saying how to fetch it', async () => {
+		const o = await pullRequestOrigin();
+		const dir = await shallowWithHead(o.origin, 7);
+		await execOk(['git', '-C', dir, 'remote', 'set-url', 'origin', join(o.origin, 'gone')]);
+		const err = await cliGit(dir)
+			.mergeCommit(o.base, o.head7)
+			.catch((e: unknown) => e);
+		expect((err as Error).message).toStartWith(
+			`this shallow checkout lacks part of the history of the pull request's head ${o.head7} and the base ${o.base}, which koi needs whole to merge them, and koi could not fetch it (git fetch exited 128: `,
+		);
+		expect((err as Error).message).toEndWith(
+			'. Fetch the rest (git fetch --unshallow origin), then run koi up again',
+		);
 	});
 
 	test('refuses a head with no commit in common with the base, after fetching all a shallow checkout lacks', async () => {

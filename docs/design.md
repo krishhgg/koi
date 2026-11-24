@@ -74,9 +74,14 @@ objects, with no system or global git config, no work tree, index or
 renames on, a rename limit of 7,000). Attributes come from the `.gitattributes` files in
 the base's tree and nowhere else (`git --attr-source=<base>`), as `git merge` reads them
 with the base checked out in a fresh clone, and no merge driver runs. So the same two
-parents give the same tree on any machine. A shallow checkout that has both tips but
-not the commit they share is deepened from origin, 100, 1,000 and 10,000 commits at a
-time and then whole, for up to 10 minutes. GitHub merges with the same algorithm, but
+parents give the same tree on any machine. git merges from the newest commits the two
+parents share, and in a shallow checkout a boundary can hide the newest one while an
+older one stays in reach, which can turn a clean merge into a conflict. So in a shallow
+checkout koi first walks both histories in the temporary repository, which has no list
+of shallow commits and so fails on any parent the checkout lacks. When one is missing,
+koi fetches both histories whole (`git fetch --unshallow origin <base> <head>`) and
+walks them again, for up to 10 minutes in all, and refuses a history that is still not
+whole. GitHub merges with the same algorithm, but
 may read attributes from elsewhere, and LFS or union settings can make its tree differ
 from koi's; koi does not promise the same tree as GitHub's.
 
