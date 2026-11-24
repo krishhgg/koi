@@ -147,6 +147,22 @@ apt-get update
 apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 restart_docker_if_pending
 
+# --- Unattended upgrades ------------------------------------------------------
+# Ubuntu's daily security upgrade stays on. The box is stopped most of the
+# time, so the run its timer missed starts a few minutes after each start,
+# often while a build runs, and needrestart then restarts every service that
+# loaded an upgraded library: koid, Docker and containerd among them, which
+# kills the build in flight ("the daemon restarted before this build
+# finished"). These services keep running on the old libraries instead. The
+# box stops when idle, and its next start loads the new ones.
+install -d -m 0755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/50-koi.conf <<'CONF'
+# Written by koi's host/cloud-init.sh: an unattended upgrade never restarts
+# the services builds and previews run on. The next start of the box loads
+# the upgraded libraries.
+$nrconf{override_rc}{qr(^(koid|koi-egress|koi-firewall|caddy|docker|containerd)\.service$)} = 0;
+CONF
+
 # --- koi user and state -----------------------------------------------------
 id koi >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/koi --shell /usr/sbin/nologin koi
 usermod -aG docker koi
