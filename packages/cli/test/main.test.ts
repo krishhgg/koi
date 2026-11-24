@@ -3,7 +3,13 @@ import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { DeploymentIdentity, LeaseReply, UpRequest } from '@koi/shared';
+import type {
+	Deployment,
+	DeploymentIdentity,
+	LeaseReply,
+	PreviewRecord,
+	UpRequest,
+} from '@koi/shared';
 import { BuildLogs } from '../../daemon/src/buildlog.ts';
 import { CapacityError } from '../../daemon/src/deployer.ts';
 import { USAGE } from '../src/args.ts';
@@ -15,6 +21,7 @@ import type { GitHub } from '../src/github.ts';
 import { type HostContext, type Runtime, run, table, VERSION } from '../src/main.ts';
 import { type HealthAnswer, WAKE_POLL_MS, WAKE_WAIT_MS } from '../src/up.ts';
 import { koidClients, koidDeps, previewRecord, settings } from './koid.ts';
+import { schemaErrors } from './output-schemas.ts';
 import { asGitHub, pullRequestOrigin } from './pulls.ts';
 
 // A box whose koid ctl answers from `replies` by command. `health` is what
@@ -734,6 +741,7 @@ describe('run against koid through SSM', () => {
 			pr: 7,
 			merge: { head: o.head7, base: o.base, baseBranch: 'main' },
 		});
+		expect(schemaErrors('koi-up', JSON.parse(j.stdout))).toEqual([]);
 		// The head as pushed, with --head.
 		const h = await capture(['up', '--pr', '7', '--head'], runtime);
 		expect(h.code).toBe(0);
@@ -826,6 +834,170 @@ describe('run against koid through SSM', () => {
 		);
 		expect(JSON.parse(whole.stdout)).toMatchObject({ truncated: false });
 		expect(untimed(JSON.parse(whole.stdout).text)).toBe('b\nc\n');
+	});
+});
+
+// A deployment as koid records it, built from the request `requestId`.
+function deployment(over: Partial<Deployment> = {}): Deployment {
+	return {
+		requestId: 'a'.repeat(16),
+		deploymentId: 'b'.repeat(20),
+		imageDigest: `sha256:${'1'.repeat(64)}`,
+		commit: 'c'.repeat(40),
+		image: 'koi-preview/hello:a',
+		container: 'koi-hello-a',
+		port: 8080,
+		healthPath: '/',
+		healthTimeoutSeconds: 60,
+		user: '65534:65534',
+		env: {},
+		deployedAt: '2026-10-06T00:00:00.000Z',
+		...over,
+	};
+}
+
+// koi up --json in a git repository, against the real koid ctl and control
+// API behind SSM. Once koi up has uploaded its request, koid's record for the
+// label is what `record` makes of the request, and the build log is empty.
+async function upThroughKoid(record: (request: UpRequest) => PreviewRecord) {
+	const dir = await gitRepo();
+	let request: UpRequest | undefined;
+	const clients = koidClients(
+		koidDeps({
+			deployer: {
+				...koidDeps({}).deployer,
+				up: async () => ({ label: request?.label ?? '', queued: false }),
+			},
+			store: {
+				get: async () => (request === undefined ? undefined : record(request)),
+				list: async () => [],
+			},
+			buildLogs: { read: async () => ({ next: 0, lines: [] }), tail: async () => '' },
+		}),
+	);
+	const box: Box = {
+		...awsBox(settings, clients, async () => {}),
+		upload: async (r) => {
+			request = r;
+		},
+	};
+	const r = await capture(['up', '--json'], {
+		cwd: dir,
+		box: async () => ({ box, domain: 'previews.example.net' }),
+		sleep: async () => {},
+	});
+	if (request === undefined) throw new Error(`koi up uploaded nothing: ${r.stderr}`);
+	return { ...r, request };
+}
+
+describe('--json output matches the JSON Schemas in schemas/', () => {
+	test('up, for a preview that runs the build it asked for', async () => {
+		const loginKey = `koi-${'k'.repeat(24)}`;
+		const r = await upThroughKoid((request) =>
+			previewRecord({
+				label: request.label,
+				requestId: request.id,
+				commit: request.commit,
+				status: 'running',
+				loginKey,
+				deployment: deployment({ requestId: request.id, commit: request.commit }),
+			}),
+		);
+		expect(r.code).toBe(0);
+		const out = JSON.parse(r.stdout);
+		expect(schemaErrors('koi-up', out)).toEqual([]);
+		const { label, commit } = r.request;
+		expect(out).toEqual({
+			schemaVersion: 1,
+			label,
+			url: `https://${label}.previews.example.net`,
+			status: 'running',
+			commit,
+			deployment: {
+				label,
+				deploymentId: 'b'.repeat(20),
+				imageDigest: `sha256:${'1'.repeat(64)}`,
+				commit,
+			},
+			loginKey,
+			keysUrl: `https://keys.previews.example.net/?for=${label}`,
+		});
+		// Output without schemaVersion, as koi printed it before, does not match.
+		const { schemaVersion: _, ...unversioned } = out;
+		expect(schemaErrors('koi-up', unversioned)).toContainEqual(
+			expect.objectContaining({
+				keyword: 'required',
+				params: { missingProperty: 'schemaVersion' },
+			}),
+		);
+	});
+
+	test('up, for a failed build while the previous deployment serves', async () => {
+		const previous = 'b'.repeat(40);
+		const r = await upThroughKoid((request) =>
+			previewRecord({
+				label: request.label,
+				requestId: request.id,
+				commit: request.commit,
+				status: 'failed',
+				error: 'RUN npm ci failed',
+				deployment: deployment({
+					requestId: 'p'.repeat(16),
+					deploymentId: 'p'.repeat(20),
+					commit: previous,
+				}),
+			}),
+		);
+		expect(r.code).toBe(1);
+		const out = JSON.parse(r.stdout);
+		expect(schemaErrors('koi-up', out)).toEqual([]);
+		expect(out).toMatchObject({
+			schemaVersion: 1,
+			status: 'failed',
+			commit: r.request.commit,
+			error: 'RUN npm ci failed',
+			deployment: { deploymentId: 'p'.repeat(20), commit: previous },
+		});
+		expect(out.deployment.commit).not.toBe(out.commit);
+	});
+
+	test('lease and release', async () => {
+		const clients = koidClients(
+			koidDeps({
+				deployer: {
+					...koidDeps({}).deployer,
+					acquireLease: async () => leaseReply,
+					releaseLease: async () => {},
+				},
+			}),
+		);
+		const runtime: Runtime = {
+			...koidRuntime(clients),
+			probe: async () => ({ status: 200 }),
+			sleep: async () => {},
+		};
+		const lease = await capture(
+			['lease', 'hello-pr-7', '--minutes', '30', '--holder', 'dev@laptop', '--json'],
+			runtime,
+		);
+		expect(lease.code).toBe(0);
+		const leased = JSON.parse(lease.stdout);
+		expect(schemaErrors('koi-lease', leased)).toEqual([]);
+		expect(leased).toEqual({ schemaVersion: 1, ...leaseReply });
+
+		const id = leaseReply.lease.leaseId;
+		const release = await capture(['release', 'hello-pr-7', id, '--json'], runtime);
+		expect(release.code).toBe(0);
+		const released = JSON.parse(release.stdout);
+		expect(schemaErrors('koi-release', released)).toEqual([]);
+		expect(released).toEqual({
+			schemaVersion: 1,
+			label: 'hello-pr-7',
+			leaseId: id,
+			released: true,
+		});
+		// Each command reached koid, after the ping that checks it is up.
+		expect(clients.commands.map((c) => c[0])).toEqual(['ping', 'lease', 'ping', 'release']);
 	});
 });
 
