@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { exec } from '../src/exec.ts';
+import { type ExecOptions, type ExecResult, exec, execOk } from '../src/exec.ts';
 import { cliGit, FETCH_TIMEOUT_MS, finishTarball, koiFiles, packWorkingTree } from '../src/git.ts';
 import { pullRequestOrigin, shallowCheckout } from './pulls.ts';
 
@@ -175,10 +175,64 @@ describe('cliGit', () => {
 			return exec(['sleep', '600'], { ...options, timeoutMs: 200 });
 		});
 		const err = await g.fetchPullRequest(7).catch((e: unknown) => e);
-		expect(limits).toEqual([FETCH_TIMEOUT_MS]);
+		expect(limits.length).toBe(1);
+		expect(limits[0]).toBeLessThanOrEqual(FETCH_TIMEOUT_MS);
+		expect(limits[0]).toBeGreaterThan(FETCH_TIMEOUT_MS - 1000);
 		expect(FETCH_TIMEOUT_MS).toBe(5 * 60_000);
 		expect((err as Error).message).toBe('git fetch did not finish within 5 minutes');
 	});
+
+	// exec, except that the first git command whose arguments include `stall`
+	// never exits on its own, and every command's time limit is recorded.
+	function stalling(stall: string) {
+		const limits: Array<[string, number | undefined]> = [];
+		let stalled = false;
+		const run = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+			limits.push([cmd[3] ?? '', options?.timeoutMs]);
+			if (stalled || !cmd.includes(stall)) return exec(cmd, options);
+			stalled = true;
+			return exec(['sleep', '600'], options);
+		};
+		return { run, limits };
+	}
+
+	test('reads what it fetched within the same time limit as the fetch', async () => {
+		const o = await pullRequestOrigin();
+		const s = stalling('for-each-ref');
+		const g = cliGit(o.user, s.run);
+		await g.root();
+		s.limits.length = 0;
+		const started = performance.now();
+		const err = await g.fetchPullRequest(7, { timeoutMs: 1500 }).catch((e: unknown) => e);
+		expect(performance.now() - started).toBeLessThan(1500 + 1000);
+		expect((err as Error).message).toBe('git for-each-ref did not finish within 1.5 seconds');
+		expect(s.limits.map(([command]) => command)).toEqual(['fetch', 'for-each-ref']);
+		for (const [, limit] of s.limits) expect(limit).toBeLessThanOrEqual(1500);
+	}, 10_000);
+
+	test('tidies its refs only in the time the fetch has left, and still returns them', async () => {
+		const o = await pullRequestOrigin();
+		const s = stalling('update-ref');
+		const g = cliGit(o.user, s.run);
+		await g.root();
+		s.limits.length = 0;
+		const started = performance.now();
+		const refs = await g.fetchPullRequest(7, { timeoutMs: 1500 });
+		expect(performance.now() - started).toBeLessThan(1500 + 1000);
+		expect(refs).toEqual({
+			head: o.head7,
+			merge: { commit: o.merge7, parents: [o.base, o.head7] },
+		});
+		expect(s.limits.map(([command]) => command)).toEqual([
+			'fetch',
+			'for-each-ref',
+			'rev-parse',
+			'rev-parse',
+			'cat-file',
+			'update-ref',
+		]);
+		for (const [, limit] of s.limits) expect(limit).toBeLessThanOrEqual(1500);
+	}, 10_000);
 
 	test('show reads a file at a commit, or nothing', async () => {
 		const { dir } = await repo();
@@ -246,6 +300,385 @@ describe('mergeFiles', () => {
 		// Tidied: no ref of koi's left behind.
 		const refs = await exec(['git', '-C', shallow, 'for-each-ref', 'refs/koi/']);
 		expect(refs.stdout).toBe('');
+	});
+});
+
+describe('fetchBranch', () => {
+	test('fetches the commit a branch on origin is at, leaving no ref behind', async () => {
+		const o = await pullRequestOrigin();
+		await o.author('checkout', '-q', '--detach', o.base);
+		await o.author('commit', '-q', '--allow-empty', '-m', 'main moved on');
+		const moved = await o.author('rev-parse', 'HEAD');
+		await o.author('push', '-q', o.origin, `${moved}:refs/heads/main`);
+		expect(await cliGit(o.user).fetchBranch('main')).toBe(moved);
+		expect((await exec(['git', '-C', o.user, 'cat-file', '-e', moved])).code).toBe(0);
+		expect((await exec(['git', '-C', o.user, 'for-each-ref', 'refs/koi/'])).stdout).toBe('');
+		// The clone's own view of origin is left as it was.
+		expect(await o.userGit('rev-parse', 'refs/remotes/origin/main')).toBe(o.base);
+	});
+
+	test('refuses a name git does not take for a branch, and fails for one origin lacks', async () => {
+		const o = await pullRequestOrigin();
+		await expect(cliGit(o.user).fetchBranch('main:refs/heads/x')).rejects.toThrow(
+			'"main:refs/heads/x" is not a branch name git accepts',
+		);
+		await expect(cliGit(o.user).fetchBranch('ma*')).rejects.toThrow(
+			'"ma*" is not a branch name git accepts',
+		);
+		await expect(cliGit(o.user).fetchBranch('develop')).rejects.toThrow(/^git fetch exited 128/);
+	});
+});
+
+describe('mergeCommit', () => {
+	test('merges cleanly into a commit with the base, then the head, as parents', async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/7/head');
+		const made = await cliGit(o.user).mergeCommit(o.base, o.head7);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		const object = await o.userGit('cat-file', '-p', made.commit);
+		expect(object.split('\n').filter((l) => l.startsWith('parent '))).toEqual([
+			`parent ${o.base}`,
+			`parent ${o.head7}`,
+		]);
+		// The same tree as the merge in the fixture, which git merge made.
+		expect(await o.userGit('rev-parse', `${made.commit}^{tree}`)).toBe(
+			await o.author('rev-parse', `${o.merge7}^{tree}`),
+		);
+	});
+
+	test('lists the conflicting files of a merge that does not go cleanly', async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/8/head');
+		expect(await cliGit(o.user).mergeCommit(o.base, o.head8)).toEqual({ conflicts: ['base.txt'] });
+	});
+
+	test('throws, rather than finding no conflicts, for a commit the repository lacks', async () => {
+		const o = await pullRequestOrigin();
+		// Pull request 8 was never fetched.
+		await expect(cliGit(o.user).mergeCommit(o.base, o.head8)).rejects.toThrow(
+			`git merge-base exited 128: fatal: Not a valid commit name ${o.head8}`,
+		);
+	});
+
+	test('says it needs git 2.43, and merges nothing, on an older git', async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/7/head');
+		// git as it answers git version, and the commands koi ran past it.
+		const answering = (version: string) => {
+			const calls: string[][] = [];
+			const run = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+				calls.push(cmd);
+				return cmd.at(-1) === 'version'
+					? Promise.resolve({ code: 0, stdout: `${version}\n`, stderr: '', timedOut: false })
+					: exec(cmd, options);
+			};
+			return { run, calls };
+		};
+		// Apple's git of 2024, and two later releases before 2.43.
+		for (const version of [
+			'git version 2.39.5 (Apple Git-154)',
+			'git version 2.40.0',
+			'git version 2.42.2',
+		]) {
+			const old = answering(version);
+			await expect(cliGit(o.user, old.run).mergeCommit(o.base, o.head7)).rejects.toThrow(
+				`koi merges with git merge-tree --write-tree and git --attr-source, which need git 2.43 or later (this is ${version})`,
+			);
+			expect(old.calls.some((c) => c.includes('merge-tree') || c.includes('fetch'))).toBe(false);
+		}
+		const current = answering('git version 2.43.0');
+		expect(await cliGit(o.user, current.run).mergeCommit(o.base, o.head7)).toHaveProperty('commit');
+	});
+
+	test("neither the checkout's nor the machine's attributes or merge drivers change the merge", async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/8/head');
+		const conflict = { conflicts: ['base.txt'] };
+		const union = 'base.txt merge=union\n';
+		// An untracked .gitattributes in the work tree, which git merge-tree
+		// in the checkout reads.
+		await writeFile(join(o.user, '.gitattributes'), union);
+		expect(await cliGit(o.user).mergeCommit(o.base, o.head8)).toEqual(conflict);
+		await rm(join(o.user, '.gitattributes'));
+		// The checkout's own attributes file.
+		await mkdir(join(o.user, '.git', 'info'), { recursive: true });
+		await writeFile(join(o.user, '.git', 'info', 'attributes'), union);
+		expect(await cliGit(o.user).mergeCommit(o.base, o.head8)).toEqual(conflict);
+		await rm(join(o.user, '.git', 'info', 'attributes'));
+		// A merge driver the user's global config sets up for every path,
+		// which takes the base's side and reports success.
+		const home = await mkdtemp(join(tmpdir(), 'koi-home-'));
+		await writeFile(join(home, 'attributes'), '* merge=keep-base\n');
+		await writeFile(
+			join(home, 'gitconfig'),
+			`[core]\n\tattributesFile = ${join(home, 'attributes')}\n[merge "keep-base"]\n\tdriver = true\n`,
+		);
+		// git as it runs in that user's environment, where koi's own
+		// variables still come last.
+		const machine = (cmd: string[], options?: ExecOptions): Promise<ExecResult> =>
+			exec(cmd, {
+				...options,
+				env: { GIT_CONFIG_GLOBAL: join(home, 'gitconfig'), ...options?.env },
+			});
+		expect(
+			(
+				await execOk(['git', 'config', '--get', 'merge.keep-base.driver'], {
+					env: { GIT_CONFIG_GLOBAL: join(home, 'gitconfig') },
+				})
+			).stdout,
+		).toBe('true\n');
+		expect(await cliGit(o.user, machine).mergeCommit(o.base, o.head8)).toEqual(conflict);
+	});
+
+	test("the checkout's merge.renormalize does not change the merge", async () => {
+		// A file committed with CRLF line ends. The base adds `* text=auto` and
+		// stores the file with LF; the head changes a line and keeps CRLF. git
+		// merges the two cleanly only when it renormalizes them.
+		const dir = await mkdtemp(join(tmpdir(), 'koi-git-'));
+		const git = async (...args: string[]) =>
+			(
+				await execOk([
+					'git',
+					'-C',
+					dir,
+					'-c',
+					'user.email=t@example.com',
+					'-c',
+					'user.name=t',
+					...args,
+				])
+			).stdout.trim();
+		await git('init', '-q', '-b', 'main');
+		await writeFile(join(dir, 'file.txt'), 'a\r\nb\r\nc\r\n');
+		await git('add', 'file.txt');
+		await git('commit', '-q', '-m', 'crlf');
+		await git('checkout', '-q', '-b', 'head');
+		await writeFile(join(dir, 'file.txt'), 'a\r\nB\r\nc\r\n');
+		await git('commit', '-q', '-am', 'head');
+		const head = await git('rev-parse', 'HEAD');
+		await git('checkout', '-q', 'main');
+		await writeFile(join(dir, '.gitattributes'), '* text=auto\n');
+		await writeFile(join(dir, 'file.txt'), 'a\nb\nc\n');
+		await git('add', '.gitattributes', 'file.txt');
+		await git('commit', '-q', '-m', 'base');
+		const base = await git('rev-parse', 'HEAD');
+		const conflict = { conflicts: ['file.txt'] };
+		expect(await cliGit(dir).mergeCommit(base, head)).toEqual(conflict);
+		await git('config', 'merge.renormalize', 'true');
+		expect(await cliGit(dir).mergeCommit(base, head)).toEqual(conflict);
+	});
+
+	test("takes attributes from the base's .gitattributes, not the head's", async () => {
+		const o = await pullRequestOrigin();
+		// main moves on by a commit that merges base.txt as a union.
+		await o.author('checkout', '-q', '--detach', o.base);
+		const unionBase = await o.commit('.gitattributes', 'base.txt merge=union\n', 'union');
+		await o.author('push', '-q', o.origin, `${unionBase}:refs/heads/main`);
+		await o.userGit('fetch', '-q', 'origin', 'main', 'refs/pull/8/head');
+		const made = await cliGit(o.user).mergeCommit(unionBase, o.head8);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		expect(await o.userGit('show', `${made.commit}:base.txt`)).toBe('base moved\nsomething else');
+		// The pull request adds the same rule, and the base it merges into has
+		// none.
+		await o.author('checkout', '-q', '--detach', o.head8);
+		const unionHead = await o.commit('.gitattributes', 'base.txt merge=union\n', 'union too');
+		await o.author('push', '-q', o.origin, `${unionHead}:refs/pull/8/head`);
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/8/head');
+		expect(await cliGit(o.user).mergeCommit(o.base, unionHead)).toEqual({
+			conflicts: ['base.txt'],
+		});
+	});
+
+	// exec, recording the git fetches it runs.
+	function fetchesOf() {
+		const fetches: string[][] = [];
+		const run = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+			if (cmd.includes('fetch')) fetches.push(cmd);
+			return exec(cmd, options);
+		};
+		return { run, fetches };
+	}
+
+	// A clone of main at depth one that then fetched a pull request's head
+	// at depth one, as a CI job that checks out the base might.
+	async function shallowWithHead(origin: string, pr: number): Promise<string> {
+		const dir = join(await mkdtemp(join(tmpdir(), 'koi-shallow-')), 'checkout');
+		await execOk([
+			'git',
+			'clone',
+			'-q',
+			'--depth',
+			'1',
+			'--branch',
+			'main',
+			`file://${origin}`,
+			dir,
+		]);
+		await execOk([
+			'git',
+			'-C',
+			dir,
+			'fetch',
+			'-q',
+			'--depth',
+			'1',
+			'origin',
+			`refs/pull/${pr}/head`,
+		]);
+		return dir;
+	}
+
+	test('fetches the whole history of a shallow checkout that has both tips but not the commit they share', async () => {
+		const o = await pullRequestOrigin();
+		// main's tip and the pull request's head, without init, where the
+		// head left main.
+		const dir = await shallowWithHead(o.origin, 7);
+		expect((await exec(['git', '-C', dir, 'merge-base', o.base, o.head7])).code).toBe(1);
+		const f = fetchesOf();
+		const made = await cliGit(dir, f.run).mergeCommit(o.base, o.head7);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		expect(await execOk(['git', '-C', dir, 'rev-parse', `${made.commit}^{tree}`])).toMatchObject({
+			stdout: `${await o.author('rev-parse', `${o.merge7}^{tree}`)}\n`,
+		});
+		expect(f.fetches.map((c) => c.slice(3))).toEqual([
+			[
+				'fetch',
+				'--quiet',
+				'--no-tags',
+				'--no-write-fetch-head',
+				'--unshallow',
+				'origin',
+				o.base,
+				o.head7,
+			],
+		]);
+	});
+
+	test('merges from the newest commit the two share, not an older one a shallow boundary leaves in reach', async () => {
+		// older sets f to 1, and newer, its child, sets it to 2. baseSide and
+		// headSide are children of newer, and headSide sets f to 3. sideB and
+		// sideH are children of older. base merges sideB into baseSide, and
+		// head merges sideH into headSide. The newest commit base and head
+		// share is newer, so f merges to 3. From older, where f is 1, base's 2
+		// and head's 3 conflict.
+		const author = await mkdtemp(join(tmpdir(), 'koi-author-'));
+		const git = async (...args: string[]) =>
+			(
+				await execOk([
+					'git',
+					'-C',
+					author,
+					'-c',
+					'user.email=t@example.com',
+					'-c',
+					'user.name=t',
+					...args,
+				])
+			).stdout.trim();
+		const commit = async (file: string, text: string, message: string) => {
+			await writeFile(join(author, file), text);
+			await git('add', file);
+			await git('commit', '-q', '-m', message);
+			return git('rev-parse', 'HEAD');
+		};
+		await git('init', '-q', '-b', 'main');
+		const older = await commit('f', '1\n', 'older');
+		const newer = await commit('f', '2\n', 'newer');
+		await git('checkout', '-q', '--detach', older);
+		const sideB = await commit('b.txt', 'b\n', 'side of the base');
+		await git('checkout', '-q', '--detach', older);
+		const sideH = await commit('h.txt', 'h\n', 'side of the head');
+		await git('checkout', '-q', '--detach', newer);
+		const baseSide = await commit('base.txt', 'base\n', 'base');
+		await git('merge', '-q', '--no-ff', '-m', 'base merges its side', sideB);
+		const base = await git('rev-parse', 'HEAD');
+		await git('checkout', '-q', '--detach', newer);
+		const headSide = await commit('f', '3\n', 'head');
+		await git('merge', '-q', '--no-ff', '-m', 'head merges its side', sideH);
+		const head = await git('rev-parse', 'HEAD');
+		const tree = await git('merge-tree', '--write-tree', base, head);
+		expect(await git('show', `${tree}:f`)).toBe('3');
+
+		const origin = await mkdtemp(join(tmpdir(), 'koi-origin-'));
+		await execOk(['git', 'init', '-q', '--bare', '--initial-branch=main', origin]);
+		await git('push', '-q', origin, `${base}:refs/heads/main`, `${head}:refs/pull/5/head`);
+		// A checkout whose history stops at baseSide and headSide: it has
+		// older, through the sides, and not newer.
+		const dir = join(await mkdtemp(join(tmpdir(), 'koi-shallow-')), 'checkout');
+		await execOk(['git', 'clone', '-q', `file://${origin}`, dir]);
+		const user = (...args: string[]) => execOk(['git', '-C', dir, ...args]);
+		await user('fetch', '-q', 'origin', '+refs/pull/5/head:refs/remotes/origin/pr-5');
+		await writeFile(join(dir, '.git', 'shallow'), `${baseSide}\n${headSide}\n`);
+		// git in the checkout merges from older, and finds a conflict.
+		expect((await user('merge-base', '--all', base, head)).stdout).toBe(`${older}\n`);
+		const inCheckout = await exec(['git', '-C', dir, 'merge-tree', '--name-only', base, head]);
+		expect(inCheckout.code).toBe(1);
+		expect(inCheckout.stdout).toContain('\nf\n');
+
+		// The checkout has newer, behind the boundary: koi reads it without
+		// fetching anything.
+		const present = fetchesOf();
+		const made = await cliGit(dir, present.run).mergeCommit(base, head);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		expect((await user('rev-parse', `${made.commit}^{tree}`)).stdout).toBe(`${tree}\n`);
+		expect(present.fetches).toEqual([]);
+
+		// Without newer, koi fetches the whole history first.
+		await user('reflog', 'expire', '--expire=now', '--all');
+		await user('gc', '-q', '--prune=now');
+		expect((await exec(['git', '-C', dir, 'cat-file', '-e', newer])).code).not.toBe(0);
+		const fetched = fetchesOf();
+		const again = await cliGit(dir, fetched.run).mergeCommit(base, head);
+		expect(again).toEqual(made);
+		expect(fetched.fetches.map((c) => c.slice(3))).toEqual([
+			[
+				'fetch',
+				'--quiet',
+				'--no-tags',
+				'--no-write-fetch-head',
+				'--unshallow',
+				'origin',
+				base,
+				head,
+			],
+		]);
+		expect((await user('rev-parse', '--is-shallow-repository')).stdout).toBe('false\n');
+	});
+
+	test('refuses to merge in a shallow checkout that cannot fetch the history it lacks, saying how to fetch it', async () => {
+		const o = await pullRequestOrigin();
+		const dir = await shallowWithHead(o.origin, 7);
+		await execOk(['git', '-C', dir, 'remote', 'set-url', 'origin', join(o.origin, 'gone')]);
+		const err = await cliGit(dir)
+			.mergeCommit(o.base, o.head7)
+			.catch((e: unknown) => e);
+		expect((err as Error).message).toStartWith(
+			`this shallow checkout lacks part of the history of the pull request's head ${o.head7} and the base ${o.base}, which koi needs whole to merge them, and koi could not fetch it (git fetch exited 128: `,
+		);
+		expect((err as Error).message).toEndWith(
+			'. Fetch the rest (git fetch --unshallow origin), then run koi up again',
+		);
+	});
+
+	test('refuses a head with no commit in common with the base, after fetching all a shallow checkout lacks', async () => {
+		const o = await pullRequestOrigin();
+		await o.author('checkout', '-q', '--orphan', 'unrelated');
+		const unrelated = await o.commit('other.txt', 'unrelated\n', 'unrelated');
+		await o.author('push', '-q', o.origin, `${unrelated}:refs/pull/9/head`);
+		const refusal = `the pull request's head ${unrelated} and the base ${o.base} have no commit in common, so git cannot merge them`;
+		// A shallow checkout is deepened until its history is whole.
+		const dir = await shallowWithHead(o.origin, 9);
+		const shallow = fetchesOf();
+		await expect(cliGit(dir, shallow.run).mergeCommit(o.base, unrelated)).rejects.toThrow(refusal);
+		expect(shallow.fetches.length).toBe(1);
+		expect((await exec(['git', '-C', dir, 'rev-parse', '--is-shallow-repository'])).stdout).toBe(
+			'false\n',
+		);
+		// A whole one is not fetched from at all.
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/9/head');
+		const whole = fetchesOf();
+		await expect(cliGit(o.user, whole.run).mergeCommit(o.base, unrelated)).rejects.toThrow(refusal);
+		expect(whole.fetches).toEqual([]);
 	});
 });
 

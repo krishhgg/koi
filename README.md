@@ -38,13 +38,19 @@ into evidence or logs.
 `koi up --pr` builds GitHub's merge of the pull request into its base branch (the
 repository's `refs/pull/N/merge`): the pull request as merging it now would give, with
 the base branch's later changes. The output and the pull request comment say what was
-built, as in "Built from #2518 (abc1234) merged into develop (def5678)". A pull request
-that conflicts with its base has no such merge, and GitHub may keep an old merge after
-the base alone moves on; in both cases koi stops before uploading and says to rebase or
-merge the base, or to try again in a minute if GitHub has not computed the merge yet.
-Checking the merge against the base needs the base branch's name, which koi asks gh
-for, so a merge build needs gh installed and signed in. `--head` builds the head as
-pushed instead, and needs no gh.
+built, as in "Built from #2518 (abc1234) merged into develop (def5678)". GitHub may keep
+an old merge after the base alone moves on. koi then asks GitHub's API whether the pull
+request can merge, which makes GitHub recompute the merge, and fetches it again for up
+to 90 seconds. If it is still out of date, koi merges the head into the base's tip
+itself with `git merge-tree` (git 2.43 or later), and says so. That merge reads nothing
+from your checkout or machine but the commits: no git config, no attributes or merge
+drivers of yours, only the `.gitattributes` in the base's tree. A pull request that
+conflicts with its base has no merge, and koi stops before uploading and says to rebase
+or merge the base. Checking the merge against the base needs the base branch's name,
+which koi asks gh for, so a merge build needs gh installed and signed in. `--head`
+builds the head as pushed instead, and needs no gh. koi runs git and gh without a
+terminal, so neither can ask you for a password or passphrase: fetching from origin
+needs an SSH agent or a git credential helper that answers on its own.
 
 `koi up` prints the preview URL and, for projects with a login, the
 preview's login key, and the preview's keys page, `https://keys.previews.example.com/?for=<label>`.

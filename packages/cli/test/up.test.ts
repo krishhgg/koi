@@ -5,11 +5,26 @@ import { join } from 'node:path';
 import { deploymentIdentity, type PreviewRecord, type UpRequest, type UpResult } from '@koi/shared';
 import { type BuildLog, BuildLogs } from '../../daemon/src/buildlog.ts';
 import { awsBox, type Box, BoxUnavailableError, type CtlResult } from '../src/box.ts';
-import { exec, OutputTooLargeError } from '../src/exec.ts';
+import {
+	type ExecOptions,
+	type ExecResult,
+	exec,
+	execOk,
+	OutputTooLargeError,
+} from '../src/exec.ts';
 import { cliGit, type Git } from '../src/git.ts';
-import type { GitHub } from '../src/github.ts';
+import type { GitHub, PullRequestMergeState } from '../src/github.ts';
 import { ghCli, ownerRepoFor } from '../src/github.ts';
-import { builtFrom, type UpDeps, up } from '../src/up.ts';
+import {
+	builtFrom,
+	MERGE_INPUT_TRIES,
+	MERGE_POLL_MS,
+	MERGE_STATE_READS,
+	MERGE_STATE_RETRY_MS,
+	MERGE_WAIT_MS,
+	type UpDeps,
+	up,
+} from '../src/up.ts';
 import { koidClients, koidDeps, previewRecord, s3Stub, settings } from './koid.ts';
 import { asGitHub, pullRequestOrigin, shallowCheckout } from './pulls.ts';
 
@@ -19,6 +34,12 @@ const COMMIT = 'c'.repeat(40);
 const PR_HEAD = 'd'.repeat(40);
 const PR_BASE = 'e'.repeat(40);
 const PR_MERGE = 'f'.repeat(40);
+
+// gh's mergeability check, for a pull request whose merge is current or not
+// built: koi has nothing to ask GitHub to recompute.
+const notAsked = async (): Promise<PullRequestMergeState> => {
+	throw new Error('koi asked GitHub to recompute a merge that is current');
+};
 
 async function fakeGit(
 	overrides: Partial<Git> = {},
@@ -38,6 +59,13 @@ async function fakeGit(
 			merge: { commit: PR_MERGE, parents: [PR_BASE, PR_HEAD] },
 		}),
 		remoteBranchTips: async () => new Map([['main', PR_BASE]]),
+		// GitHub's merge above is current, so koi makes no merge of its own.
+		fetchBranch: async () => {
+			throw new Error('koi fetched the base to merge a pull request whose merge is current');
+		},
+		mergeCommit: async () => {
+			throw new Error('koi merged a pull request whose merge is current');
+		},
 		archive: async (_commit, out) => {
 			await exec(['tar', '-cf', out, '-C', root, 'Dockerfile']);
 		},
@@ -138,6 +166,7 @@ function deps(git: Git, box: Box, extra: Partial<UpDeps> = {}) {
 		buildLine: (l) => lines.push(l),
 		randomId: () => 'r'.repeat(16),
 		now: () => new Date(clock),
+		clock: () => clock,
 		sleep: async (ms) => {
 			clock += ms;
 		},
@@ -820,6 +849,7 @@ describe('up --pr', () => {
 		const fb = fakeBox([{ record: record({ status: 'running', commit: PR_MERGE }), log: [] }]);
 		const comments: Array<{ pr: number; marker: string; body: string }> = [];
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({
 				head: 'feature/from-pr',
 				base: 'main',
@@ -862,6 +892,7 @@ describe('up --pr', () => {
 
 	test("refuses a pull request whose tree has a .koi-runtime/, and keeps the tree's .koi/", async () => {
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({
 				head: 'feature/from-pr',
 				base: 'main',
@@ -955,6 +986,7 @@ describe('up --pr', () => {
 		const fb = fakeBox([{ record: record({ status: 'running', commit: PR_MERGE }), log: [] }]);
 		const asked: number[] = [];
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({
 				head: 'feature/from-pr',
 				base: 'main',
@@ -980,6 +1012,7 @@ describe('up --pr', () => {
 		const git = await fakeGit();
 		const fb = fakeBox([{ record: record({ status: 'running', commit: PR_HEAD }), log: [] }]);
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({
 				head: 'feature/from-pr',
 				base: 'main',
@@ -997,6 +1030,7 @@ describe('up --pr', () => {
 		const git = await fakeGit();
 		const fb = fakeBox([]);
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({
 				head: 'feature/from-pr',
 				base: 'main',
@@ -1016,6 +1050,7 @@ describe('up --pr', () => {
 		const git = await fakeGit();
 		const fb = fakeBox([]);
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({
 				head: 'feature/from-pr',
 				base: 'main',
@@ -1037,6 +1072,7 @@ describe('up --pr', () => {
 		const fb = fakeBox([{ record: record({ status: 'running', commit: PR_MERGE }), log: [] }]);
 		const bodies: string[] = [];
 		const github: GitHub = {
+			pullRequestMergeState: notAsked,
 			pullRequestBranches: async () => ({ head: 'feature/from-pr', base: 'main' }),
 			pullRequestFiles: async () => [],
 			upsertComment: async (_pr, _marker, body) => {
@@ -1099,28 +1135,126 @@ describe('up --pr without gh installed', () => {
 // koi up --pr with the real git client, against a bare repository holding
 // pull requests as GitHub does (see pulls.ts).
 describe('up --pr against a real origin', () => {
-	// gh as it answers for that origin's pull requests: each is opened from
-	// a branch called feature against main, and changes pr.txt.
-	const github: GitHub = {
+	type Origin = Awaited<ReturnType<typeof pullRequestOrigin>>;
+	// GitHub's answer when asked whether pull request `pr` of `o` can merge:
+	// `mergeable`, with the base branch main and the head as origin has it.
+	const mergeState = async (
+		o: Origin,
+		pr: number,
+		mergeable: boolean | null,
+		baseBranch = 'main',
+	): Promise<PullRequestMergeState> => ({
+		baseBranch,
+		head: (
+			await execOk(['git', '-C', o.origin, 'rev-parse', `refs/pull/${pr}/head`])
+		).stdout.trim(),
+		mergeable,
+	});
+	// gh as it answers for o's pull requests: each is opened from a branch
+	// called feature against main, and changes pr.txt. Asked whether one can
+	// merge, GitHub keeps working it out and never remakes its merge, as it
+	// did for nine pull requests through a whole cost run.
+	const github = (o: Origin): GitHub => ({
 		pullRequestBranches: async () => ({ head: 'feature', base: 'main' }),
 		pullRequestFiles: async () => ['pr.txt'],
+		pullRequestMergeState: (pr) => mergeState(o, pr, null),
 		upsertComment: async () => {
 			throw new Error('no comment in this test');
 		},
-	};
+	});
 	const running = (commit: string) =>
 		fakeBox([{ record: record({ status: 'running', commit }), log: [] }]);
 	const short = (c: string) => c.slice(0, 7);
-	const run = (
-		o: Awaited<ReturnType<typeof pullRequestOrigin>>,
-		box: Box,
-		gh: UpDeps['github'] = () => github,
-	) => deps(cliGit(o.user, asGitHub()), box, { github: gh }).d;
+	// koi up's dependencies, its progress, and how long it waited before
+	// uploading (or in all, when it uploaded nothing).
+	const all = (o: Origin, box: Box, gh: UpDeps['github'] = () => github(o)) => {
+		let uploadedAt: number | undefined;
+		const timed: Box = {
+			...box,
+			upload: async (request, tarball) => {
+				uploadedAt = r.clock();
+				await box.upload(request, tarball);
+			},
+		};
+		const r = deps(cliGit(o.user, asGitHub()), timed, { github: gh });
+		return { ...r, waited: () => uploadedAt ?? r.clock() };
+	};
+	const run = (o: Origin, box: Box, gh: UpDeps['github'] = () => github(o)) => all(o, box, gh).d;
+	// main moves on past the base GitHub merged into: by a commit that adds
+	// `file` when given, or by an empty one. Returns where main is now.
+	const moveMain = async (o: Origin, file?: { path: string; text: string }) => {
+		await o.author('checkout', '-q', '--detach', o.base);
+		const moved =
+			file === undefined
+				? await o
+						.author('commit', '-q', '--allow-empty', '-m', 'main moved on')
+						.then(() => o.author('rev-parse', 'HEAD'))
+				: await o.commit(file.path, file.text, 'main moved on');
+		await o.author('push', '-q', o.origin, `${moved}:refs/heads/main`);
+		return moved;
+	};
+	// The author pushes pull request 7 again, and GitHub does not remake its
+	// merge. Returns the new head.
+	const pushAgain = async (o: Origin) => {
+		await o.author('checkout', '-q', '--detach', o.head7);
+		await o.author('commit', '-q', '--allow-empty', '-m', 'pull request 7, pushed again');
+		const pushed = await o.author('rev-parse', 'HEAD');
+		await o.author('push', '-q', o.origin, `${pushed}:refs/pull/7/head`);
+		return pushed;
+	};
+	// The author pushes pull request 7 once more, on top of where it is now,
+	// as push number `n`. Returns the new head.
+	const pushOnTop = async (o: Origin, n: number) => {
+		await o.author('fetch', '-q', o.origin, 'refs/pull/7/head');
+		await o.author('checkout', '-q', '--detach', 'FETCH_HEAD');
+		await o.author('commit', '-q', '--allow-empty', '-m', `pull request 7, push ${n}`);
+		const pushed = await o.author('rev-parse', 'HEAD');
+		await o.author('push', '-q', o.origin, `${pushed}:refs/pull/7/head`);
+		return pushed;
+	};
+	// A branch develop on origin, a commit past the base GitHub merged into.
+	// Returns its tip.
+	const develop = async (o: Origin) => {
+		await o.author('checkout', '-q', '--detach', o.base);
+		const tip = await o.commit('dev.txt', 'develop\n', 'develop');
+		await o.author('push', '-q', o.origin, `${tip}:refs/heads/develop`);
+		return tip;
+	};
+	// GitHub remakes its merge of pull request 7, of `head` into `base`,
+	// replacing the ref.
+	const remerge = async (o: Origin, head: string, base: string) => {
+		await o.author('checkout', '-q', '--detach', base);
+		await o.author('merge', '-q', '--no-ff', '-m', `Merge ${head} into ${base}`, head);
+		const merge = await o.author('rev-parse', 'HEAD');
+		await o.author('push', '-q', o.origin, `+${merge}:refs/pull/7/merge`);
+		return merge;
+	};
+	// A commit's parents, as its object names them.
+	const parents = async (o: Origin, commit: string) =>
+		(await o.userGit('cat-file', '-p', commit))
+			.split('\n')
+			.filter((l) => l.startsWith('parent '))
+			.map((l) => l.slice('parent '.length));
 
 	test("builds GitHub's merge of the pull request into its base, seeded from what the pull request changed", async () => {
 		const o = await pullRequestOrigin();
 		const fb = running(o.merge7);
-		const result = await up({ pr: 7, comment: false }, run(o, fb.box));
+		// The merge is current, so koi asks GitHub nothing and waits for nothing.
+		let asked = 0;
+		const current: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				return mergeState(o, pr, true);
+			},
+		};
+		const d = all(o, fb.box, () => current);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(asked).toBe(0);
+		expect(d.waited()).toBe(0);
+		expect(d.progress.some((m) => m.includes('out of date') || m.includes('koi merged'))).toBe(
+			false,
+		);
 		const request = fb.uploads[0];
 		expect(request?.commit).toBe(o.merge7);
 		expect(request?.pr).toBe(7);
@@ -1175,7 +1309,7 @@ describe('up --pr against a real origin', () => {
 	test('builds from a shallow checkout of the merge, as actions/checkout makes, in both modes', async () => {
 		const o = await pullRequestOrigin();
 		const shallow = await shallowCheckout(o.origin, 'refs/pull/7/merge');
-		const at = (box: Box) => deps(cliGit(shallow, asGitHub()), box, { github: () => github }).d;
+		const at = (box: Box) => deps(cliGit(shallow, asGitHub()), box, { github: () => github(o) }).d;
 		const merged = running(o.merge7);
 		await up({ pr: 7, comment: false }, at(merged.box));
 		expect(merged.uploads[0]?.commit).toBe(o.merge7);
@@ -1233,51 +1367,488 @@ describe('up --pr against a real origin', () => {
 		expect(fb.uploads).toEqual([]);
 	});
 
-	test("stops before uploading when GitHub's merge is of an earlier push than the head", async () => {
+	test('asks GitHub to recompute a merge it kept after the base moved on, and builds the new one', async () => {
 		const o = await pullRequestOrigin();
-		// The author pushes again, and GitHub has not remade the merge yet.
-		await o.author('checkout', '-q', '--detach', o.head7);
-		await o.author('commit', '-q', '--allow-empty', '-m', 'pull request 7, pushed again');
-		const pushed = await o.author('rev-parse', 'HEAD');
-		await o.author('push', '-q', o.origin, `${pushed}:refs/pull/7/head`);
-		const fb = fakeBox([]);
-		await expect(up({ pr: 7, comment: false }, run(o, fb.box))).rejects.toThrow(
-			`GitHub's merge of pull request 7 into main (refs/pull/7/merge on origin) is out of date. Its head ${short(o.head7)} is an earlier push, and the pull request is now at ${short(pushed)}. GitHub has not recomputed the merge yet. Try again in a minute, or build the head as pushed with koi up --pr 7 --head.`,
+		const moved = await moveMain(o);
+		// GitHub, asked, is working it out, then has remade the merge.
+		let asked = 0;
+		let remade = '';
+		const recomputing: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 1) return mergeState(o, pr, null);
+				remade = await remerge(o, o.head7, moved);
+				return mergeState(o, pr, true);
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => recomputing);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(asked).toBe(2);
+		expect(fb.uploads[0]?.commit).toBe(remade);
+		expect(fb.uploads[0]?.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
+		expect(result.commit).toBe(remade);
+		expect(result.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
+		// GitHub's merge holds main's change as well as the pull request's.
+		expect(fb.tarballs[1]).toEqual(['changed:pr.txt']);
+		// Two fetches, one wait apart, after the first look.
+		expect(d.waited()).toBe(2 * MERGE_POLL_MS);
+		expect(d.progress).toContain(
+			`GitHub's merge of pull request 7 into main is out of date. Its base ${short(o.base)} is behind main, now at ${short(moved)}. Asking GitHub to recompute it, and waiting up to 90 seconds`,
 		);
+		expect(d.progress).toContain('GitHub recomputed its merge of pull request 7');
+		expect(d.progress).toContain(
+			`building #7 (${short(o.head7)}) merged into main (${short(moved)}), merge commit ${short(remade)}`,
+		);
+	});
+
+	test("merges the pull request itself when GitHub keeps an out-of-date merge, and records it as it would GitHub's", async () => {
+		const o = await pullRequestOrigin();
+		const moved = await moveMain(o, { path: 'later.txt', text: 'main moved on\n' });
+		let asked = 0;
+		const bodies: string[] = [];
+		const stuck: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				return mergeState(o, pr, null);
+			},
+			upsertComment: async (_pr, _marker, body) => {
+				bodies.push(body);
+				return 'https://github.com/acme/hello/pull/7#issuecomment-1';
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => stuck);
+		const result = await up({ pr: 7, comment: true }, d.d);
+		const made = result.commit;
+		expect(made).not.toBe(o.merge7);
+		// Recorded as GitHub's merge is: the commit, and its head, base and
+		// base branch, which are the commit's own parents, base first.
+		expect(fb.uploads[0]?.commit).toBe(made);
+		expect(fb.uploads[0]?.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
+		expect(result.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
+		expect(await parents(o, made)).toEqual([moved, o.head7]);
+		// The tree holds main's later change and the pull request's, and the
+		// preview is seeded from what the pull request changed.
+		expect(fb.tarballs[0]).toEqual([
+			'.koi-runtime/',
+			'.koi-runtime/changed-files.txt',
+			'base.txt',
+			'koi.yaml',
+			'later.txt',
+			'pr.txt',
+		]);
+		expect(fb.tarballs[1]).toEqual(['changed:pr.txt']);
+		// koi asked, and fetched again, for the whole wait and no longer, then
+		// asked once more for the base branch and head to merge.
+		expect(d.waited()).toBe(MERGE_WAIT_MS);
+		expect(asked).toBe(MERGE_WAIT_MS / MERGE_POLL_MS + 1);
+		// It says it made the merge, in its progress and the comment.
+		expect(d.progress).toContain(
+			`GitHub did not recompute its merge of pull request 7 within 90 seconds; koi merges its head ${short(o.head7)} into main itself`,
+		);
+		expect(d.progress).toContain(
+			`koi merged pull request 7 (${short(o.head7)}) into main (${short(moved)}) itself, merge commit ${short(made)}, since GitHub's merge is out of date`,
+		);
+		const built = `#7 (${short(o.head7)}) merged into main (${short(moved)}), merge commit ${short(made)}, which koi made because GitHub's was out of date`;
+		expect(d.progress).toContain(`building ${built}`);
+		expect(bodies[0]).toContain(`Built from ${built}.`);
+		// Anyone with the two parents gets the same commit, with plain git in
+		// another repository: the tree git merge-tree writes, the base then
+		// the head, GitHub's message, and koi as author and committer at the
+		// later parent's commit time, in UTC.
+		const tree = await o.author('merge-tree', '--write-tree', moved, o.head7);
+		const time = Math.max(
+			...(await o.author('show', '-s', '--format=%ct', moved, o.head7)).split('\n').map(Number),
+		);
+		const when = `@${time} +0000`;
+		const again = await execOk(
+			[
+				'git',
+				'-C',
+				o.authorDir,
+				'commit-tree',
+				'--no-gpg-sign',
+				'-p',
+				moved,
+				'-p',
+				o.head7,
+				'-m',
+				`Merge ${o.head7} into ${moved}`,
+				tree,
+			],
+			{
+				env: {
+					GIT_AUTHOR_NAME: 'koi',
+					GIT_AUTHOR_EMAIL: 'koi@koi.invalid',
+					GIT_AUTHOR_DATE: when,
+					GIT_COMMITTER_NAME: 'koi',
+					GIT_COMMITTER_EMAIL: 'koi@koi.invalid',
+					GIT_COMMITTER_DATE: when,
+				},
+			},
+		);
+		expect(again.stdout.trim()).toBe(made);
+		// And koi up again makes it again.
+		const twice = running(made);
+		await up(
+			{ pr: 7, comment: false },
+			run(o, twice.box, () => stuck),
+		);
+		expect(twice.uploads[0]?.commit).toBe(made);
+	});
+
+	test('refuses a pull request that conflicts with the base GitHub kept an out-of-date merge for', async () => {
+		const o = await pullRequestOrigin();
+		// main adds the pull request's file with other text.
+		const moved = await moveMain(o, { path: 'pr.txt', text: 'not seven\n' });
+		const fb = fakeBox([]);
+		const d = all(o, fb.box);
+		await expect(up({ pr: 7, comment: false }, d.d)).rejects.toThrow(
+			`pull request 7 (${short(o.head7)}) conflicts with main (${short(moved)}) in pr.txt, so there is no merge of it to build, and GitHub's merge (refs/pull/7/merge on origin) is of an earlier head or base. Rebase onto main or merge it in and push. To build the head as pushed instead, without main's later changes, run koi up --pr 7 --head.`,
+		);
+		expect(d.waited()).toBe(MERGE_WAIT_MS);
 		expect(fb.uploads).toEqual([]);
 		expect(fb.woke()).toBe(0);
+		// GitHub saying it cannot merge ends the wait at once, with the same
+		// refusal.
+		const cannot: GitHub = {
+			...github(o),
+			pullRequestMergeState: (pr) => mergeState(o, pr, false),
+		};
+		const early = all(o, fakeBox([]).box, () => cannot);
+		await expect(up({ pr: 7, comment: false }, early.d)).rejects.toThrow(
+			`pull request 7 (${short(o.head7)}) conflicts with main (${short(moved)}) in pr.txt`,
+		);
+		expect(early.waited()).toBe(0);
+		expect(early.progress).toContain(
+			`GitHub says pull request 7 cannot be merged into main; koi merges its head ${short(o.head7)} into main itself`,
+		);
+		// --head is unaffected.
+		const head = running(o.head7);
+		await up({ pr: 7, comment: false, head: true }, run(o, head.box));
+		expect(head.uploads[0]?.commit).toBe(o.head7);
+	});
+
+	test("merges the new push itself when GitHub's merge is of an earlier one, naming what was out of date", async () => {
+		const o = await pullRequestOrigin();
+		const pushed = await pushAgain(o);
+		const fb = running(COMMIT);
+		const d = all(o, fb.box);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(fb.uploads[0]?.merge).toEqual({ head: pushed, base: o.base, baseBranch: 'main' });
+		expect(await parents(o, result.commit)).toEqual([o.base, pushed]);
+		expect(d.progress).toContain(
+			`GitHub's merge of pull request 7 into main is out of date. Its head ${short(o.head7)} is an earlier push, and the pull request is now at ${short(pushed)}. Asking GitHub to recompute it, and waiting up to 90 seconds`,
+		);
+		// main moves on as well, and both are named.
+		const moved = await moveMain(o);
+		const both = all(o, running(COMMIT).box);
+		const again = await up({ pr: 7, comment: false }, both.d);
+		expect(await parents(o, again.commit)).toEqual([moved, pushed]);
+		expect(both.progress).toContain(
+			`GitHub's merge of pull request 7 into main is out of date. Its head ${short(o.head7)} is an earlier push, and the pull request is now at ${short(pushed)}. Its base ${short(o.base)} is behind main, now at ${short(moved)}. Asking GitHub to recompute it, and waiting up to 90 seconds`,
+		);
 		// --head takes the new push.
 		const head = running(pushed);
 		await up({ pr: 7, comment: false, head: true }, run(o, head.box));
 		expect(head.uploads[0]?.commit).toBe(pushed);
 	});
 
-	test('stops before uploading when the base moved on and GitHub kept the merge of the old one', async () => {
+	test('refuses to merge the pull request itself when gh cannot read it, rather than merge what gh pr view named', async () => {
 		const o = await pullRequestOrigin();
-		// main moves on. GitHub may keep the merge after a base-only update,
-		// and its head is still the pull request's.
-		await o.author('checkout', '-q', '--detach', o.base);
-		await o.author('commit', '-q', '--allow-empty', '-m', 'main moved on');
-		const moved = await o.author('rev-parse', 'HEAD');
-		await o.author('push', '-q', o.origin, `${moved}:refs/heads/main`);
+		const moved = await moveMain(o);
+		let asked = 0;
+		const failing: GitHub = {
+			...github(o),
+			pullRequestMergeState: async () => {
+				asked += 1;
+				throw new Error('gh api exited 1: HTTP 502');
+			},
+		};
 		const fb = fakeBox([]);
-		await expect(up({ pr: 7, comment: false }, run(o, fb.box))).rejects.toThrow(
-			`GitHub's merge of pull request 7 into main (refs/pull/7/merge on origin) is out of date. Its base ${short(o.base)} is behind main, now at ${short(moved)}. GitHub has not recomputed the merge yet. Try again in a minute, or build the head as pushed with koi up --pr 7 --head.`,
+		const d = all(o, fb.box, () => failing);
+		const err = await up({ pr: 7, comment: false }, d.d).catch((e: unknown) => e);
+		expect((err as Error).message).toBe(
+			`GitHub's merge of pull request 7 into main (refs/pull/7/merge on origin) is out of date. Its base ${short(o.base)} is behind main, now at ${short(moved)}. koi could not ask GitHub to recompute its merge of pull request 7 (gh api exited 1: HTTP 502), and koi could not merge the pull request itself: it takes the base branch and head to merge from GitHub just before it merges, and gh could not read them in 3 tries (gh api exited 1: HTTP 502). Try again in a minute, or build the head as pushed with koi up --pr 7 --head.`,
+		);
+		// Once while it waits, then MERGE_STATE_READS times, a pause apart.
+		expect(MERGE_STATE_READS).toBe(3);
+		expect(asked).toBe(1 + MERGE_STATE_READS);
+		expect(d.waited()).toBe((MERGE_STATE_READS - 1) * MERGE_STATE_RETRY_MS);
+		expect(fb.uploads).toEqual([]);
+	});
+
+	test('reads GitHub again before merging when its read during the wait failed, and merges into the branch the pull request targets now', async () => {
+		const o = await pullRequestOrigin();
+		await moveMain(o);
+		const tip = await develop(o);
+		// gh pr view said main. The pull request is retargeted at develop
+		// while gh cannot answer koi's first read.
+		let asked = 0;
+		const retargeted: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 1) throw new Error('gh api exited 1: HTTP 502');
+				return mergeState(o, pr, null, 'develop');
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => retargeted);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(asked).toBe(2);
+		expect(result.merge).toEqual({ head: o.head7, base: tip, baseBranch: 'develop' });
+		expect(await parents(o, result.commit)).toEqual([tip, o.head7]);
+		expect(d.progress).toContain(
+			`koi could not ask GitHub to recompute its merge of pull request 7 (gh api exited 1: HTTP 502); koi merges its head ${short(o.head7)} into develop itself`,
+		);
+	});
+
+	test('tries a failed read again before merging, and merges into the branch its answer names', async () => {
+		const o = await pullRequestOrigin();
+		await moveMain(o);
+		const tip = await develop(o);
+		// GitHub says the pull request cannot merge into main, which ends the
+		// wait. It is retargeted at develop, and the next read fails once.
+		let asked = 0;
+		const retargeted: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 1) return mergeState(o, pr, false);
+				if (asked === 2) throw new Error('gh api exited 1: HTTP 502');
+				return mergeState(o, pr, null, 'develop');
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => retargeted);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(asked).toBe(3);
+		expect(result.merge).toEqual({ head: o.head7, base: tip, baseBranch: 'develop' });
+		expect(await parents(o, result.commit)).toEqual([tip, o.head7]);
+		expect(d.waited()).toBe(MERGE_STATE_RETRY_MS);
+	});
+
+	test('ends the wait at its deadline on a clock that only moves forward, however long each step stalls', async () => {
+		const o = await pullRequestOrigin();
+		const moved = await moveMain(o);
+		// Each fetch, listing of origin's branches and gh call takes 40
+		// seconds, or fails at its time limit when that is shorter, as exec
+		// would. The wall clock is set back an hour once koi first asks.
+		const calls: Array<[number, string, number | undefined]> = [];
+		let setBack = 0;
+		const stall = async <T>(
+			what: string,
+			timeoutMs: number | undefined,
+			call: () => Promise<T>,
+		) => {
+			calls.push([t.clock(), what, timeoutMs]);
+			if (what === 'ask') setBack = 3_600_000;
+			if (timeoutMs !== undefined && timeoutMs < 40_000) {
+				await t.d.sleep(timeoutMs);
+				throw new Error(`${what} did not finish within ${timeoutMs / 1000} seconds`);
+			}
+			await t.d.sleep(40_000);
+			return call();
+		};
+		const real = cliGit(o.user, asGitHub());
+		const git: Git = {
+			...real,
+			fetchPullRequest: (pr, options) =>
+				stall('fetch', options?.timeoutMs, () => real.fetchPullRequest(pr)),
+			remoteBranchTips: (options) =>
+				stall('branches', options?.timeoutMs, () => real.remoteBranchTips()),
+		};
+		const slow: GitHub = {
+			...github(o),
+			pullRequestMergeState: (pr, options) =>
+				stall('ask', options?.timeoutMs, () => mergeState(o, pr, null)),
+		};
+		const fb = running(COMMIT);
+		const t = deps(git, fb.box, {
+			github: () => slow,
+			now: () => new Date(t.clock() - setBack),
+		});
+		await up({ pr: 7, comment: false }, t.d);
+		// The wait starts at 80 seconds, after the first fetch and look, and
+		// ends at 170, when the fetch given the last 35 seconds runs out.
+		// What follows, to make the merge, has its own time limits.
+		expect(calls).toEqual([
+			[0, 'fetch', undefined],
+			[40_000, 'branches', undefined],
+			[80_000, 'ask', MERGE_WAIT_MS],
+			[80_000 + 40_000 + MERGE_POLL_MS, 'fetch', 35_000],
+			[80_000 + MERGE_WAIT_MS, 'ask', undefined],
+			[80_000 + MERGE_WAIT_MS + 40_000, 'fetch', undefined],
+		]);
+		expect(t.progress).toContain(
+			`koi could not fetch pull request 7 again while it waited (fetch did not finish within 35 seconds); koi merges its head ${short(o.head7)} into main itself`,
+		);
+		expect(fb.uploads[0]?.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
+	});
+
+	test('merges the pull request itself when a fetch fails while it waits, and it can fetch again', async () => {
+		const o = await pullRequestOrigin();
+		const moved = await moveMain(o);
+		const real = cliGit(o.user, asGitHub());
+		let fetches = 0;
+		const git: Git = {
+			...real,
+			fetchPullRequest: async (pr, options) => {
+				fetches += 1;
+				// The first fetch while koi waits fails, as when the network drops.
+				if (fetches === 2) throw new Error('git fetch exited 128: Could not resolve host');
+				return real.fetchPullRequest(pr, options);
+			},
+		};
+		const fb = running(COMMIT);
+		const d = deps(git, fb.box, { github: () => github(o) });
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(fetches).toBe(3);
+		expect(result.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
+		expect(await parents(o, result.commit)).toEqual([moved, o.head7]);
+		expect(d.progress).toContain(
+			`koi could not fetch pull request 7 again while it waited (git fetch exited 128: Could not resolve host); koi merges its head ${short(o.head7)} into main itself`,
+		);
+	});
+
+	test("accepts GitHub's remade merge of a pull request retargeted while koi waits, against the branch it targets now", async () => {
+		const o = await pullRequestOrigin();
+		await moveMain(o);
+		const tip = await develop(o);
+		// gh pr view said main. Asked, GitHub says develop, then remakes its
+		// merge onto develop.
+		let asked = 0;
+		let remade = '';
+		const retargeted: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 2) remade = await remerge(o, o.head7, tip);
+				return mergeState(o, pr, asked === 1 ? null : true, 'develop');
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => retargeted);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(result.commit).toBe(remade);
+		expect(result.merge).toEqual({ head: o.head7, base: tip, baseBranch: 'develop' });
+		expect(d.progress).toContain('GitHub recomputed its merge of pull request 7');
+	});
+
+	test('merges a pull request retargeted while koi waits into the branch it targets now', async () => {
+		const o = await pullRequestOrigin();
+		await moveMain(o);
+		const tip = await develop(o);
+		const retargeted: GitHub = {
+			...github(o),
+			pullRequestMergeState: (pr) => mergeState(o, pr, null, 'develop'),
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => retargeted);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(result.merge).toEqual({ head: o.head7, base: tip, baseBranch: 'develop' });
+		expect(await parents(o, result.commit)).toEqual([tip, o.head7]);
+		expect(d.progress).toContain(
+			`GitHub did not recompute its merge of pull request 7 within 90 seconds; koi merges its head ${short(o.head7)} into develop itself`,
+		);
+	});
+
+	test('merges the head GitHub answered for, not the one koi fetched before it asked', async () => {
+		const o = await pullRequestOrigin();
+		const moved = await moveMain(o);
+		// The author pushes as koi asks, and GitHub answers for the new push.
+		let asked = 0;
+		let pushed = '';
+		const pushing: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 1) pushed = await pushAgain(o);
+				return mergeState(o, pr, false);
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => pushing);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(result.merge).toEqual({ head: pushed, base: moved, baseBranch: 'main' });
+		expect(d.progress).toContain(
+			`GitHub says pull request 7 cannot be merged into main; koi merges its head ${short(pushed)} into main itself`,
+		);
+	});
+
+	test('reads GitHub again when the author pushes between its answer and the fetch, and stops when the pushes keep coming', async () => {
+		const o = await pullRequestOrigin();
+		const moved = await moveMain(o);
+		// GitHub says the pull request cannot merge, so koi merges it at once.
+		// The author pushes just after GitHub answers koi's first read of what
+		// to merge, then stops.
+		let asked = 0;
+		let pushed = '';
+		const once: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				const said = await mergeState(o, pr, false);
+				if (asked === 2) pushed = await pushOnTop(o, asked);
+				return said;
+			},
+		};
+		const fb = running(COMMIT);
+		const result = await up({ pr: 7, comment: false }, all(o, fb.box, () => once).d);
+		expect(asked).toBe(3);
+		expect(result.merge).toEqual({ head: pushed, base: moved, baseBranch: 'main' });
+		// An author who pushes after every answer.
+		let again = 0;
+		const named: string[] = [];
+		const busy: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				again += 1;
+				const said = await mergeState(o, pr, false);
+				named.push(said.head);
+				if (again >= 2) await pushOnTop(o, 10 + again);
+				return said;
+			},
+		};
+		const stopped = fakeBox([]);
+		const err = await up({ pr: 7, comment: false }, all(o, stopped.box, () => busy).d).catch(
+			(e: unknown) => e,
+		);
+		const now = (await execOk(['git', '-C', o.origin, 'rev-parse', 'refs/pull/7/head'])).stdout;
+		expect(err).toBeInstanceOf(Error);
+		expect((err as Error).message).toBe(
+			`pull request 7 moved while koi was fetching it to merge it: GitHub named its head ${short(named.at(-1) ?? '')}, and origin had ${short(now)}. Run koi up again.`,
+		);
+		expect(again).toBe(1 + MERGE_INPUT_TRIES);
+		expect(stopped.uploads).toEqual([]);
+	});
+
+	test('stops before uploading when git is too old to merge the pull request itself', async () => {
+		const o = await pullRequestOrigin();
+		const moved = await moveMain(o);
+		// git version as Apple's git of 2024 answers it.
+		const old = (cmd: string[], options?: ExecOptions): Promise<ExecResult> =>
+			cmd.at(-1) === 'version'
+				? Promise.resolve({
+						code: 0,
+						stdout: 'git version 2.39.5 (Apple Git-154)\n',
+						stderr: '',
+						timedOut: false,
+					})
+				: asGitHub()(cmd, options);
+		const fb = fakeBox([]);
+		const d = deps(cliGit(o.user, old), fb.box, { github: () => github(o) });
+		await expect(up({ pr: 7, comment: false }, d.d)).rejects.toThrow(
+			new RegExp(
+				`^GitHub's merge of pull request 7 into main \\(refs/pull/7/merge on origin\\) is out of date\\. Its base ${short(o.base)} is behind main, now at ${short(moved)}\\. GitHub did not recompute its merge of pull request 7 within 90 seconds, and koi could not merge the pull request itself: koi merges with git merge-tree --write-tree and git --attr-source, which need git 2\\.43 or later \\(this is git version 2\\.39\\.5 \\(Apple Git-154\\)\\)\\. Try again in a minute, or build the head as pushed with koi up --pr 7 --head\\.$`,
+			),
 		);
 		expect(fb.uploads).toEqual([]);
 		expect(fb.woke()).toBe(0);
-		// --head is unaffected.
-		const head = running(o.head7);
-		await up({ pr: 7, comment: false, head: true }, run(o, head.box));
-		expect(head.uploads[0]?.commit).toBe(o.head7);
-		// A new push on top of that, and both are named.
-		await o.author('checkout', '-q', '--detach', o.head7);
-		await o.author('commit', '-q', '--allow-empty', '-m', 'pull request 7, pushed again');
-		const pushed = await o.author('rev-parse', 'HEAD');
-		await o.author('push', '-q', o.origin, `${pushed}:refs/pull/7/head`);
-		await expect(up({ pr: 7, comment: false }, run(o, fakeBox([]).box))).rejects.toThrow(
-			`is out of date. Its head ${short(o.head7)} is an earlier push, and the pull request is now at ${short(pushed)}. Its base ${short(o.base)} is behind main, now at ${short(moved)}. GitHub has not recomputed`,
-		);
 	});
 
 	test('stops before uploading when gh cannot name the base, even with another branch still at the old one', async () => {
@@ -1312,7 +1883,7 @@ describe('up --pr against a real origin', () => {
 		expect(failing.uploads).toEqual([]);
 		// gh answering, but naming no base.
 		const unnamed: GitHub = {
-			...github,
+			...github(o),
 			pullRequestBranches: async () => ({ head: 'feature', base: undefined }),
 		};
 		await expect(
@@ -1323,10 +1894,18 @@ describe('up --pr against a real origin', () => {
 		).rejects.toThrow(
 			"checking GitHub's merge of pull request 7 against its base branch needs gh, and gh pr view 7 did not name one. Check the pull request on GitHub, or build the head as pushed with koi up --pr 7 --head.",
 		);
-		// With gh naming main, the merge is seen to be behind it.
-		await expect(up({ pr: 7, comment: false }, run(o, fakeBox([]).box))).rejects.toThrow(
-			`Its base ${short(o.base)} is behind main, now at ${short(moved)}.`,
+		// With gh naming main, the merge is seen to be behind it, and koi
+		// merges into main, not the old base release is at.
+		const named = all(o, running(COMMIT).box);
+		await up({ pr: 7, comment: false }, named.d);
+		expect(named.progress).toContain(
+			`GitHub's merge of pull request 7 into main is out of date. Its base ${short(o.base)} is behind main, now at ${short(moved)}. Asking GitHub to recompute it, and waiting up to 90 seconds`,
 		);
+		expect(
+			(
+				await parents(o, (await up({ pr: 7, comment: false }, run(o, running(COMMIT).box))).commit)
+			)[0],
+		).toBe(moved);
 		// --head needs no gh.
 		const head = running(o.head7);
 		await up({ pr: 7, comment: false, head: true }, run(o, head.box, noGh));
@@ -1337,7 +1916,7 @@ describe('up --pr against a real origin', () => {
 	test('stops before uploading when gh names a base branch origin does not have', async () => {
 		const o = await pullRequestOrigin();
 		const elsewhere: GitHub = {
-			...github,
+			...github(o),
 			pullRequestBranches: async () => ({ head: 'feature', base: 'develop' }),
 		};
 		const fb = fakeBox([]);
@@ -1357,7 +1936,7 @@ describe('up --pr against a real origin', () => {
 		const o = await pullRequestOrigin();
 		const bodies: string[] = [];
 		const commenting: GitHub = {
-			...github,
+			...github(o),
 			upsertComment: async (_pr, _marker, body) => {
 				bodies.push(body);
 				return 'https://github.com/acme/hello/pull/7#issuecomment-1';

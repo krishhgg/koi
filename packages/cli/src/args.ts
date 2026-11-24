@@ -355,7 +355,8 @@ commands:
 
 options:
   --pr N          preview pull request N instead of the working tree: GitHub's
-                  merge of it into its base branch, as merging it now would give
+                  merge of it into its base branch, as merging it now would give,
+                  or koi's own merge when GitHub's stays out of date
   --head          with --pr: build the pull request's head as pushed instead
   --comment       with --pr: post or update the preview comment on the pull request
   --build         with logs: show the build log

@@ -1,5 +1,6 @@
 import type { Stats } from 'node:fs';
-import { lstat, realpath } from 'node:fs/promises';
+import { lstat, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { ExecError, type ExecOptions, type ExecResult, exec, execOk, FULL_OUTPUT } from './exec.ts';
 
@@ -19,11 +20,27 @@ export interface Git {
 	files(): Promise<string[]>;
 	// Fetches a pull request's refs from origin without touching local
 	// branches. A ref origin does not have comes back undefined; a fetch that
-	// fails (network, sign-in, a remote that is not there) throws.
-	fetchPullRequest(pr: number): Promise<PullRequestRefs>;
+	// fails (network, sign-in, a remote that is not there) throws, as does one
+	// that, with reading what it fetched, takes longer than `timeoutMs` (at
+	// most FETCH_TIMEOUT_MS).
+	fetchPullRequest(pr: number, options?: { timeoutMs?: number }): Promise<PullRequestRefs>;
 	// The branches on origin and the commit each is at now, by name, as
-	// asked of origin without fetching anything.
-	remoteBranchTips(): Promise<Map<string, string>>;
+	// asked of origin without fetching anything. Throws when origin does not
+	// answer within `timeoutMs` (at most FETCH_TIMEOUT_MS).
+	remoteBranchTips(options?: { timeoutMs?: number }): Promise<Map<string, string>>;
+	// Fetches a branch from origin without touching local branches, and
+	// returns the commit it is at. Throws when the fetch fails, a branch
+	// origin does not have included.
+	fetchBranch(branch: string): Promise<string>;
+	// Merges a pull request's head into a base commit, as GitHub makes
+	// refs/pull/N/merge, when the two merge cleanly: the commit, made as
+	// localMerge describes, or the files that conflict. The merge reads
+	// nothing of the checkout but its objects (see mergeIsolated). A shallow
+	// checkout that lacks part of either one's history fetches both whole
+	// from origin first. Throws when git cannot merge them at all: a git
+	// older than 2.43, a history koi could not fetch whole, or a head and
+	// base with no commit in common.
+	mergeCommit(base: string, head: string): Promise<{ commit: string } | { conflicts: string[] }>;
 	// An uncompressed tar of a commit's tree.
 	archive(commit: string, out: string): Promise<void>;
 	// Files changed on this branch: everything that differs from where it
@@ -43,6 +60,10 @@ export interface Git {
 	// A file's content at a commit, or undefined when it does not exist there.
 	show(commit: string, path: string): Promise<string | undefined>;
 }
+
+// git run with a time limit shared by the commands of one operation: the
+// arguments after git -C <root>, and what the command printed.
+type Timed = (args: string[], options?: ExecOptions) => Promise<string>;
 
 // A pull request's refs on origin, as one fetch found them.
 export interface PullRequestRefs {
@@ -81,14 +102,39 @@ export function cliGit(
 	// For output that is used whole, however long: an error rather than a cut list.
 	const gitAll = async (...args: string[]) =>
 		(await ok(await at(args), { maxBytes: FULL_OUTPUT })).stdout;
+	// git, for the commands of one operation that must end within `limitMs`
+	// of starting it, as a fetch and the reads after it. They share one
+	// deadline on a clock that only moves forward: each is given the time
+	// left, none starts once it has passed, and an error names `limitMs`.
+	const within = (limitMs: number): Timed => {
+		const deadline = performance.now() + limitMs;
+		return async (args, options = {}) => {
+			const cmd = await at(args);
+			const left = Math.floor(deadline - performance.now());
+			const result =
+				left > 0
+					? await run(cmd, { ...options, timeoutMs: left })
+					: { code: -1, stdout: '', stderr: '', timedOut: true };
+			if (result.code !== 0 || result.timedOut) throw new ExecError(cmd, result, limitMs);
+			return result.stdout;
+		};
+	};
+	// Deletes refs of koi's own, in one command, within what `timed` has
+	// left. Tidying only: a ref left behind keeps its commits, and nothing
+	// reads it.
+	const deleteRefs = async (refs: string[], timed: Timed) => {
+		if (refs.length === 0) return;
+		const stdin = refs.map((ref) => `delete ${ref}\n`).join('');
+		await timed(['update-ref', '--stdin'], { stdin }).catch(() => {});
+	};
 	// A commit's parents as its object names them, from the raw object rather
 	// than rev-list or log. In a shallow checkout (actions/checkout fetches
 	// the pull request's merge at depth one) a commit at the shallow boundary
 	// has its parents hidden from the history walkers, but the object still
 	// lists them. The headers end at the first blank line; a signature's
 	// continuation lines start with a space, so none matches.
-	const parentsOf = async (commit: string) => {
-		const headers = (await git('cat-file', '-p', commit)).split('\n\n', 1)[0] ?? '';
+	const parentsOf = async (commit: string, timed: Timed) => {
+		const headers = (await timed(['cat-file', '-p', commit])).split('\n\n', 1)[0] ?? '';
 		return headers.split('\n').flatMap((line) => {
 			const parent = /^parent ([0-9a-f]{40})$/.exec(line)?.[1];
 			return parent !== undefined ? [parent] : [];
@@ -116,7 +162,7 @@ export function cliGit(
 			const out = await gitAll('ls-files', '--cached', '--others', '--exclude-standard', '-z');
 			return [...new Set(out.split('\0').filter((f) => f !== ''))];
 		},
-		async fetchPullRequest(pr) {
+		async fetchPullRequest(pr, options = {}) {
 			// One fetch takes every ref under refs/pull/N/ (GitHub keeps head and
 			// merge there) into refs of koi's own. FETCH_HEAD is shared, and
 			// another fetch in this repository can replace it before koi reads it.
@@ -126,32 +172,34 @@ export function cliGit(
 			// failure, but a pattern that matches nothing is no error. So a failed
 			// fetch here always means git could not fetch, and a ref origin lacks
 			// is just missing afterwards.
+			//
+			// The fetch, the reads after it and the tidying all end within the
+			// one time limit.
+			const timed = within(fetchTimeout(options.timeoutMs));
 			const prefix = `refs/koi/pr-${pr}-${randomSuffix()}`;
-			const args = ['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${pr}/*:${prefix}/*`];
-			await ok(await at(args), { timeoutMs: FETCH_TIMEOUT_MS });
-			const fetched = (await git('for-each-ref', '--format=%(refname)', `${prefix}/`))
+			await timed(['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${pr}/*:${prefix}/*`]);
+			const fetched = (await timed(['for-each-ref', '--format=%(refname)', `${prefix}/`]))
 				.split('\n')
 				.filter((r) => r !== '');
 			try {
 				const commitAt = async (name: string) =>
 					fetched.includes(`${prefix}/${name}`)
-						? (await git('rev-parse', '--verify', `${prefix}/${name}^{commit}`)).trim()
+						? (await timed(['rev-parse', '--verify', `${prefix}/${name}^{commit}`])).trim()
 						: undefined;
 				const head = await commitAt('head');
 				const merge = await commitAt('merge');
 				if (merge === undefined) return { head, merge: undefined };
-				return { head, merge: { commit: merge, parents: await parentsOf(merge) } };
+				return { head, merge: { commit: merge, parents: await parentsOf(merge, timed) } };
 			} finally {
-				// Tidying only: a ref left behind keeps its commits, and nothing reads it.
-				for (const ref of fetched) await git('update-ref', '-d', ref).catch(() => {});
+				await deleteRefs(fetched, timed);
 			}
 		},
-		async remoteBranchTips() {
+		async remoteBranchTips(options = {}) {
 			// One line per branch: the commit, a tab, refs/heads/<name>.
 			const out = (
 				await ok(await at(['ls-remote', '--heads', 'origin']), {
 					maxBytes: FULL_OUTPUT,
-					timeoutMs: FETCH_TIMEOUT_MS,
+					timeoutMs: fetchTimeout(options.timeoutMs),
 				})
 			).stdout;
 			const tips = new Map<string, string>();
@@ -160,6 +208,64 @@ export function cliGit(
 				if (m?.[1] !== undefined && m[2] !== undefined) tips.set(m[2], m[1]);
 			}
 			return tips;
+		},
+		async fetchBranch(branch) {
+			// A name git does not take for a branch could read as a pattern or
+			// a second refspec. gh names real branches; this does not rely on it.
+			const ref = `refs/heads/${branch}`;
+			if ((await run(await at(['check-ref-format', ref]))).code !== 0) {
+				throw new Error(`${JSON.stringify(branch)} is not a branch name git accepts`);
+			}
+			const local = `refs/koi/branch-${randomSuffix()}`;
+			// --refmap= keeps git from also moving the clone's origin/<branch>,
+			// which it does for a branch named on the command line.
+			const args = ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+${ref}:${local}`];
+			const timed = within(FETCH_TIMEOUT_MS);
+			try {
+				await timed(args);
+				return (await timed(['rev-parse', '--verify', `${local}^{commit}`])).trim();
+			} finally {
+				await deleteRefs([local], timed);
+			}
+		},
+		async mergeCommit(base, head) {
+			const version = (await git('version')).trim();
+			const known = /^git version (\d+)\.(\d+)/.exec(version);
+			const [major, minor] = MIN_GIT;
+			if (known !== null && Number(known[1]) * 1000 + Number(known[2]) < major * 1000 + minor) {
+				throw new Error(
+					`koi merges with git merge-tree --write-tree and git --attr-source, which need git ${major}.${minor} or later (this is ${version})`,
+				);
+			}
+			// Where the checkout keeps its objects and its list of shallow
+			// commits, for a linked work tree too, and the hash its objects use.
+			const [objects = '', shallow = ''] = (
+				await git(
+					'rev-parse',
+					'--path-format=absolute',
+					'--git-path',
+					'objects',
+					'--git-path',
+					'shallow',
+				)
+			).split('\n');
+			const format = (await git('rev-parse', '--show-object-format')).trim();
+			const unshallow = async (timeoutMs: number) => {
+				// By commit, so that the histories fetched are the ones merged,
+				// whatever the branches on origin are at by now.
+				const args = ['fetch', '--quiet', '--no-tags', '--no-write-fetch-head', '--unshallow'];
+				await ok(await at([...args, 'origin', base, head]), { timeoutMs });
+			};
+			const work = await mkdtemp(join(tmpdir(), 'koi-merge-'));
+			try {
+				return await mergeIsolated(
+					{ run, dir: join(work, 'repo'), objects, shallow, format, unshallow },
+					base,
+					head,
+				);
+			} finally {
+				await rm(work, { recursive: true, force: true });
+			}
 		},
 		async archive(commit, out) {
 			await ok(await at(['archive', '--format=tar', `--output=${out}`, commit]), {
@@ -197,10 +303,11 @@ export function cliGit(
 					'origin',
 					`+refs/pull/${pr}/merge:${ref}`,
 				];
+				const timed = within(FETCH_TIMEOUT_MS);
 				try {
-					await ok(await at(args), { timeoutMs: FETCH_TIMEOUT_MS });
+					await timed(args);
 				} finally {
-					await git('update-ref', '-d', ref).catch(() => {});
+					await deleteRefs([ref], timed);
 				}
 				r = await diff();
 				if (r.code !== 0)
@@ -211,6 +318,263 @@ export function cliGit(
 		async show(commit, path) {
 			const r = await run(await at(['show', `${commit}:${path}`]));
 			return r.code === 0 ? r.stdout : undefined;
+		},
+	};
+}
+
+// How long git may take to merge a pull request's head into its base.
+const MERGE_TIMEOUT_MS = 10 * 60_000;
+
+// The oldest git koi makes its own merge with. Older releases either lack
+// git --attr-source or abort when git merge-tree reads attributes through it,
+// which is how koi merges (see mergeIsolated).
+const MIN_GIT = [2, 43] as const;
+
+// A time limit for one fetch: the caller's, but never more than
+// FETCH_TIMEOUT_MS.
+function fetchTimeout(timeoutMs: number | undefined): number {
+	return Math.min(FETCH_TIMEOUT_MS, timeoutMs ?? FETCH_TIMEOUT_MS);
+}
+
+// How long koi may take to check that a shallow checkout has the whole
+// history of a pull request's head and base, fetch what it lacks, and check
+// again (see mergeIsolated).
+const UNSHALLOW_BUDGET_MS = 10 * 60_000;
+
+// The settings git merges by, pinned, so that nothing set for the user's
+// checkout or machine changes the tree. Each is git's default:
+// renormalizing off, renames found (up to 7,000 files, git's limit for a
+// merge), and a file in a renamed directory left as a conflict.
+// core.attributesFile is empty so that git reads no per-user attributes
+// file, which it otherwise looks for under $XDG_CONFIG_HOME with no config
+// at all.
+const MERGE_SETTINGS = [
+	'core.attributesFile=',
+	'merge.renormalize=false',
+	'merge.renames=true',
+	'diff.renames=true',
+	'merge.renameLimit=7000',
+	'merge.directoryRenames=conflict',
+];
+
+// The environment for a git that reads nothing of the user's: no system or
+// global config file, no config passed down from a git that started koi
+// (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT), no system attributes file, and
+// none of koi's own GIT_* variables, any of which can name another
+// repository, index, work tree or attributes source.
+function isolatedEnv(): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = {
+		GIT_CONFIG_PARAMETERS: undefined,
+		GIT_CONFIG_COUNT: undefined,
+	};
+	for (const name of Object.keys(process.env)) {
+		if (name.startsWith('GIT_')) env[name] = undefined;
+	}
+	return {
+		...env,
+		GIT_CONFIG_NOSYSTEM: '1',
+		GIT_CONFIG_GLOBAL: '/dev/null',
+		GIT_ATTR_NOSYSTEM: '1',
+	};
+}
+
+// What mergeIsolated needs of the user's checkout.
+interface MergeIn {
+	run: (cmd: string[], options?: ExecOptions) => Promise<ExecResult>;
+	// The temporary repository to make, which must not exist yet.
+	dir: string;
+	// The checkout's object directory, its shallow file (there when the
+	// checkout is shallow), and its object format (sha1 or sha256).
+	objects: string;
+	shallow: string;
+	format: string;
+	// Fetches the whole history of the base and the head from origin into
+	// the checkout.
+	unshallow: (timeoutMs: number) => Promise<void>;
+}
+
+// koi's merge of a pull request, made in a temporary bare repository that
+// shares only the checkout's objects. The same two parents give the same
+// tree and commit in any checkout with the same git release (2.43 or
+// later).
+//
+// The repository has no config but what git init writes, no work tree, no
+// index and no info/attributes, and git runs with isolatedEnv, so none of
+// the user's config, attributes or merge drivers reach the merge. Its
+// GIT_OBJECT_DIRECTORY is the checkout's, so git reads the parents from
+// there and writes the merged tree and the commit there, where git archive
+// and git diff read them afterwards.
+//
+// git merges from the newest commits the two parents share, and finds them
+// by walking both histories. In a shallow checkout a boundary can hide the
+// newest one while an older one stays in reach, and git then merges from
+// the older one: a conflict, or another tree, where the whole history
+// merges cleanly. So the merge needs both histories whole. The temporary
+// repository has no list of shallow commits, so git there reads every
+// parent and fails on one the checkout lacks. When the checkout is shallow,
+// koi walks both histories there first, and on a missing parent fetches
+// them whole from origin (git fetch --unshallow) and walks them again,
+// within UNSHALLOW_BUDGET_MS. A history still not whole is refused.
+//
+// Attributes (which paths merge as union or as binary, and the like) come
+// from the .gitattributes files in the base's tree and nowhere else:
+// --attr-source names that tree, and there is nothing else to read them
+// from. That is what git merge reads when the base is checked out in a
+// fresh clone. No merge driver runs, since none is configured: a path whose
+// attributes name one merges as text, and only git's own union and binary
+// apply.
+//
+// GitHub merges with the same algorithm (ort), but it may run another git
+// release, read attributes from elsewhere, or apply LFS or union settings
+// of its own, so its tree can differ from koi's. koi's output and comment
+// say koi made the merge, its commit names koi as author, and what the
+// commit-match rule checks is the commit and its parents, not that GitHub
+// would have made the same tree.
+async function mergeIsolated(
+	m: MergeIn,
+	base: string,
+	head: string,
+): Promise<{ commit: string } | { conflicts: string[] }> {
+	const env = { ...isolatedEnv(), GIT_DIR: m.dir, GIT_OBJECT_DIRECTORY: m.objects };
+	const git = (args: string[], options: ExecOptions = {}) =>
+		m.run(['git', ...MERGE_SETTINGS.flatMap((s) => ['-c', s]), ...args], {
+			...options,
+			env: { ...env, ...options.env },
+		});
+	const gitOk = async (args: string[], options: ExecOptions = {}) => {
+		const r = await git(args, options);
+		if (r.code !== 0 || r.timedOut) throw new ExecError(['git', ...args], r, options.timeoutMs);
+		return r.stdout;
+	};
+	const init = ['git', 'init', '--quiet', '--bare', '--template=', `--object-format=${m.format}`];
+	const made = await m.run([...init, m.dir], { env: isolatedEnv() });
+	if (made.code !== 0) throw new ExecError(init, made);
+
+	if ((await lstatOrMissing(m.shallow)) !== undefined) {
+		const lacking = (why: string) =>
+			new Error(
+				`this shallow checkout lacks part of the history of the pull request's head ${head} and the base ${base}, which koi needs whole to merge them, and ${why}. Fetch the rest (git fetch --unshallow origin), then run koi up again`,
+			);
+		const deadline = performance.now() + UNSHALLOW_BUDGET_MS;
+		const left = () => {
+			const ms = Math.floor(deadline - performance.now());
+			if (ms <= 0)
+				throw lacking(`${UNSHALLOW_BUDGET_MS / 60_000} minutes were not enough to fetch it`);
+			return ms;
+		};
+		// Undefined when both histories are whole, or what git said of the
+		// parent it could not read.
+		const missing = async () => {
+			const walked = await git(['rev-list', '--quiet', base, head], { timeoutMs: left() });
+			if (walked.timedOut) throw lacking('git rev-list did not finish walking it in time');
+			return walked.code === 0 ? undefined : walked.stderr.trim().split('\n').slice(-2).join(' ');
+		};
+		if ((await missing()) !== undefined) {
+			const ms = left();
+			try {
+				await m.unshallow(ms);
+			} catch (err) {
+				throw lacking(
+					`koi could not fetch it (${err instanceof Error ? err.message : String(err)})`,
+				);
+			}
+			const still = await missing();
+			if (still !== undefined)
+				throw lacking(`git fetch --unshallow did not bring it all (${still})`);
+		}
+	}
+
+	// A head and base with no commit in common have nothing to merge from.
+	const found = await git(['merge-base', base, head]);
+	if (found.code === 1 && !found.timedOut) {
+		throw new Error(
+			`the pull request's head ${head} and the base ${base} have no commit in common, so git cannot merge them`,
+		);
+	}
+	if (found.code !== 0 || found.timedOut) throw new ExecError(['git', 'merge-base'], found);
+
+	const mergeTree = [
+		`--attr-source=${base}`,
+		'merge-tree',
+		'--write-tree',
+		'-z',
+		'--name-only',
+		'--no-messages',
+		base,
+		head,
+	];
+	const merged = await git(mergeTree, { maxBytes: FULL_OUTPUT, timeoutMs: MERGE_TIMEOUT_MS });
+	// With -z and --name-only: the tree, then each conflicted path, each
+	// ended by a NUL. It exits 0 for a clean merge and 1 for one with
+	// conflicts, but also 1, printing no tree, for a commit it cannot find.
+	// Any other answer means no merge was made.
+	const [tree = '', ...paths] = merged.stdout.split('\0');
+	const conflicted = names(paths.join('\0'));
+	const clean = merged.code === 0 && conflicted.length === 0;
+	const conflicting = merged.code === 1 && conflicted.length > 0;
+	if (merged.timedOut || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) || !(clean || conflicting)) {
+		throw new ExecError(['git', ...mergeTree], merged, MERGE_TIMEOUT_MS);
+	}
+	if (conflicting) return { conflicts: conflicted };
+	const times = (await gitOk(['show', '-s', '--format=%ct', base, head]))
+		.split('\n')
+		.filter((t) => t !== '')
+		.map(Number);
+	const commit = localMerge(tree, base, head, times);
+	return { commit: (await gitOk(commit.args, { env: commit.env })).trim() };
+}
+
+// Who koi's own merge commits name as author and committer. The address is
+// under .invalid, which no one can hold.
+const KOI_MERGE_IDENT = { name: 'koi', email: 'koi@koi.invalid' };
+
+// The git commit-tree command, and the variables to run it with, that make
+// koi's merge of a pull request from the tree git merge-tree wrote and the
+// two parents' committer times (seconds since the epoch). Everything that
+// goes into the commit is fixed by the parents, so anyone with them gets
+// the same commit:
+//
+//   tree       what git merge-tree --write-tree <base> <head> writes in
+//              isolation (see mergeIsolated): git's default settings, and
+//              attributes from the base's .gitattributes only
+//   parents    the base, then the head, as GitHub orders its merge's
+//   message    "Merge <head> into <base>", GitHub's own for its merge
+//   author and committer
+//              koi <koi@koi.invalid>, at the later of the two parents'
+//              committer times, in UTC
+//
+// It is never signed, and its message is UTF-8 with no encoding header,
+// whatever the user's git config says.
+function localMerge(
+	tree: string,
+	base: string,
+	head: string,
+	parentTimes: number[],
+): { args: string[]; env: Record<string, string> } {
+	const latest = Math.max(...parentTimes);
+	if (!Number.isSafeInteger(latest)) throw new Error('git did not give the parents a commit time');
+	const when = `@${latest} +0000`;
+	return {
+		args: [
+			'-c',
+			'i18n.commitEncoding=UTF-8',
+			'commit-tree',
+			'--no-gpg-sign',
+			'-p',
+			base,
+			'-p',
+			head,
+			'-m',
+			`Merge ${head} into ${base}`,
+			tree,
+		],
+		env: {
+			GIT_AUTHOR_NAME: KOI_MERGE_IDENT.name,
+			GIT_AUTHOR_EMAIL: KOI_MERGE_IDENT.email,
+			GIT_AUTHOR_DATE: when,
+			GIT_COMMITTER_NAME: KOI_MERGE_IDENT.name,
+			GIT_COMMITTER_EMAIL: KOI_MERGE_IDENT.email,
+			GIT_COMMITTER_DATE: when,
 		},
 	};
 }

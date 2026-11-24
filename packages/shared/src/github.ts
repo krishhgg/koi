@@ -10,6 +10,15 @@ export const GhPullRequestSchema = z.object({
 	headRefOid: z.string().optional(),
 });
 
+// `gh api repos/{owner}/{repo}/pulls/N` with --jq picking out, from the one
+// response, the base branch's name, the head commit, and whether GitHub can
+// merge the pull request (null while it works that out).
+export const GhPullRequestMergeSchema = z.object({
+	base: z.string().min(1),
+	head: z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/),
+	mergeable: z.boolean().nullable(),
+});
+
 // An issue comment from the GitHub REST API. A deleted account's comments
 // have no user.
 export const GhCommentSchema = z.object({

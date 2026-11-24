@@ -44,11 +44,11 @@ export const UpResultSchema = z
 				'How the build koi up asked for ended: running once it deployed, failed when it did not. It does not say whether the container is up now.',
 			),
 		commit: CommitSchema.describe(
-			"What koi built: for a pull request, GitHub's merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit.",
+			"What koi built: for a pull request, the merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit. The merge is GitHub's (refs/pull/N/merge), or one koi made itself from the same two parents when GitHub's stayed out of date; koi makes its own the same way every time, so the parents give the commit.",
 		),
 		pr: PrNumberSchema.optional().describe('The pull request built, with --pr.'),
 		merge: PullRequestMergeSchema.optional().describe(
-			"The parents of the merge in commit, when koi built GitHub's merge of a pull request. Absent for a working tree and with --head.",
+			'The parents of the merge in commit, when koi built a merge of a pull request. Absent for a working tree and with --head.',
 		),
 		deployment: DeploymentIdentitySchema.optional().describe(
 			"The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview.",

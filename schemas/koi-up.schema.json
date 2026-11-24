@@ -31,7 +31,7 @@
 		"commit": {
 			"type": "string",
 			"pattern": "^[0-9a-f]{40}$",
-			"description": "What koi built: for a pull request, GitHub's merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit."
+			"description": "What koi built: for a pull request, the merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit. The merge is GitHub's (refs/pull/N/merge), or one koi made itself from the same two parents when GitHub's stayed out of date; koi makes its own the same way every time, so the parents give the commit."
 		},
 		"pr": {
 			"description": "The pull request built, with --pr.",
@@ -40,7 +40,7 @@
 			"maximum": 9007199254740991
 		},
 		"merge": {
-			"description": "The parents of the merge in commit, when koi built GitHub's merge of a pull request. Absent for a working tree and with --head.",
+			"description": "The parents of the merge in commit, when koi built a merge of a pull request. Absent for a working tree and with --head.",
 			"type": "object",
 			"properties": {
 				"head": {

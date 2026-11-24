@@ -46,11 +46,78 @@ names the preview `storefront-pr-2518`. The output and the PR comment say what w
 built, "Built from #2518 (abc1234) merged into develop (def5678)", and the preview
 record keeps the merge commit and both its parents. koi checks that the merge is
 current before uploading: its head must be the PR's head now, and its base the base
-branch's tip now (asked of origin with `git ls-remote`), since GitHub may keep an old
-merge after the base alone moves on. The base branch's name comes from gh, so a merge
-build needs gh signed in and stops without it. A PR that conflicts with its base has
-no merge ref. In either case koi stops before uploading and says to rebase or merge the
-base, or to try again in a minute if GitHub has not computed the merge yet. `--head`
+branch's tip now (asked of origin with `git ls-remote`). The base branch's name comes
+from gh, so a merge build needs gh signed in and stops without it.
+
+GitHub may keep an old merge after the base alone moves on, through any number of
+fetches of the ref: only a request for the PR's mergeability (`GET
+/repos/{owner}/{repo}/pulls/{n}`, whose `mergeable` is null while GitHub works it out)
+makes it recompute the merge. So when the merge is out of date koi asks, fetches the
+merge again every 15 seconds for up to 90, and checks it each time against the base
+branch and head that GitHub's answer just named, so a PR retargeted or pushed during the
+wait is checked against what it is now. The 90 seconds are a deadline on a clock that
+only moves forward, and each gh call, fetch and sleep in the wait gets only the time
+left; a program killed at the deadline gets up to 2 seconds more for its output to end
+(`PIPE_GRACE_MS` in exec.ts). When the merge stays out of date (or GitHub says the PR cannot merge, or gh
+cannot ask, or a fetch during the wait fails), koi reads the base branch and head from
+GitHub once more, whatever happened during the wait. A read that fails is tried again,
+three times in all, 5 seconds apart, each with gh's usual 2 minute limit. Without an
+answer koi stops before uploading rather than merge a base branch or head that an
+earlier answer named, since the PR may have been retargeted or pushed since. With one,
+koi fetches the PR and checks that origin's head is the one GitHub named; when the
+author pushed in between, it reads and fetches again, up to three times, then stops.
+The API's `base.sha` is not used: GitHub leaves it at the base of the PR's last
+push, even after it remakes the merge onto a later base, so koi takes the base's tip
+from origin. If GitHub's merge has caught up by then koi builds it; otherwise koi
+merges the PR's head into the base's tip itself, with `git merge-tree --write-tree`.
+That needs git 2.43 or later: older releases lack `git --attr-source`, or abort when
+`git merge-tree` reads attributes through it, and koi refuses to merge with them.
+
+koi makes that merge in a temporary bare repository that shares only the checkout's
+objects, with no system or global git config, no work tree, index or `info/attributes`,
+and the merge settings pinned to git's defaults (no renormalizing, renames on, a rename
+limit of 7,000). Attributes come from the `.gitattributes` files in the base's tree and
+nowhere else (`git --attr-source=<base>`), as `git merge` reads them with the base
+checked out in a fresh clone, and no merge driver runs. git merges from the newest
+commits the two parents share, and in a shallow checkout a boundary can hide the newest
+one while an older one stays in reach, which can turn a clean merge into a conflict. So
+in a shallow checkout koi first walks both histories in the temporary repository, which
+has no list of shallow commits and so fails on any parent the checkout lacks. When one
+is missing, koi fetches both histories whole (`git fetch --unshallow origin <base>
+<head>`) and walks them again, for up to 10 minutes in all, and refuses a history that
+is still not whole.
+
+koi's merge depends on these inputs and no others:
+
+- the base commit, the tip on origin of the base branch GitHub's API named just before;
+- the head commit, `refs/pull/N/head` on origin, which must be the head GitHub named;
+- the whole history of both, back to their roots;
+- the `.gitattributes` files in the base's tree;
+- the git that runs it (2.43 or later), with git's default merge settings.
+
+Nothing else in the checkout or on the machine counts: not the work tree, index, config,
+`info/attributes` or hooks, not the user's global or system git config or attributes,
+and no merge driver. The same parents give the same tree in any checkout with the same
+git release.
+
+koi does not promise that its tree matches GitHub's. GitHub merges with the same
+algorithm (ort), but it may run another git release, read attributes from elsewhere, or
+apply LFS or other settings of its own, any of which can give another tree. koi's
+output and comment say koi made the merge, its commit names koi as author, and what the
+commit-match rule checks is the commit and its parents, not that GitHub would have made
+the same tree.
+
+koi commits that merge with `git commit-tree`: parents the base then the head, message
+`Merge <head> into <base>`, author and committer `koi <koi@koi.invalid>` at the later
+parent's commit time in UTC, unsigned. So the commit follows from its two parents, and
+anyone can make it again.
+koi records it exactly as it records GitHub's merge (the commit, and `merge.head`,
+`merge.base`, `merge.baseBranch`), so deployment and lease checks, which compare those
+fields, hold as they would for GitHub's. The output and the comment add that koi made
+the merge, since GitHub does not have its commit. A PR whose head conflicts with its
+base's tip has no merge, from GitHub or koi, and koi stops before uploading, names the
+conflicting files and says to rebase or merge the base. A PR with no merge ref at all
+stops the same way, as one GitHub found to conflict or has not checked yet. `--head`
 builds the head as pushed and needs no gh. Both work from a shallow checkout such as
 actions/checkout makes. The list of changed files a recipe may read comes from the PR's
 own changes either way, not from everything the merge holds. `--comment` posts or

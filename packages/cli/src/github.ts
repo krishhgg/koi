@@ -1,4 +1,9 @@
-import { GhCommentPagesSchema, GhCommentSchema, GhPullRequestSchema } from '@koi/shared';
+import {
+	GhCommentPagesSchema,
+	GhCommentSchema,
+	GhPullRequestMergeSchema,
+	GhPullRequestSchema,
+} from '@koi/shared';
 import {
 	ExecError,
 	type ExecOptions,
@@ -21,6 +26,16 @@ export interface GitHub {
 	// now (at most 3,000: a list that long may be cut). Throws when gh cannot
 	// list them.
 	pullRequestFiles(pr: number): Promise<string[]>;
+	// The pull request as one GET of it through the REST API answers: the
+	// base branch it is opened against, its head commit, and whether GitHub
+	// can merge it into the base. Asking is what makes GitHub recompute its
+	// merge (refs/pull/N/merge) when the base has moved on; fetching the ref
+	// does not. Throws when gh cannot ask, or has no answer within
+	// `timeoutMs` (at most GH_TIMEOUT_MS).
+	pullRequestMergeState(
+		pr: number,
+		options?: { timeoutMs?: number },
+	): Promise<PullRequestMergeState>;
 	// Creates the preview comment, or edits the one already there. Returns its URL.
 	upsertComment(pr: number, marker: string, body: string): Promise<string>;
 }
@@ -30,6 +45,13 @@ export interface PullRequestBranches {
 	base: string | undefined;
 	// The head commit GitHub has now; undefined when gh did not say.
 	headOid?: string | undefined;
+}
+
+export interface PullRequestMergeState {
+	baseBranch: string;
+	head: string;
+	// True or false, or null while GitHub works it out.
+	mergeable: boolean | null;
 }
 
 export class GhMissingError extends Error {
@@ -50,15 +72,17 @@ export function ghCli(
 	ownerRepo: string,
 	run: (cmd: string[], options?: ExecOptions) => Promise<ExecResult> = exec,
 ): GitHub {
-	// Throws when gh could not be started or ran out of time.
+	// Throws when gh could not be started or ran out of time: GH_TIMEOUT_MS,
+	// or less when `options` says so.
 	const gh = async (cmd: string[], options: ExecOptions = {}) => {
+		const timeoutMs = Math.min(GH_TIMEOUT_MS, options.timeoutMs ?? GH_TIMEOUT_MS);
 		let r: ExecResult;
 		try {
-			r = await run(cmd, { ...options, timeoutMs: GH_TIMEOUT_MS });
+			r = await run(cmd, { ...options, timeoutMs });
 		} catch (err) {
 			throw err instanceof SpawnError ? new GhMissingError(err) : err;
 		}
-		if (r.timedOut) throw new ExecError(cmd, r, GH_TIMEOUT_MS);
+		if (r.timedOut) throw new ExecError(cmd, r, timeoutMs);
 		return r;
 	};
 	// gh api output is parsed whole, so a long page is an error, never a cut one.
@@ -102,6 +126,36 @@ export function ghCli(
 				`repos/${ownerRepo}/pulls/${pr}/files`,
 			);
 			return r.stdout.split('\n').filter((f) => f !== '');
+		},
+		async pullRequestMergeState(pr, options = {}) {
+			// The response's base.sha is not read. It is not the base branch's
+			// tip: GitHub leaves it where the base was at the pull request's
+			// last push, and does not move it when it remakes the merge onto a
+			// later base, as the base of git/git#2000 showed (base.sha 16bd9f2,
+			// the remade merge's first parent 77904e5, master's tip).
+			const cmd = [
+				'gh',
+				'api',
+				'--jq',
+				'{base: .base.ref, head: .head.sha, mergeable: .mergeable}',
+				`repos/${ownerRepo}/pulls/${pr}`,
+			];
+			const r = await gh(cmd, options);
+			if (r.code !== 0) throw new ExecError(cmd, r);
+			let answer: unknown;
+			try {
+				answer = JSON.parse(r.stdout);
+			} catch {
+				answer = undefined;
+			}
+			const parsed = GhPullRequestMergeSchema.safeParse(answer);
+			if (!parsed.success) {
+				throw new Error(
+					`gh api repos/${ownerRepo}/pulls/${pr} answered ${JSON.stringify(r.stdout.trim().slice(0, 120))}, not the pull request's base branch, head commit and mergeability`,
+				);
+			}
+			const { base, head, mergeable } = parsed.data;
+			return { baseBranch: base, head, mergeable };
 		},
 		async upsertComment(pr, marker, body) {
 			// Only a comment this gh user wrote whose first line is the marker is

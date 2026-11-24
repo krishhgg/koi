@@ -216,6 +216,74 @@ describe('pullRequestBranches', () => {
 	});
 });
 
+describe('pullRequestMergeState', () => {
+	const HEAD = 'd'.repeat(40);
+	// gh api printing `stdout` and exiting with `code`, and the time limit
+	// each call was given.
+	function api(code: number, stdout: string) {
+		const calls: string[][] = [];
+		const limits: Array<number | undefined> = [];
+		const run = async (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+			calls.push(cmd);
+			limits.push(options?.timeoutMs);
+			return {
+				code,
+				stdout,
+				stderr: code === 0 ? '' : 'gh: Not Found (HTTP 404)',
+				timedOut: false,
+			};
+		};
+		return { run, calls, limits };
+	}
+
+	test("asks the REST API for the pull request, which is what makes GitHub recompute its merge, and gives the base branch, head and GitHub's answer from that one response", async () => {
+		for (const mergeable of [true, false, null]) {
+			const f = api(0, `${JSON.stringify({ base: 'develop', head: HEAD, mergeable })}\n`);
+			expect(await ghCli('acme/hello', f.run).pullRequestMergeState(7)).toEqual({
+				baseBranch: 'develop',
+				head: HEAD,
+				mergeable,
+			});
+			expect(f.calls).toEqual([
+				[
+					'gh',
+					'api',
+					'--jq',
+					'{base: .base.ref, head: .head.sha, mergeable: .mergeable}',
+					'repos/acme/hello/pulls/7',
+				],
+			]);
+		}
+	});
+
+	test('gives gh the time it is given, but never more than GH_TIMEOUT_MS', async () => {
+		const f = api(0, JSON.stringify({ base: 'main', head: HEAD, mergeable: null }));
+		const g = ghCli('acme/hello', f.run);
+		await g.pullRequestMergeState(7, { timeoutMs: 12_345 });
+		await g.pullRequestMergeState(7, { timeoutMs: 10 * GH_TIMEOUT_MS });
+		await g.pullRequestMergeState(7);
+		expect(f.limits).toEqual([12_345, GH_TIMEOUT_MS, GH_TIMEOUT_MS]);
+	});
+
+	test('throws when gh fails, or answers something else', async () => {
+		await expect(ghCli('acme/hello', api(1, '').run).pullRequestMergeState(7)).rejects.toThrow(
+			'gh api exited 1: gh: Not Found (HTTP 404)',
+		);
+		for (const printed of [
+			'yes\n',
+			JSON.stringify({ base: '', head: HEAD, mergeable: true }),
+			JSON.stringify({ base: 'main', head: 'abc', mergeable: true }),
+			JSON.stringify({ base: 'main', head: HEAD, mergeable: 'yes' }),
+		]) {
+			await expect(
+				ghCli('acme/hello', api(0, printed).run).pullRequestMergeState(7),
+			).rejects.toThrow(
+				`gh api repos/acme/hello/pulls/7 answered ${JSON.stringify(printed.trim())}, not the pull request's base branch, head commit and mergeability`,
+			);
+		}
+	});
+});
+
 describe('without gh installed', () => {
 	// The real exec, on a machine where gh is not there.
 	const noGh = (cmd: string[], options?: ExecOptions) =>
