@@ -348,6 +348,8 @@ export class Deployer {
 	// it may be one koid stopped for disk use before a restart, whose record
 	// could not say so.
 	private diskChecked = false;
+	// Settles when diskChecked becomes true. restore waits for it.
+	private readonly diskMeasured = Promise.withResolvers<void>();
 	// Running containers koid found outside the slice and has not managed to
 	// stop yet. Nothing routes or wakes them, and the watchdog's timer tries
 	// the stop again (stopMisplaced).
@@ -1113,9 +1115,11 @@ export class Deployer {
 	// last start failed (koid stopped it on purpose; a visit still tries
 	// again), and a preview past its ttl, which expire() at startup has
 	// already retired and start() would retire rather than start. Call it
-	// after expire() and the disk watchdog's first run: until a watchdog run
-	// has measured them, start() starts no stopped container.
+	// after expire(). It first waits for a disk watchdog run to measure the
+	// containers, the one at startup or, if that failed, a later one on the
+	// timer: until one has, start() starts no stopped container.
 	async restore(): Promise<string[]> {
+		await this.diskMeasured.promise;
 		const now = this.deps.now().getTime();
 		const due = (await this.records()).filter((r) => {
 			const d = r.deployment;
@@ -1627,6 +1631,7 @@ export class Deployer {
 		const over = (await deps.docker.diskUsage()).filter((c) => c.bytes > limitBytes);
 		for (const c of over) this.halted.add(c.name);
 		this.diskChecked = true;
+		this.diskMeasured.resolve();
 		const stopped: string[] = [];
 		for (const c of over) {
 			const reason = `stopped for disk use: its writable layer and volumes reached ${gib(c.bytes)} GiB, over the ${gib(limitBytes)} GiB limit`;

@@ -250,9 +250,10 @@ async function daemon(): Promise<void> {
 	// has measured them.
 	await deployer.stopOversized().catch((err: unknown) => log(`disk watchdog: ${errorText(err)}`));
 	// After expiry and the disk watchdog, so that neither a preview past its
-	// ttl nor one over its disk limit starts. Not awaited: health checks can
-	// take minutes, and a visit that comes meanwhile shares its preview's
-	// start.
+	// ttl nor one over its disk limit starts. If the watchdog's run above
+	// failed, restore waits for the first run of the timer below that
+	// succeeds. Not awaited: health checks can take minutes, and a visit that
+	// comes meanwhile shares its preview's start.
 	void deployer
 		.restore()
 		.then((labels) => labels.length > 0 && log(`started ${labels.join(', ')}`))

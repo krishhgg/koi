@@ -2465,6 +2465,27 @@ describe('restore', () => {
 		expect(t.lastRoutes()).toEqual(routes);
 	});
 
+	test('when the first disk scan fails, starts the stopped previews after the next scan that succeeds', async () => {
+		const t = await setup();
+		await t.up(request());
+		const container = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		t.docker.stopAll();
+		const deployer = t.restart();
+		await deployer.reconcile();
+		await deployer.expire();
+		t.docker.diskUsageError = 'docker system df timed out';
+		await expect(deployer.stopOversized()).rejects.toThrow('docker system df timed out');
+		const restoring = deployer.restore();
+		await Promise.race([restoring, Bun.sleep(20)]);
+		expect(t.docker.starts).toEqual([]);
+		// The five-minute timer's scan.
+		t.docker.diskUsageError = undefined;
+		await deployer.stopOversized();
+		expect(await restoring).toEqual(['hello-pr-7']);
+		expect(t.docker.starts).toEqual([container]);
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
+	});
+
 	test.each([
 		['Caddy', (t: Awaited<ReturnType<typeof setup>>) => t.rejectNextApply('connection refused')],
 		['the egress proxy', (t: Awaited<ReturnType<typeof setup>>) => t.rejectMaps(3)],
