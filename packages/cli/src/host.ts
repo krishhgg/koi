@@ -9,13 +9,14 @@ import {
 import { SshClient } from './ssh.ts';
 import { type HostTransport, UnsupportedCapabilityError, verifiedTransport } from './transport.ts';
 import { awsTransport, type Clients, clients, resolveSettings } from './transports/aws.ts';
+import { localTransport } from './transports/local.ts';
 import { sshTransport } from './transports/ssh.ts';
 
 // From the command line and the environment to an open, checked transport:
 // resolve the target (config.ts), build the transport for its kind, and see
 // that the host's descriptor is compared with the target before anything is
 // sent to koid: the AWS transport is wrapped for it (transport.ts), the SSH
-// transport does it itself (transports/ssh.ts).
+// and local transports do it themselves (transports/ssh.ts, local.ts).
 
 export interface OpenHostOptions {
 	flags: TargetFlags;
@@ -63,8 +64,14 @@ export async function openHost(o: OpenHostOptions): Promise<OpenedHost> {
 	// The selected target, with the file it came from, so that a config file
 	// or alias chosen by something other than the user shows up before any
 	// source is uploaded.
+	const transport =
+		target.transport.kind === 'local'
+			? `local, koid at ${target.transport.controlSocket}`
+			: target.transport.kind;
 	o.notice(
-		`target ${name} (${describeSource(resolved.source)}) from ${resolved.configPath}: ${target.transport.kind}, previews under ${target.domain}`,
+		resolved.source === 'local'
+			? `target ${name} (--local, built in): ${transport}, previews under ${target.domain}`
+			: `target ${name} (${describeSource(resolved.source)}) from ${resolved.configPath}: ${transport}, previews under ${target.domain}`,
 	);
 	return {
 		box: transportFor(name, target, make, o.notice, o.env),
@@ -83,6 +90,8 @@ function describeSource(source: TargetSource): string {
 			return '.koi/target.yaml';
 		case 'default':
 			return 'defaultTarget';
+		case 'local':
+			return '--local';
 	}
 }
 
@@ -149,10 +158,20 @@ export function transportFor(
 				{ progress: notice },
 			);
 		}
-		case 'local':
-			throw new UnsupportedCapabilityError(
-				'local',
-				`target ${quoted} uses the local transport, which this version of koi does not support yet`,
+		case 'local': {
+			// koid on this machine is on or off; koi neither starts nor stops it.
+			if (target.power.kind !== 'always-on') {
+				throw new UnsupportedCapabilityError(
+					'power',
+					`target ${quoted} reaches koid on this machine and manages its power with ${target.power.kind}; a local target takes power: always-on`,
+				);
+			}
+			// Checks the host's descriptor itself, as the SSH transport does,
+			// since its uploads reach koid directly.
+			return localTransport(
+				{ name, socket: target.transport.controlSocket, domain: target.domain },
+				{ progress: notice },
 			);
+		}
 	}
 }

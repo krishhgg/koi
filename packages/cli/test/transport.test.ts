@@ -341,7 +341,47 @@ describe('openHost with a configured target', () => {
 		await opened.box.close();
 	});
 
-	test('an SSH target with ec2 power, a local target, a channel or another port is not supported yet', async () => {
+	test('a local target opens the local transport, and --local the built-in one, with no file', async () => {
+		const h = await home({
+			version: 1,
+			targets: {
+				dev: {
+					domain: 'koi.test',
+					transport: { kind: 'local', controlSocket: '/run/koi-local/control.sock' },
+					power: { kind: 'always-on' },
+				},
+			},
+		});
+		const n = notices();
+		const opened = await openHost({
+			flags: { target: 'dev' },
+			env: { HOME: h },
+			checkoutDir: '/nonexistent',
+			notice: n.notice,
+			awsClients: () => {
+				throw new Error('no AWS clients expected');
+			},
+		});
+		expect(opened.domain).toBe('koi.test');
+		// Nothing is opened until a command asks: the socket is not there.
+		await expect(opened.box.ensureAwake(() => {})).rejects.toThrow(
+			'there is no control socket at /run/koi-local/control.sock, so koid is not running on this machine',
+		);
+		const empty = await home();
+		const local = await openHost({
+			flags: { local: true, domain: 'dev.koi.test' },
+			env: { HOME: empty, KOID_CONTROL_SOCKET: '/run/koi-local/control.sock' },
+			checkoutDir: '/nonexistent',
+			notice: n.notice,
+		});
+		expect(local.domain).toBe('dev.koi.test');
+		expect(n.lines).toEqual([
+			`target dev (--target) from ${join(h, '.config', 'koi', 'config.yaml')}: local, koid at /run/koi-local/control.sock, previews under koi.test`,
+			'target local (--local, built in): local, koid at /run/koi-local/control.sock, previews under dev.koi.test',
+		]);
+	});
+
+	test('an SSH target with ec2 power, a local one with ec2 power, a channel or another port is not supported yet', async () => {
 		const h = await home({
 			version: 1,
 			targets: {
@@ -349,7 +389,8 @@ describe('openHost with a configured target', () => {
 				local: {
 					domain: 'koi.test',
 					transport: { kind: 'local', controlSocket: '/run/koi-local/control.sock' },
-					power: { kind: 'always-on' },
+					power: { kind: 'ec2' },
+					aws: AWS_TARGET.aws,
 				},
 				port: { ...AWS_TARGET, address: { port: 8443 } },
 				channel: {
@@ -375,7 +416,7 @@ describe('openHost with a configured target', () => {
 			],
 			[
 				'local',
-				/target "local" uses the local transport, which this version of koi does not support yet/,
+				/target "local" reaches koid on this machine and manages its power with ec2; a local target takes power: always-on/,
 			],
 			[
 				'port',

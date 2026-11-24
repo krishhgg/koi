@@ -75,6 +75,9 @@ export interface ParsedCli {
 	target: string | undefined;
 	config: string | undefined;
 	domain: string | undefined;
+	// --local: koid on this machine, with no config file (config.ts,
+	// localTarget).
+	local: boolean;
 	// With config or target: the subcommand. `name` is import-aws's --name,
 	// or the target named on the command line of a target command.
 	sub: ConfigSubcommand | TargetSubcommand | undefined;
@@ -107,6 +110,7 @@ export function parseCli(argv: string[]): ParsedCli {
 			target: { type: 'string' },
 			config: { type: 'string' },
 			domain: { type: 'string' },
+			local: { type: 'boolean', default: false },
 			name: { type: 'string' },
 			replace: { type: 'boolean', default: false },
 			fingerprint: { type: 'string' },
@@ -209,6 +213,14 @@ export function parseCli(argv: string[]): ParsedCli {
 	] as const) {
 		if (value === '') throw new Error(`${flag} needs a value`);
 	}
+	if (values.local) {
+		if (values.target !== undefined) {
+			throw new Error('--local and --target both pick a target; pass one of them');
+		}
+		if (command === 'target' || sub === 'import-aws') {
+			throw new Error(`--local does not go with ${command} ${sub}`);
+		}
+	}
 	if (values.name !== undefined && sub !== 'import-aws') {
 		throw new Error('--name goes with config import-aws');
 	}
@@ -260,6 +272,7 @@ export function parseCli(argv: string[]): ParsedCli {
 		target: values.target,
 		config: values.config,
 		domain: values.domain,
+		local: values.local,
 		sub,
 		name,
 		replace: values.replace,
@@ -366,6 +379,9 @@ options:
                   $XDG_CONFIG_HOME/koi/config.yaml or ~/.config/koi/config.yaml)
   --domain D      the domain the host must serve previews under, instead of the
                   target's; never changes which host is used
+  --local         use koid on this machine: its control socket (KOID_CONTROL_SOCKET,
+                  else /run/koi/control.sock) and previews under koi.test, with no
+                  config file
   --fingerprint F with target trust: the host key's SHA256 fingerprint, as the
                   host's operator read it with ssh-keygen -l
   --minutes N     with lease: how long to hold the preview, at most ${LEASE_MAX_MINUTES}
@@ -377,6 +393,7 @@ options:
 
 environment:
   KOI_TARGET and KOI_CONFIG, as --target and --config. KOI_DOMAIN as --domain.
+  KOID_CONTROL_SOCKET: with --local, where koid's control socket is.
   On an AWS target, or without a config file: KOI_AWS_PROFILE (default koi-cli),
   KOI_AWS_REGION (default us-east-1), KOI_INSTANCE_ID and KOI_BUCKET. Without a
   config file the rest is discovered: the box by its tags, the domain from the

@@ -49,7 +49,7 @@ export async function configCommand(
 // design (references only), so the target prints whole; a field that ever
 // carries one must be left out here.
 async function show(cli: ParsedCli, io: Io, deps: ConfigCommandDeps): Promise<number> {
-	const flags = { target: cli.target, config: cli.config, domain: cli.domain };
+	const flags = { target: cli.target, config: cli.config, domain: cli.domain, local: cli.local };
 	const resolved = await resolveTarget({
 		flags,
 		env: deps.env,
@@ -87,7 +87,7 @@ async function show(cli: ParsedCli, io: Io, deps: ConfigCommandDeps): Promise<nu
 	if (cli.json) {
 		io.stdout(
 			`${JSON.stringify({
-				file: resolved.configPath,
+				file: resolved.source === 'local' ? null : resolved.configPath,
 				target: resolved.name,
 				source: resolved.source,
 				settings: resolved.target,
@@ -96,7 +96,9 @@ async function show(cli: ParsedCli, io: Io, deps: ConfigCommandDeps): Promise<nu
 		return 0;
 	}
 	io.stdout(
-		`target ${resolved.name} (from ${sourceWords(resolved.source)}) in ${resolved.configPath}:\n${indent(toYaml(resolved.target))}`,
+		resolved.source === 'local'
+			? `target local (from --local, built in):\n${indent(toYaml(resolved.target))}`
+			: `target ${resolved.name} (from ${sourceWords(resolved.source)}) in ${resolved.configPath}:\n${indent(toYaml(resolved.target))}`,
 	);
 	return 0;
 }

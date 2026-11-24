@@ -126,6 +126,22 @@ describe('parseCli', () => {
 		expect(parseCli(['logs', 'a', '--target', 't']).target).toBe('t');
 	});
 
+	test('--local picks koid on this machine, never with --target, a target command or an import', () => {
+		expect(parseCli(['up', '--local']).local).toBe(true);
+		expect(parseCli(['down', 'hello', '--local', '--domain', 'dev.koi.test']).local).toBe(true);
+		expect(parseCli(['config', 'show', '--local']).local).toBe(true);
+		expect(parseCli(['up']).local).toBe(false);
+		expect(() => parseCli(['up', '--local', '--target', 'team'])).toThrow(
+			'--local and --target both pick a target; pass one of them',
+		);
+		expect(() => parseCli(['target', 'show', 'team', '--local'])).toThrow(
+			'--local does not go with target show',
+		);
+		expect(() => parseCli(['config', 'import-aws', '--name', 'x', '--local'])).toThrow(
+			'--local does not go with config import-aws',
+		);
+	});
+
 	test('an empty selector is an error', () => {
 		for (const flag of ['--target', '--config', '--domain']) {
 			expect(() => parseCli(['up', `${flag}=`])).toThrow(`${flag} needs a value`);
