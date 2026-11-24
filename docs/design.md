@@ -163,12 +163,13 @@ files stay on disk; keys do not, though their tokens come back unchanged when th
 page registers them again (see Keys). The box stopping stops every preview container,
 and Docker does not start them again. koid does, as soon as it starts: every preview
 that has a deployment, at the same URL with the same deployment and login key,
-each routed once it answers its health check. It skips a preview stopped for disk use,
-one whose last start failed, and one past its ttl, which expires instead. A visit while
-its preview starts gets the waiting page until it answers. Seven days after a
-preview's last visit its container and files are deleted and the link reports that it
-expired. The wake Lambda checks a list of live previews before starting the box, so
-scanners hitting random hostnames do not wake it.
+one at a time, each routed once it answers its health check. It skips a preview stopped
+for disk use, one whose container did not start or answer last time, and one past its
+ttl, which expires instead. A visit to a preview still waiting its turn starts it at
+once; a visit while its preview starts gets the waiting page until it answers. Seven
+days after a preview's last visit its container and files are deleted and the link
+reports that it expired. The wake Lambda checks a list of live previews before
+starting the box, so scanners hitting random hostnames do not wake it.
 
 ## Parts
 

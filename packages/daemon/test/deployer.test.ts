@@ -2465,6 +2465,38 @@ describe('restore', () => {
 		expect(t.lastRoutes()).toEqual(routes);
 	});
 
+	test('starts one preview at a time, through its health check, and a visit starts one still waiting', async () => {
+		const t = await setup();
+		const labels = ['hello-pr-7', 'other', 'third'];
+		await t.up(request());
+		await t.up(request({ id: 'bbbbbbbbbbbbbbbb2', label: 'other', pr: 8 }));
+		await t.up(request({ id: 'cccccccccccccccc3', label: 'third', pr: 9 }));
+		const labelOf = new Map<string, string>();
+		for (const label of labels) {
+			labelOf.set((await t.store.get(label))?.deployment?.container ?? '', label);
+		}
+		const started = () => t.docker.starts.map((c) => labelOf.get(c));
+		t.docker.stopAll();
+		const deployer = t.restart();
+		await deployer.reconcile();
+		await deployer.expire();
+		await deployer.stopOversized();
+		const checking = t.hold('probe');
+		const restoring = deployer.restore();
+		await checking.reached;
+		const first = started()[0] ?? '';
+		const [visited = '', last = ''] = labels.filter((l) => l !== first);
+		// The first is in its health check, and the others have not started.
+		// A visit to one of them starts it now and shares nothing.
+		await deployer.ensureRunning(visited);
+		expect(started()).toEqual([first, visited]);
+		expect(await deployer.view(visited)).toEqual({ kind: 'running' });
+		checking.release();
+		expect(await restoring).toEqual([first, last].sort());
+		expect(started()).toEqual([first, visited, last]);
+		expect(t.lastRoutes()).toHaveLength(3);
+	});
+
 	test('when the first disk scan fails, starts the stopped previews after the next scan that succeeds', async () => {
 		const t = await setup();
 		await t.up(request());

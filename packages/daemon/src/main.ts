@@ -89,8 +89,9 @@ function configOrExit(): Config {
 //    needs, which only decides whether it is available;
 // 4. expire previews whose ttl passed while the box slept;
 // 5. stop and block previews over their disk limit, stopped ones included;
-// 6. start every other preview that serves, in the background: Docker
-//    leaves them stopped when the box stops (Deployer.restore);
+// 6. start every other preview that serves, one at a time in the
+//    background: Docker leaves them stopped when the box stops
+//    (Deployer.restore);
 // 7. start the log sink, the HTTP server and the control socket;
 // 8. start the timers.
 async function daemon(): Promise<void> {
@@ -253,7 +254,7 @@ async function daemon(): Promise<void> {
 	// ttl nor one over its disk limit starts. If the watchdog's run above
 	// failed, restore waits for the first run of the timer below that
 	// succeeds. Not awaited: health checks can take minutes, and a visit that
-	// comes meanwhile shares its preview's start.
+	// comes meanwhile starts its preview or shares its start.
 	void deployer
 		.restore()
 		.then((labels) => labels.length > 0 && log(`started ${labels.join(', ')}`))

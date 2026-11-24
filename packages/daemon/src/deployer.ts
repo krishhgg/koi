@@ -1099,51 +1099,57 @@ export class Deployer {
 		await this.sync();
 	}
 
-	// Starts every preview that serves and is not routed, all at once, each
-	// as a visit would (ensureRunning), and resolves once every start has
-	// ended. Returns the labels routed after their start. koid calls it at
-	// startup without waiting: preview containers run with --restart no
-	// (docker.ts, runArgs), so the box stopping leaves every one stopped, and
-	// without this a preview started again only once a request reached
-	// koid. A visit that comes during a start shares it.
+	// Starts every preview that serves and is not routed, each as a visit
+	// would (ensureRunning), and resolves once every start has ended.
+	// Returns the labels routed after their start. koid calls it at startup
+	// without waiting: preview containers run with --restart no (docker.ts,
+	// runArgs), so the box stopping leaves every one stopped, and without
+	// this a preview started again only once a request reached koid.
+	//
+	// One start at a time, health check included: each container may use
+	// the memory in CONTAINER_LIMITS (docker.ts), and several at their
+	// start-up peak together can exceed the slice's memory ceiling, which
+	// kills one that would have started alone. A visit does not wait its
+	// preview's turn: it starts the preview at once, or shares a start
+	// already in progress. Each preview's record is read again just before
+	// its turn, so one that a visit started or failed to start meanwhile is
+	// skipped.
 	//
 	// The record's own deployment starts, from its container or, if that is
 	// gone, from its image with the recorded environment, so the URL, the
 	// deployment a lease holds and the login key stay what they were. Each
 	// container is routed only once it answers its health check, as on any
 	// wake. Not started: a deployment halted for disk use, a preview whose
-	// last start failed (koid stopped it on purpose; a visit still tries
-	// again), and a preview past its ttl, which expire() at startup has
-	// already retired and start() would retire rather than start. Call it
-	// after expire(). It first waits for a disk watchdog run to measure the
-	// containers, the one at startup or, if that failed, a later one on the
-	// timer: until one has, start() starts no stopped container.
+	// container did not start or answer last time (koid stopped it on
+	// purpose; a visit still tries again), and a preview past its ttl, which
+	// expire() at startup has already retired and start() would retire
+	// rather than start. Call it after expire(). It first waits for a disk
+	// watchdog run to measure the containers, the one at startup or, if that
+	// failed, a later one on the timer: until one has, start() starts no
+	// stopped container.
 	async restore(): Promise<string[]> {
 		await this.diskMeasured.promise;
-		const now = this.deps.now().getTime();
-		const due = (await this.records()).filter((r) => {
-			const d = r.deployment;
-			return (
-				d !== undefined &&
-				d.halted === undefined &&
-				!this.ready.has(d.container) &&
-				!r.error?.startsWith(WAKE_FAILED) &&
-				!this.lapsed(r, now)
-			);
-		});
 		const restored: string[] = [];
-		await Promise.all(
-			due.map(async (r) => {
-				try {
-					await this.ensureRunning(r.label);
-				} catch (err) {
-					this.deps.log(`starting ${r.label}: ${message(err)}`);
-					return;
+		for (const { label } of await this.records()) {
+			try {
+				const r = await this.deps.store.get(label);
+				const d = r?.deployment;
+				if (
+					r === undefined ||
+					d === undefined ||
+					d.halted !== undefined ||
+					this.ready.has(d.container) ||
+					r.error?.startsWith(WAKE_FAILED) ||
+					this.lapsed(r, this.deps.now().getTime())
+				) {
+					continue;
 				}
-				const container = r.deployment?.container;
-				if (container !== undefined && this.ready.has(container)) restored.push(r.label);
-			}),
-		);
+				await this.ensureRunning(label);
+				if (this.ready.has(d.container)) restored.push(label);
+			} catch (err) {
+				this.deps.log(`starting ${label}: ${message(err)}`);
+			}
+		}
 		return restored.sort();
 	}
 
