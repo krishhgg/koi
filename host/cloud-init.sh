@@ -482,11 +482,12 @@ rm -f /etc/caddy/Caddyfile
 
 # What Caddy's DNS module reads from its environment: on AWS the region, with
 # credentials from the box's role; elsewhere a provider's token, from a file
-# of root's that host/install-vm.sh makes for the operator to fill.
+# of root's, in a directory of root's, that host/install-vm.sh makes for the
+# operator to fill.
 if [ "$KOI_TLS" = route53 ]; then
 	caddy_env="Environment=AWS_REGION=$KOI_REGION"
 else
-	caddy_env='EnvironmentFile=-/etc/caddy/koi.env'
+	caddy_env='EnvironmentFile=-/etc/koi/caddy/env'
 fi
 # Unquoted, for that line; nothing else in the unit expands.
 cat > /etc/systemd/system/caddy.service <<UNIT

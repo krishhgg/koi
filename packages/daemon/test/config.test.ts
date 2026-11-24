@@ -20,7 +20,7 @@ describe('loadConfig', () => {
 			caddyfile: '/var/lib/koi-caddy/Caddyfile',
 			caddyAdmin: 'http://127.0.0.1:2019',
 			tls: 'route53',
-			tlsDnsFile: '/etc/caddy/koi-dns.caddy',
+			tlsDnsFile: '/etc/koi/caddy/dns.caddy',
 			dockerRoot: '/var/lib/docker',
 			network: 'koi-previews',
 			buildNetwork: 'koi-build',

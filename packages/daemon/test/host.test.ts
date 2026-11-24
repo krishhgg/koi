@@ -1624,7 +1624,7 @@ describe('host/cloud-init.sh outside AWS, run in bash', () => {
 				`curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64${module} -o ${r.dir}/caddy.new`,
 			);
 			const unit = (await r.read('caddy.service')) ?? '';
-			expect(unit).toContain('\nEnvironmentFile=-/etc/caddy/koi.env\n');
+			expect(unit).toContain('\nEnvironmentFile=-/etc/koi/caddy/env\n');
 			expect(unit).not.toContain('AWS_REGION');
 			// Caddy serves nothing until koid writes its file with the mode's block.
 			expect(await r.read('Caddyfile')).toBe(

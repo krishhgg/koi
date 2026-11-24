@@ -27,9 +27,12 @@ SHARE=/usr/local/share/koi
 KOI_ENV=/etc/koi/env
 EGRESS_ENV=/etc/koi/egress/env
 # Read by Caddy alone (cloud-init.sh's caddy.service, and the import in the
-# Caddyfile koid writes): a DNS provider's token never reaches koid.
-CADDY_ENV=/etc/caddy/koi.env
-DNS_FILE=/etc/caddy/koi-dns.caddy
+# Caddyfile koid writes): a DNS provider's token never reaches koid. The
+# directory is root's, so that only root makes entries in it; /etc/caddy is
+# the caddy account's, which could plant a link where root then writes.
+CADDY_DIR=/etc/koi/caddy
+CADDY_ENV=$CADDY_DIR/env
+DNS_FILE=$CADDY_DIR/dns.caddy
 # Where Caddy keeps its own CA's root (XDG_DATA_HOME=/var/lib in its unit).
 CADDY_ROOT=/var/lib/caddy/pki/authorities/local/root.crt
 KOID_HEALTH=http://127.0.0.1:7777/__koi/health
@@ -157,6 +160,7 @@ install_bundle() {
 write_dns_files() {
 	case $TLS in acme-dns:*) ;; *) return 0 ;; esac
 	local provider=${TLS#acme-dns:}
+	install -d -o root -g caddy -m 0750 "$CADDY_DIR"
 	if [ ! -e "$DNS_FILE" ]; then
 		printf '%s\n' \
 			"# The DNS provider Caddy proves control of *.$DOMAIN with (koid's Caddyfile" \

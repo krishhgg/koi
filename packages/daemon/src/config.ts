@@ -117,7 +117,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 		caddyfile: env.KOI_CADDYFILE ?? '/var/lib/koi-caddy/Caddyfile',
 		caddyAdmin: env.KOI_CADDY_ADMIN ?? 'http://127.0.0.1:2019',
 		tls: env.KOI_TLS || 'route53',
-		tlsDnsFile: env.KOI_TLS_DNS_FILE ?? '/etc/caddy/koi-dns.caddy',
+		tlsDnsFile: env.KOI_TLS_DNS_FILE ?? '/etc/koi/caddy/dns.caddy',
 		dockerRoot: env.KOI_DOCKER_ROOT ?? '/var/lib/docker',
 		network: env.KOI_PREVIEW_NETWORK ?? 'koi-previews',
 		buildNetwork: env.KOI_BUILD_NETWORK ?? 'koi-build',

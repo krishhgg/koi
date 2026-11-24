@@ -239,12 +239,14 @@ update the host.
 |---|---|---|
 | `internal` | One wildcard certificate from Caddy's own CA. | Every machine that visits previews trusts the CA's root, `/var/lib/caddy/pki/authorities/local/root.crt`: on the host itself, `sudo caddy trust`. |
 | `acme-http` | A certificate per preview name from Let's Encrypt, which cannot issue a wildcard over HTTP. Caddy gets one at the first visit of a name, once koid confirms the name is a preview's (`/__koi/tls-ask`), so a stranger cannot make the host order certificates for names of their choosing. | A DNS record `*.D` pointing at the host, and ports 80 and 443 open to the internet: Let's Encrypt checks each name over HTTP-01 on 80 or TLS-ALPN-01 on 443. Let's Encrypt allows 50 new certificates a week for a registered domain. |
-| `acme-dns:PROVIDER` | One wildcard certificate from Let's Encrypt over DNS-01, through `github.com/caddy-dns/PROVIDER` (`cloudflare`, `digitalocean`, `hetzner` and so on), which the installer builds Caddy with. | A DNS record `*.D` pointing at the host, port 443 open to visitors, and the provider's API token in `/etc/caddy/koi.env` (`KOI_DNS_API_TOKEN=...`, mode 0600), then `systemctl restart caddy`. The installer writes `/etc/caddy/koi-dns.caddy` with `dns PROVIDER {env.KOI_DNS_API_TOKEN}`; edit it for a provider that takes other arguments. It keeps both files on a run again. |
+| `acme-dns:PROVIDER` | One wildcard certificate from Let's Encrypt over DNS-01, through `github.com/caddy-dns/PROVIDER` (`cloudflare`, `digitalocean`, `hetzner` and so on), which the installer builds Caddy with. | A DNS record `*.D` pointing at the host, port 443 open to visitors, and the provider's API token in `/etc/koi/caddy/env` (`KOI_DNS_API_TOKEN=...`, mode 0600), then `systemctl restart caddy`. The installer writes `/etc/koi/caddy/dns.caddy` with `dns PROVIDER {env.KOI_DNS_API_TOKEN}`; edit it for a provider that takes other arguments. It keeps both files on a run again. |
 
 koid reads the mode from `KOI_TLS` in `/etc/koi/env` and writes the matching
 `tls` block into the Caddyfile it owns. With `acme-dns` the block imports
-`/etc/caddy/koi-dns.caddy`, which root owns and Caddy reads, and the token is in
-Caddy's environment alone, so koid never sees it. The AWS box sets no `KOI_TLS`
+`/etc/koi/caddy/dns.caddy`, which root owns and Caddy reads, and the token is in
+Caddy's environment alone, so koid never sees it. Both files are in
+`/etc/koi/caddy`, a directory of root's that Caddy may read, so that no other
+account can put a file or a link there. The AWS box sets no `KOI_TLS`
 and keeps its Route 53 block.
 
 The installer changes the machine as `host/cloud-init.sh` changes the AWS box

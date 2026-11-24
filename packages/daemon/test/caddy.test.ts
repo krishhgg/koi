@@ -97,9 +97,9 @@ describe('renderCaddyfile', () => {
 		const dns = renderCaddyfile({
 			...base,
 			routes,
-			tls: { kind: 'acme-dns', file: '/etc/caddy/koi-dns.caddy' },
+			tls: { kind: 'acme-dns', file: '/etc/koi/caddy/dns.caddy' },
 		});
-		expect(dns).toBe(offAws.replace(block, '\ttls {\n\t\timport /etc/caddy/koi-dns.caddy\n\t}\n'));
+		expect(dns).toBe(offAws.replace(block, '\ttls {\n\t\timport /etc/koi/caddy/dns.caddy\n\t}\n'));
 		// On demand, with koid's answer to which names are previews'.
 		const http = renderCaddyfile({ ...base, routes, tls: { kind: 'acme-http' } });
 		expect(http).toBe(

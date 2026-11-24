@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { exec } from '../src/exec.ts';
@@ -24,7 +24,7 @@ async function box(): Promise<Box> {
 	const dir = await mkdtemp(join(tmpdir(), 'koi-install-vm-'));
 	const bundle = join(dir, 'bundle');
 	const calls = join(dir, 'calls');
-	for (const d of ['bundle', 'etc/koi/egress', 'etc/caddy', 'bin', 'share', 'src']) {
+	for (const d of ['bundle', 'etc/koi/egress', 'bin', 'share', 'src']) {
 		await mkdir(join(dir, d), { recursive: true });
 	}
 	await writeFile(calls, '');
@@ -71,8 +71,9 @@ async function run(b: Box, body: string, stubs = '') {
 			`SHARE='${b.dir}/share'`,
 			`KOI_ENV='${b.dir}/etc/koi/env'`,
 			`EGRESS_ENV='${b.dir}/etc/koi/egress/env'`,
-			`CADDY_ENV='${b.dir}/etc/caddy/koi.env'`,
-			`DNS_FILE='${b.dir}/etc/caddy/koi-dns.caddy'`,
+			`CADDY_DIR='${b.dir}/etc/koi/caddy'`,
+			`CADDY_ENV='${b.dir}/etc/koi/caddy/env'`,
+			`DNS_FILE='${b.dir}/etc/koi/caddy/dns.caddy'`,
 			`calls='${b.calls}'`,
 			`printf 'ID=ubuntu\\nVERSION_ID="24.04"\\n' > "$OS_RELEASE"`,
 			'id() { case "$1" in -u) echo 0 ;; alice | bob) return 0 ;; *) return 1 ;; esac; }',
@@ -206,23 +207,34 @@ describe('host/install-vm.sh, run whole', () => {
 				'',
 			].join('\n'),
 		);
-		expect(await r.read('etc/caddy/koi-dns.caddy')).toContain(
+		expect(await r.read('etc/koi/caddy/dns.caddy')).toContain(
 			'\ndns cloudflare {env.KOI_DNS_API_TOKEN}\n',
 		);
-		expect(await r.read('etc/caddy/koi.env')).toEndWith('\nKOI_DNS_API_TOKEN=\n');
+		expect(await r.read('etc/koi/caddy/env')).toEndWith('\nKOI_DNS_API_TOKEN=\n');
+		// root:caddy, root:caddy and root:root on the host: only root makes
+		// entries there, Caddy reads the provider's line, and systemd the token.
+		const mode = async (path: string) =>
+			((await stat(join(b.dir, path))).mode & 0o7777).toString(8);
+		expect(await mode('etc/koi/caddy')).toBe('750');
+		expect(await mode('etc/koi/caddy/dns.caddy')).toBe('640');
+		expect(await mode('etc/koi/caddy/env')).toBe('600');
+		expect(readFileSync(script, 'utf8')).toContain(
+			'install -d -o root -g caddy -m 0750 "$CADDY_DIR"',
+		);
 		expect(r.stdout).toContain('a DNS record *.previews.example.com pointing at');
-		expect(r.stdout).toContain(`Put the provider's API token in ${b.dir}/etc/caddy/koi.env`);
+		expect(r.stdout).toContain(`Put the provider's API token in ${b.dir}/etc/koi/caddy/env`);
 		expect(r.stdout).toContain('Authorize each CLI');
 	});
 
 	test("a run again keeps the operator's provider line and token", async () => {
 		const b = await box();
-		await writeFile(join(b.dir, 'etc/caddy/koi-dns.caddy'), 'dns porkbun {\n\tapi_key x\n}\n');
-		await writeFile(join(b.dir, 'etc/caddy/koi.env'), 'KOI_DNS_API_TOKEN=secret\n');
+		await mkdir(join(b.dir, 'etc/koi/caddy'));
+		await writeFile(join(b.dir, 'etc/koi/caddy/dns.caddy'), 'dns porkbun {\n\tapi_key x\n}\n');
+		await writeFile(join(b.dir, 'etc/koi/caddy/env'), 'KOI_DNS_API_TOKEN=secret\n');
 		const r = await run(b, 'main --domain previews.example.com --tls acme-dns:porkbun');
 		expect(r.code).toBe(0);
-		expect(await r.read('etc/caddy/koi-dns.caddy')).toBe('dns porkbun {\n\tapi_key x\n}\n');
-		expect(await r.read('etc/caddy/koi.env')).toBe('KOI_DNS_API_TOKEN=secret\n');
+		expect(await r.read('etc/koi/caddy/dns.caddy')).toBe('dns porkbun {\n\tapi_key x\n}\n');
+		expect(await r.read('etc/koi/caddy/env')).toBe('KOI_DNS_API_TOKEN=secret\n');
 	});
 
 	test('this machine with --local: no SSH gateway, the internal CA, and what to do once', async () => {
@@ -236,7 +248,7 @@ describe('host/install-vm.sh, run whole', () => {
 		expect(r.calls.filter((c) => c.startsWith('ssh '))).toEqual([]);
 		expect(await r.read('share/ssh/install.sh')).toBeUndefined();
 		expect(await r.read('etc/koi/env')).toContain('\nKOI_TLS=internal\n');
-		expect(await r.read('etc/caddy/koi-dns.caddy')).toBeUndefined();
+		expect(await r.read('etc/koi/caddy/dns.caddy')).toBeUndefined();
 		expect(r.stdout).toContain('127.0.0.1 hello.koi.test');
 		expect(r.stdout).toContain('sudo caddy trust');
 		expect(r.stdout).toContain('alice: log out and in again (or run newgrp koi-control)');
