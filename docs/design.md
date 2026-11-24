@@ -62,8 +62,8 @@ It is absent only when no build has ever succeeded or the deployment was retired
 `deployment` says which build is saved. `status` says how far the latest build attempt
 has got and how it ended: `queued`, `building` or `starting` while it goes, `running`
 once it deployed, `failed` when it did not, and `expired` once the preview is retired.
-Neither says whether the container is up right now. After the box wakes, `status` still says
-`running` for a container that is stopped; after a failed rebuild it says `failed`
+Neither says whether the container is up right now. After the box wakes, `status` says
+`running` while the container starts, or if it did not; after a failed rebuild it says `failed`
 while the previous deployment serves. For a live check, request `/__koi/health` on the
 preview, which answers 200 only while the container runs and Caddy routes to it, or run
 `koi lease`, which refuses a preview that is not running. A verification run binds to
@@ -160,10 +160,15 @@ the PR's code will see them.
 
 After 10 minutes with no requests and no build running, the box stops itself. Preview
 files stay on disk; keys do not, though their tokens come back unchanged when the keys
-page registers them again (see Keys). Seven days after a preview's last visit its
-container and files are deleted and the link reports that it expired. The wake Lambda
-checks a list of live previews before starting the box, so scanners hitting random
-hostnames do not wake it.
+page registers them again (see Keys). The box stopping stops every preview container,
+and Docker does not start them again. koid does, as soon as it starts: every preview
+that has a deployment, at the same URL with the same deployment and login key,
+each routed once it answers its health check. It skips a preview stopped for disk use,
+one whose last start failed, and one past its ttl, which expires instead. A visit while
+its preview starts gets the waiting page until it answers. Seven days after a
+preview's last visit its container and files are deleted and the link reports that it
+expired. The wake Lambda checks a list of live previews before starting the box, so
+scanners hitting random hostnames do not wake it.
 
 ## Parts
 

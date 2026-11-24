@@ -981,9 +981,9 @@ export class Deployer {
 	}
 
 	// Starts a stopped preview's container. Called when someone visits a
-	// preview that is not routed, which is every preview after the box wakes.
-	// Runs under the label's lifecycle lock, and visitors who ask while a start
-	// is in progress share it. A preview past its ttl is expired instead.
+	// preview that is not routed, and by restore when koid starts. Runs under
+	// the label's lifecycle lock, and visitors who ask while a start is in
+	// progress share it. A preview past its ttl is expired instead.
 	ensureRunning(label: string): Promise<void> {
 		const inFlight = this.starting.get(label);
 		if (inFlight !== undefined) return inFlight;
@@ -1078,6 +1078,52 @@ export class Deployer {
 			});
 		}
 		await this.sync();
+	}
+
+	// Starts every preview that serves and is not routed, all at once, each
+	// as a visit would (ensureRunning), and resolves once every start has
+	// ended. Returns the labels routed after their start. koid calls it at
+	// startup without waiting: preview containers run with --restart no
+	// (docker.ts, runArgs), so the box stopping leaves every one stopped, and
+	// without this a preview started again only once a request reached
+	// koid. A visit that comes during a start shares it.
+	//
+	// The record's own deployment starts, from its container or, if that is
+	// gone, from its image with the recorded environment, so the URL, the
+	// deployment a lease holds and the login key stay what they were. Each
+	// container is routed only once it answers its health check, as on any
+	// wake. Not started: a deployment halted for disk use, a preview whose
+	// last start failed (koid stopped it on purpose; a visit still tries
+	// again), and a preview past its ttl, which expire() at startup has
+	// already retired and start() would retire rather than start. Call it
+	// after expire() and the disk watchdog's first run: until a watchdog run
+	// has measured them, start() starts no stopped container.
+	async restore(): Promise<string[]> {
+		const now = this.deps.now().getTime();
+		const due = (await this.records()).filter((r) => {
+			const d = r.deployment;
+			return (
+				d !== undefined &&
+				d.halted === undefined &&
+				!this.ready.has(d.container) &&
+				!r.error?.startsWith(WAKE_FAILED) &&
+				!this.lapsed(r, now)
+			);
+		});
+		const restored: string[] = [];
+		await Promise.all(
+			due.map(async (r) => {
+				try {
+					await this.ensureRunning(r.label);
+				} catch (err) {
+					this.deps.log(`starting ${r.label}: ${message(err)}`);
+					return;
+				}
+				const container = r.deployment?.container;
+				if (container !== undefined && this.ready.has(container)) restored.push(r.label);
+			}),
+		);
+		return restored.sort();
 	}
 
 	async view(label: string): Promise<PreviewView> {
@@ -1670,7 +1716,8 @@ export class Deployer {
 	// attempts failed, check the containers that are still running, clear
 	// build directories, route the ones that answered, and once Caddy has
 	// taken those routes remove containers and images no record points at,
-	// and stop the containers that run outside the slice.
+	// and stop the containers that run outside the slice. Starting the
+	// stopped ones is restore()'s, later in startup.
 	async reconcile(): Promise<void> {
 		const { deps } = this;
 		for (const r of await this.records()) {
@@ -1685,10 +1732,10 @@ export class Deployer {
 			r.deployment === undefined ? [] : [r.deployment],
 		);
 		// Containers still running from before koid started serve again once
-		// they answer; the rest wait for a visit to start and check them. One
-		// that runs outside the slice kept running through a Docker restart
+		// they answer; restore() starts and checks the rest. One that runs
+		// outside the slice kept running through a Docker restart
 		// (live-restore) where it was before; it is stopped below, and its
-		// next visit starts it in the slice.
+		// next start, by restore() or a visit, puts it in the slice.
 		const outside: string[] = [];
 		for (const d of deployments) {
 			if (d.halted !== undefined) continue;

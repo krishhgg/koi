@@ -89,8 +89,10 @@ function configOrExit(): Config {
 //    needs, which only decides whether it is available;
 // 4. expire previews whose ttl passed while the box slept;
 // 5. stop and block previews over their disk limit, stopped ones included;
-// 6. start the log sink, the HTTP server and the control socket;
-// 7. start the timers.
+// 6. start every other preview that serves, in the background: Docker
+//    leaves them stopped when the box stops (Deployer.restore);
+// 7. start the log sink, the HTTP server and the control socket;
+// 8. start the timers.
 async function daemon(): Promise<void> {
 	const config = configOrExit();
 	const problems = await verifyHost(hostSpec(config));
@@ -247,6 +249,14 @@ async function daemon(): Promise<void> {
 	// visits start no stopped container until the five-minute timer below
 	// has measured them.
 	await deployer.stopOversized().catch((err: unknown) => log(`disk watchdog: ${errorText(err)}`));
+	// After expiry and the disk watchdog, so that neither a preview past its
+	// ttl nor one over its disk limit starts. Not awaited: health checks can
+	// take minutes, and a visit that comes meanwhile shares its preview's
+	// start.
+	void deployer
+		.restore()
+		.then((labels) => labels.length > 0 && log(`started ${labels.join(', ')}`))
+		.catch((err: unknown) => log(`starting previews: ${errorText(err)}`));
 
 	const onVisit = (label: string) => activity.visit(label);
 	const keysLimits = {

@@ -353,6 +353,12 @@ export function runArgs(
 		CONTAINER_LIMITS.memory,
 		'--cpus',
 		CONTAINER_LIMITS.cpus,
+		// koid starts every preview itself (Deployer.startFresh): after a
+		// sync has taken dead containers out of the egress proxy's map, and
+		// with no route until a health check passes. A restart policy would
+		// have Docker start one that died, or every one when the box starts,
+		// at an address the proxy may still map to another preview. When koid
+		// starts, it starts the previews that serve (Deployer.restore).
 		'--restart',
 		'no',
 		'--log-opt',

@@ -2313,6 +2313,159 @@ describe('reconcile', () => {
 	);
 });
 
+// The box stops, which stops every container, and starts again: a new koid
+// takes its startup steps for previews in main.ts's order.
+async function stopAndStart(t: Awaited<ReturnType<typeof setup>>) {
+	t.docker.stopAll();
+	const deployer = t.restart();
+	await deployer.reconcile();
+	const expired = await deployer.expire();
+	await deployer.stopOversized();
+	const started = await deployer.restore();
+	return { deployer, expired, started };
+}
+
+describe('restore', () => {
+	test('after the box stops and starts, a preview that served runs again with its deployment and login key', async () => {
+		const t = await setup({ builtin: builtinRecipe({ loginKeyEnv: 'APP_LOGIN_KEY' }) });
+		await t.up(request({ recipe: { kind: 'builtin', name: 'storefront' } }));
+		const before = await t.store.get('hello-pr-7');
+		const container = before?.deployment?.container ?? '';
+		expect(before?.loginKey).toMatch(/^koi-[a-z0-9]{24}$/);
+		const { deployer, started } = await stopAndStart(t);
+		expect(started).toEqual(['hello-pr-7']);
+		// The same container, started again, not a new one.
+		expect(t.docker.starts).toEqual([container]);
+		expect(t.docker.runs).toHaveLength(1);
+		const after = await t.store.get('hello-pr-7');
+		expect(after?.deployment).toEqual(before?.deployment);
+		expect(after?.loginKey).toBe(before?.loginKey ?? '');
+		expect(t.docker.containers.get(container)?.options?.env.APP_LOGIN_KEY).toBe(
+			before?.loginKey ?? '',
+		);
+		const { ip } = await t.docker.inspect(container);
+		expect(t.lastRoutes()).toEqual([{ label: 'hello-pr-7', upstream: `${ip}:9000` }]);
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
+	});
+
+	test('routes a preview it starts only once it answers, and a visit meanwhile shares the start', async () => {
+		const t = await setup();
+		await t.up(request());
+		const container = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		t.docker.stopAll();
+		const deployer = t.restart();
+		await deployer.reconcile();
+		await deployer.expire();
+		await deployer.stopOversized();
+		const checking = t.hold('probe');
+		const restoring = deployer.restore();
+		await checking.reached;
+		// Started, with an address, and not yet healthy.
+		expect((await t.docker.inspect(container)).running).toBe(true);
+		expect(t.lastRoutes()).toEqual([]);
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'stopped' });
+		const visit = deployer.ensureRunning('hello-pr-7');
+		checking.release();
+		await Promise.all([restoring, visit]);
+		expect(t.docker.starts).toEqual([container]);
+		expect(t.lastRoutes()).toHaveLength(1);
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
+	});
+
+	test('a preview whose ttl passed while the box was off expires and does not come back', async () => {
+		const t = await setup();
+		await t.up(request());
+		const container = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		t.advance(8 * 86_400_000);
+		const { deployer, expired, started } = await stopAndStart(t);
+		expect(expired).toEqual(['hello-pr-7']);
+		expect(started).toEqual([]);
+		expect(t.docker.starts).toEqual([]);
+		expect(t.docker.containers.has(container)).toBe(false);
+		expect((await t.store.get('hello-pr-7'))?.status).toBe('expired');
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'expired' });
+		expect(t.lastRoutes()).toEqual([]);
+	});
+
+	test('does not start a preview past its ttl that expiry has not retired yet', async () => {
+		const t = await setup();
+		await t.up(request());
+		t.docker.stopAll();
+		const deployer = t.restart();
+		await deployer.reconcile();
+		await deployer.stopOversized();
+		t.advance(8 * 86_400_000);
+		expect(await deployer.restore()).toEqual([]);
+		expect(t.docker.starts).toEqual([]);
+		expect(t.lastRoutes()).toEqual([]);
+	});
+
+	test('a lease taken before the stop holds the same deployment after it', async () => {
+		const t = await setup();
+		await t.up(request());
+		const { lease, deployment } = await t.deployer.acquireLease('hello-pr-7', 'ci', 3600);
+		t.advance(15 * 60_000);
+		const { deployer, started } = await stopAndStart(t);
+		expect(started).toEqual(['hello-pr-7']);
+		expect((await t.store.get('hello-pr-7'))?.lease).toEqual(lease);
+		const leased = await deployer.leasedDeployment('hello-pr-7', lease.leaseId);
+		expect(leased.deploymentId).toBe(deployment.deploymentId);
+		// What the lease names runs, and visitors reach it.
+		expect((await t.docker.inspect(leased.container)).running).toBe(true);
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
+		// The lease still refuses another holder and a build that would
+		// replace its deployment.
+		await expect(deployer.acquireLease('hello-pr-7', 'dev@laptop', 60)).rejects.toThrow(
+			`leased by ci until ${lease.expiresAt}`,
+		);
+		const second = request({ id: 'bbbbbbbbbbbbbbbb2', commit: 'b'.repeat(40) });
+		t.addRequest(second);
+		await expect(deployer.up(second.id)).rejects.toBeInstanceOf(LeaseError);
+	});
+
+	test('a preview koid stopped for disk use or after a failed start stays stopped, and one koi down removed stays gone', async () => {
+		const t = await setup();
+		await t.up(request());
+		await t.up(request({ id: 'bbbbbbbbbbbbbbbb2', label: 'other', pr: 8 }));
+		await t.up(request({ id: 'cccccccccccccccc3', label: 'gone', pr: 9 }));
+		const halted = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		const failed = (await t.store.get('other'))?.deployment?.container ?? '';
+		t.docker.diskBytes.set(halted, 11 * 1024 ** 3);
+		expect(await t.deployer.stopOversized()).toEqual([halted]);
+		expect(await t.deployer.down('gone')).toBe(true);
+		// The box slept once already, and a visit to other could not start it.
+		t.docker.stopAll();
+		await t.deployer.sync();
+		t.setHealthy(() => false);
+		await t.deployer.ensureRunning('other');
+		expect((await t.store.get('other'))?.error).toContain('the preview did not start');
+		t.setHealthy(undefined);
+		const runs = t.docker.runs.length;
+		const { deployer, started } = await stopAndStart(t);
+		expect(started).toEqual([]);
+		expect(t.docker.starts).toEqual([failed]);
+		expect(t.docker.runs).toHaveLength(runs);
+		expect(t.lastRoutes()).toEqual([]);
+		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'halted' });
+		expect(await deployer.view('gone')).toEqual({ kind: 'unknown' });
+		// A visit still tries the one whose start failed.
+		await deployer.ensureRunning('other');
+		expect(await deployer.view('other')).toEqual({ kind: 'running' });
+	});
+
+	test('after a koid restart, starts nothing that runs and answers', async () => {
+		const t = await setup();
+		await t.up(request());
+		const routes = t.lastRoutes();
+		const deployer = t.restart();
+		await deployer.reconcile();
+		await deployer.stopOversized();
+		expect(await deployer.restore()).toEqual([]);
+		expect(t.docker.starts).toEqual([]);
+		expect(t.lastRoutes()).toEqual(routes);
+	});
+});
+
 // Where the build log of a record's attempt is.
 function logPath(stateDir: string, record: PreviewRecord | undefined): string {
 	return join(stateDir, 'logs', 'hello-pr-7', `${record?.attempt}.build.log`);
