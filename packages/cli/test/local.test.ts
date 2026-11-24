@@ -13,6 +13,7 @@ import {
 	UnsupportedCapabilityError,
 } from '../src/transport.ts';
 import {
+	accountUid,
 	type LocalTransportOptions,
 	localTransport,
 	socketPathProblem,
@@ -264,6 +265,58 @@ describe('socketPathProblem', () => {
 		expect(await socketPathProblem(join(open, 'link.sock'), uid)).toBe(
 			`${open} is writable by any account (mode 0777)`,
 		);
+	});
+
+	test('walks every link a link leads to, and refuses one in a directory others may write to', async () => {
+		const k = await koid();
+		const dir = await scratch();
+		const open = join(dir, 'open');
+		await mkdir(open);
+		await chmod(open, 0o777);
+		await symlink(k.socket, join(open, 'inner.sock'));
+		// Written as it is, the path is closed, and so is where it ends up;
+		// the link in between is in a directory any account may change.
+		await symlink(join(open, 'inner.sock'), join(dir, 'outer.sock'));
+		await symlink('open/inner.sock', join(dir, 'relative.sock'));
+		for (const name of ['outer.sock', 'relative.sock']) {
+			expect([name, await socketPathProblem(join(dir, name), uid)]).toEqual([
+				name,
+				`${open} is writable by any account (mode 0777)`,
+			]);
+		}
+		await symlink(join(dir, 'b'), join(dir, 'a'));
+		await symlink(join(dir, 'a'), join(dir, 'b'));
+		expect(await socketPathProblem(join(dir, 'a'), uid)).toBe(
+			`more than 40 symbolic links on the way to ${join(dir, 'a')}`,
+		);
+	});
+
+	// /proc is root's and closed to other writers, and /proc/self is a link
+	// of root's to this process's directory, which this account owns.
+	test.skipIf(process.platform !== 'linux' || uid === 0)(
+		'refuses an entry another account owns, even in a directory only root may write to',
+		async () => {
+			expect(await socketPathProblem('/proc/self', uid)).toBeUndefined();
+			expect(await socketPathProblem('/proc/self', uid + 4242)).toBe(
+				`/proc/${process.pid} belongs to uid ${uid}, which is not root, this account or koid's account koi`,
+			);
+		},
+	);
+
+	test("takes koid's account, koi, from the passwd file, and no other", async () => {
+		const k = await koid();
+		const dir = await scratch();
+		const accounts = join(dir, 'passwd');
+		// Seen from another account, the test's own directories are koi's.
+		await writeFile(
+			accounts,
+			`root:x:0:0:root:/root:/bin/bash\nkoi:x:${uid}:${uid}::/var/lib/koi:/usr/sbin/nologin\n`,
+		);
+		expect(await socketPathProblem(k.socket, uid + 4242, accounts)).toBeUndefined();
+		await writeFile(accounts, `koi-connect:x:${uid}:${uid}::/var/lib/koi-connect:/bin/sh\n`);
+		expect(await socketPathProblem(k.socket, uid + 4242, accounts)).toBeString();
+		expect(await socketPathProblem(k.socket, uid + 4242, join(dir, 'none'))).toBeString();
+		expect(await accountUid('koi', accounts)).toBeUndefined();
 	});
 
 	test('a file that is not a socket is not one', async () => {

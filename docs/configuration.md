@@ -502,16 +502,16 @@ installer puts `koi-connect` there, and a member may do what a holder of a
 `koi-connect` key may: any koid command, and uploads.
 
 What stands in for the SSH host key is the socket's path. Before it sends
-anything, koi checks that no account but root, the one running koi and the
-accounts those two gave a directory to could have put the socket, or anything
-on the way to it, there: each directory from `/` down is writable by its owner
-alone, or is sticky like `/tmp` with koi's next entry owned by an account it
-already trusts. The path is walked as written and again as it resolves. A
-directory its group or anyone may write to is refused, as OpenSSH's StrictModes
-refuses one on the way to `authorized_keys`, since another user of the machine
-could put a socket of their own there and receive the source. Then, as over
-SSH, koid's descriptor must name the target's domain before any of the source
-goes out.
+anything, koi checks that no account but root, the one running koi and `koi`,
+the account koid runs as, could have put the socket, or anything on the way to
+it, there. koi resolves the path itself, one entry at a time from `/`, and
+walks the target of every symbolic link it meets in its place. Each entry must
+belong to one of those three accounts, in a directory writable by its owner
+alone or sticky like `/tmp`. A directory its group or anyone may write to
+without the sticky bit is refused, as OpenSSH's StrictModes refuses one on the
+way to `authorized_keys`, since another user of the machine could put a socket
+of their own there and receive the source. Then, as over SSH, koid's descriptor
+must name the target's domain before any of the source goes out.
 
 ### Once, on the machine
 
@@ -567,8 +567,9 @@ it.
 - `this account may not open ...`: the account is not in `koi-control` in this
   session. Run the installer with `--user`, then log in again.
 - `koi does not trust the control socket of target ...`: a directory on the
-  way to the socket can be written by others. Use a socket in a directory only
-  root, you or koid's account can write to.
+  way to the socket can be written by others, or an entry on the way belongs
+  to another account. Use a socket in a directory only root, you or koid's
+  account can write to.
 - `waiting for koid at ... to start`: the socket is there and koid does not
   answer yet. koi waits up to five minutes, as over SSH.
 

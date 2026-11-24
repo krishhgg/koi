@@ -1,4 +1,4 @@
-import { lstat, realpath, stat } from 'node:fs/promises';
+import { lstat, readFile, readlink, stat } from 'node:fs/promises';
 import { connect } from 'node:net';
 import { CTL_EXIT } from '@koi/shared';
 import { ctl as koidCtl, socketFetch } from '../../../daemon/src/ctl.ts';
@@ -48,10 +48,9 @@ import { digestFile, uploadSequence } from './upload.ts';
 // holding a key for koi-connect is over SSH: any koid command, and uploads.
 //
 // What stands in for the SSH host key is the socket's path. koi talks only
-// to a socket that no account but root, this one and the accounts those two
-// gave a directory to could have put there (socketPathProblem), so another
-// user of the machine cannot plant a socket of their own and receive the
-// source. Then, as over SSH, the first descriptor koid gives is checked
+// to a socket that no account but root, this one and koid's own (koi) could
+// have put there (socketPathProblem), so another user of the machine cannot
+// plant a socket of their own and receive the source. Then, as over SSH, the first descriptor koid gives is checked
 // against the target before anything is sent: in ensureAwake, and in the
 // upload, which hands the source to koid itself.
 //
@@ -339,49 +338,98 @@ function connectable(path: string): Promise<string | undefined> {
 }
 
 // Why the socket at `path` may not be koid's, or undefined when it can only
-// be: no account other than root, `uid` and the accounts those two gave a
-// directory to could have put it, or anything on the way to it, there. The
-// path is walked from / as written, up to its first symbolic link, and
-// again as it resolves. Each entry must sit in a directory that only its
-// owner can write to, and then its own owner is trusted as well, since only
-// root and the directory's owner could have put it there; or in a directory
-// that anyone may write to but only the owner of an entry may change, such
-// as /tmp, and then the entry must be owned by an account already trusted.
-// A directory that a group or anyone may write to without that is refused,
-// as OpenSSH's StrictModes refuses one on the way to authorized_keys.
-export async function socketPathProblem(path: string, uid: number): Promise<string | undefined> {
-	const real = await realpath(path);
-	for (const walk of real === path ? [path] : [path, real]) {
-		const problem = await pathWalkProblem(walk, new Set([0, uid]));
-		if (problem !== undefined) return problem;
+// be. Only root, `uid` and koi, the account koid runs as, may own the socket
+// or anything on the way to it; a socket a tool forwards from a VM is this
+// account's. The path is resolved here one entry at a time from /, and a
+// symbolic link's target is walked in its place, so every entry on every
+// link is checked, not only those of the path as written. The directory each
+// entry is in must be writable by its owner alone, or be sticky like /tmp,
+// where only an entry's owner may replace it. A directory that a group or
+// anyone may write to without the sticky bit is refused, as OpenSSH's
+// StrictModes refuses one on the way to authorized_keys. koi's uid comes
+// from `accounts`; with no koi there, only root and `uid` count.
+export async function socketPathProblem(
+	path: string,
+	uid: number,
+	accounts = '/etc/passwd',
+): Promise<string | undefined> {
+	const owners = new Set([0, uid]);
+	const koi = await accountUid('koi', accounts);
+	if (koi !== undefined) owners.add(koi);
+	return pathWalkProblem(path.startsWith('/') ? path : `${process.cwd()}/${path}`, owners);
+}
+
+// As many symbolic links as Linux follows in one path before ELOOP.
+const MAX_LINKS = 40;
+
+async function pathWalkProblem(
+	path: string,
+	owners: ReadonlySet<number>,
+): Promise<string | undefined> {
+	const root = await lstat('/');
+	if (!owners.has(root.uid) || (root.mode & 0o022) !== 0) {
+		return '/ is not root-owned and closed to other writers';
+	}
+	// The directory reached so far, which has no link in it, and what is
+	// left of the path below it.
+	let dir = '/';
+	let dirInfo = root;
+	let rest = parts(path);
+	let links = 0;
+	for (let name = rest.shift(); name !== undefined; name = rest.shift()) {
+		if (name === '.') continue;
+		if (name === '..') {
+			// Every directory above this one was checked on the way down.
+			dir = dir.slice(0, dir.lastIndexOf('/')) || '/';
+			dirInfo = await lstat(dir);
+			continue;
+		}
+		if ((dirInfo.mode & 0o022) !== 0 && (dirInfo.mode & 0o1000) === 0) {
+			return `${dir} is writable by ${(dirInfo.mode & 0o002) !== 0 ? 'any account' : 'its group'} (mode ${octal(dirInfo.mode)})`;
+		}
+		const here = dir === '/' ? `/${name}` : `${dir}/${name}`;
+		const info = await lstat(here);
+		if (!owners.has(info.uid)) {
+			return (dirInfo.mode & 0o022) !== 0
+				? `${here} belongs to uid ${info.uid}, in ${dir}, where any account may add an entry`
+				: `${here} belongs to uid ${info.uid}, which is not root, this account or koid's account koi`;
+		}
+		if (info.isSymbolicLink()) {
+			links++;
+			if (links > MAX_LINKS) {
+				return `more than ${MAX_LINKS} symbolic links on the way to ${path}`;
+			}
+			// The target, from / or from the link's directory, then the rest.
+			const target = await readlink(here);
+			if (target.startsWith('/')) {
+				dir = '/';
+				dirInfo = root;
+			}
+			rest = [...parts(target), ...rest];
+			continue;
+		}
+		dir = here;
+		dirInfo = info;
 	}
 	return undefined;
 }
 
-async function pathWalkProblem(path: string, trusted: Set<number>): Promise<string | undefined> {
-	let parent = await lstat('/');
-	let parentPath = '/';
-	if (!trusted.has(parent.uid) || (parent.mode & 0o022) !== 0) {
-		return '/ is not root-owned and closed to other writers';
+function parts(path: string): string[] {
+	return path.split('/').filter((p) => p !== '');
+}
+
+// The uid of `name` in a passwd file, or undefined when the file or the
+// account is not there.
+export async function accountUid(name: string, file: string): Promise<number | undefined> {
+	let text: string;
+	try {
+		text = await readFile(file, 'utf8');
+	} catch {
+		return undefined;
 	}
-	const parts = path.split('/').filter((p) => p !== '');
-	for (const i of parts.keys()) {
-		const here = `/${parts.slice(0, i + 1).join('/')}`;
-		const info = await lstat(here);
-		if ((parent.mode & 0o022) !== 0) {
-			if ((parent.mode & 0o1000) === 0) {
-				return `${parentPath} is writable by ${(parent.mode & 0o002) !== 0 ? 'any account' : 'its group'} (mode ${octal(parent.mode)})`;
-			}
-			if (!trusted.has(info.uid)) {
-				return `${here} belongs to uid ${info.uid}, in ${parentPath}, where any account may add an entry`;
-			}
-		} else {
-			trusted.add(info.uid);
-		}
-		// What follows a link is walked again from the resolved path.
-		if (info.isSymbolicLink()) return undefined;
-		parent = info;
-		parentPath = here;
+	for (const line of text.split('\n')) {
+		const fields = line.split(':');
+		if (fields[0] === name && /^\d+$/.test(fields[2] ?? '')) return Number(fields[2]);
 	}
 	return undefined;
 }
