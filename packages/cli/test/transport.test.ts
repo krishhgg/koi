@@ -148,8 +148,7 @@ describe('openHost on the legacy AWS path', () => {
 		]);
 		expect(a.calls[0]?.input).toMatchObject({
 			Filters: [
-				{ Name: 'tag:Project', Values: ['koi'] },
-				{ Name: 'tag:Name', Values: ['koi-box'] },
+				{ Name: 'tag:koi:role', Values: ['box'] },
 				{ Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
 			],
 		});

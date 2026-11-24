@@ -54,19 +54,27 @@ describe('ctlCommand', () => {
 });
 
 // EC2 and STS as resolveSettings sees them: the boxes DescribeInstances
-// returns, each tagged with the preview domain as infra/box.tf tags it (no tag
-// when domain is null). Every DescribeInstances input lands in described.
+// returns, each tagged with the preview domain as infra/modules/koi tags it
+// (no tag when domain is null). With only = 'koi:role' or 'Project', a query
+// by tags answers only when it asks for that tag, as for a box that has only
+// the one or only the other. Every DescribeInstances input lands in described.
 function fakeClients(
 	instances: string[],
 	{
 		account = '123456789012',
 		domain = 'previews.example.com' as string | null,
 		described = [] as unknown[],
+		only = undefined as 'koi:role' | 'Project' | undefined,
 	} = {},
 ): Clients {
 	const send = async (cmd: { constructor: { name: string }; input: unknown }) => {
 		if (cmd.constructor.name === 'DescribeInstancesCommand') {
 			described.push(cmd.input);
+			const input = cmd.input as { Filters?: Array<{ Name: string }> };
+			const asks = (input.Filters ?? []).map((f) => f.Name);
+			if (only !== undefined && input.Filters !== undefined && !asks.includes(`tag:${only}`)) {
+				return { Reservations: [] };
+			}
 			const Tags = domain === null ? [] : [{ Key: 'Domain', Value: domain }];
 			return {
 				Reservations: [{ Instances: instances.map((InstanceId) => ({ InstanceId, Tags })) }],
@@ -89,6 +97,46 @@ describe('resolveSettings', () => {
 			instanceId: 'i-0abc',
 			bucket: 'koi-uploads-123456789012',
 		});
+	});
+
+	test('finds the box by koi:role, whatever Project says, and asks nothing more', async () => {
+		const described: unknown[] = [];
+		const { settings } = await resolveSettings({}, () =>
+			fakeClients(['i-0abc'], { described, only: 'koi:role' }),
+		);
+		expect(settings.instanceId).toBe('i-0abc');
+		expect(described).toEqual([
+			{
+				Filters: [
+					{ Name: 'tag:koi:role', Values: ['box'] },
+					{ Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
+				],
+			},
+		]);
+	});
+
+	test('finds a box applied before koi:role by Project and Name', async () => {
+		const described: unknown[] = [];
+		const { settings } = await resolveSettings({}, () =>
+			fakeClients(['i-0old'], { described, only: 'Project' }),
+		);
+		expect(settings.instanceId).toBe('i-0old');
+		expect(settings.domain).toBe('previews.example.com');
+		expect(described).toEqual([
+			{
+				Filters: [
+					{ Name: 'tag:koi:role', Values: ['box'] },
+					{ Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
+				],
+			},
+			{
+				Filters: [
+					{ Name: 'tag:Project', Values: ['koi'] },
+					{ Name: 'tag:Name', Values: ['koi-box'] },
+					{ Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
+				],
+			},
+		]);
 	});
 
 	test('reads the domain from the box KOI_INSTANCE_ID names', async () => {

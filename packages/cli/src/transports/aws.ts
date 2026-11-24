@@ -1,4 +1,10 @@
-import { DescribeInstancesCommand, EC2Client, StartInstancesCommand } from '@aws-sdk/client-ec2';
+import {
+	DescribeInstancesCommand,
+	EC2Client,
+	type Filter,
+	type Instance,
+	StartInstancesCommand,
+} from '@aws-sdk/client-ec2';
 import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import {
 	DescribeInstanceInformationCommand,
@@ -102,15 +108,33 @@ export function clients(profile: string, region: string): Clients {
 	};
 }
 
-// The instance tag infra/box.tf sets to var.domain, the base domain previews
-// live under. Read here and nowhere else: an explicit target names its
-// domain in the config file.
+// The instance tag infra/modules/koi sets to var.domain, the base domain
+// previews live under. Read here and nowhere else: an explicit target names
+// its domain in the config file.
 const DOMAIN_TAG = 'Domain';
 
+// The tags discovery finds the box by, in order. infra/modules/koi tags it
+// koi:role=box whatever its name prefix, and leaves Project to the caller's
+// default_tags, which another account may set to its own project name. A box
+// applied before koi:role existed has only Project=koi and Name=koi-box, so
+// those are asked for when no box has koi:role. An explicit target names its
+// instance, and none of this runs.
+const BOX_TAGS: Filter[][] = [
+	[{ Name: 'tag:koi:role', Values: ['box'] }],
+	[
+		{ Name: 'tag:Project', Values: ['koi'] },
+		{ Name: 'tag:Name', Values: ['koi-box'] },
+	],
+];
+const BOX_STATES: Filter = {
+	Name: 'instance-state-name',
+	Values: ['pending', 'running', 'stopping', 'stopped'],
+};
+
 // Settings from the environment, discovering what is not set: the box by its
-// tags, the domain from the box's Domain tag, the bucket from the account id.
-// This is the legacy path from before config files, and what `koi config
-// import-aws` writes down.
+// tags (BOX_TAGS), the domain from the box's Domain tag, the bucket from the
+// account id. This is the legacy path from before config files, and what
+// `koi config import-aws` writes down.
 export async function resolveSettings(
 	env: Record<string, string | undefined>,
 	make: (profile: string, region: string) => Clients = clients,
@@ -121,23 +145,19 @@ export async function resolveSettings(
 	let instanceId = env.KOI_INSTANCE_ID;
 	let domain = env.KOI_DOMAIN;
 	if (instanceId === undefined || domain === undefined) {
-		const out = await c.ec2.send(
-			new DescribeInstancesCommand(
-				instanceId === undefined
-					? {
-							Filters: [
-								{ Name: 'tag:Project', Values: ['koi'] },
-								{ Name: 'tag:Name', Values: ['koi-box'] },
-								{
-									Name: 'instance-state-name',
-									Values: ['pending', 'running', 'stopping', 'stopped'],
-								},
-							],
-						}
-					: { InstanceIds: [instanceId] },
-			),
-		);
-		const instances = (out.Reservations ?? []).flatMap((r) => r.Instances ?? []);
+		const describe = async (input: { Filters: Filter[] } | { InstanceIds: string[] }) => {
+			const out = await c.ec2.send(new DescribeInstancesCommand(input));
+			return (out.Reservations ?? []).flatMap((r) => r.Instances ?? []);
+		};
+		let instances: Instance[] = [];
+		if (instanceId === undefined) {
+			for (const tags of BOX_TAGS) {
+				instances = await describe({ Filters: [...tags, BOX_STATES] });
+				if (instances.length > 0) break;
+			}
+		} else {
+			instances = await describe({ InstanceIds: [instanceId] });
+		}
 		if (instanceId === undefined) {
 			const ids = instances.map((i) => i.InstanceId ?? '');
 			if (ids.length !== 1 || ids[0] === '') {
@@ -149,7 +169,7 @@ export async function resolveSettings(
 			const tag = instances[0]?.Tags?.find((t) => t.Key === DOMAIN_TAG)?.Value;
 			if (tag === undefined || tag === '') {
 				throw new Error(
-					`the koi box ${instanceId} has no ${DOMAIN_TAG} tag; apply the current infra/, which tags it with var.domain, or set KOI_DOMAIN`,
+					`the koi box ${instanceId} has no ${DOMAIN_TAG} tag; apply the current koi module (infra/modules/koi), which tags it with var.domain, or set KOI_DOMAIN`,
 				);
 			}
 			domain = tag;
