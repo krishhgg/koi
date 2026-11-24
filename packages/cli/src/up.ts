@@ -355,6 +355,11 @@ export const MERGE_POLL_MS = 15_000;
 // heads, as when the author pushes in between.
 export const MERGE_INPUT_TRIES = 3;
 
+// How many times koi tries one such read when gh fails, each with gh's
+// usual time limit, and how long it waits between tries.
+export const MERGE_STATE_READS = 3;
+export const MERGE_STATE_RETRY_MS = 5_000;
+
 // The merge a merge build builds, its parents, and whether koi made it.
 interface CurrentMerge {
 	commit: string;
@@ -417,15 +422,13 @@ async function currentMerge(
 	);
 	const deadline = deps.clock() + MERGE_WAIT_MS;
 	const left = () => deadline - deps.clock();
-	// Why koi stopped waiting for GitHub, and whether gh could answer.
+	// Why koi stopped waiting for GitHub.
 	let gaveUp = `GitHub did not recompute its merge of pull request ${pr} within ${seconds(MERGE_WAIT_MS)} seconds`;
-	let canAsk = true;
 	let current = said;
 	while (left() > 0) {
 		const asked = await attempt(() => github.pullRequestMergeState(pr, { timeoutMs: left() }));
 		if (asked instanceof Error) {
 			gaveUp = `koi could not ask GitHub to recompute its merge of pull request ${pr} (${asked.message})`;
-			canAsk = false;
 			break;
 		}
 		current = { baseBranch: asked.baseBranch, head: asked.head };
@@ -459,39 +462,54 @@ async function currentMerge(
 		}
 		behind = look.behind;
 	}
-	return mergeItself(pr, { said: current, canAsk, behind, gaveUp }, github, deps);
+	return mergeItself(pr, { baseBranch: current.baseBranch, behind, gaveUp }, github, deps);
 }
 
 // koi's own merge of a pull request's head into its base branch's tip, once
 // GitHub's has stayed out of date, or GitHub's after all if it has caught
-// up by now. What it merges comes from one answer of GitHub's, read again
-// here unless gh could not answer during the wait (then the last answer it
-// gave): the base branch, and the head, which must be the head koi fetches
-// from origin after it. When they differ the author pushed in between, and
-// koi reads and fetches again, up to MERGE_INPUT_TRIES times, then stops.
+// up by now. What it merges comes from one answer of GitHub's, read here
+// whatever happened during the wait: the base branch, and the head, which
+// must be the head koi fetches from origin after it. When they differ the
+// author pushed in between, and koi reads and fetches again, up to
+// MERGE_INPUT_TRIES times, then stops. Without an answer (see readToMerge)
+// koi stops too, rather than merge a base branch or head GitHub named
+// earlier: the pull request may have been retargeted or pushed since.
 // These reads and fetches are not part of the wait, and have their own
 // time limits.
+//
+// `wait.baseBranch` is the base branch of the last answer before, which
+// only names GitHub's out-of-date merge when koi stops without an answer.
 async function mergeItself(
 	pr: number,
-	wait: { said: Said; canAsk: boolean; behind: string[]; gaveUp: string },
+	wait: { baseBranch: string; behind: string[]; gaveUp: string },
 	github: GitHub,
 	deps: UpDeps,
 ): Promise<CurrentMerge> {
 	const { git } = deps;
 	const short = (c: string) => c.slice(0, 7);
-	let said = wait.said;
+	// Why koi stops without a merge into `into`, after the wait.
+	const cannotMerge = (into: string, why: string) =>
+		new Error(
+			`GitHub's merge of pull request ${pr} into ${into} (refs/pull/${pr}/merge on origin) is out of date. ${wait.behind.join(' ')} ${wait.gaveUp}, and koi could not merge the pull request itself: ${why}. Try again in a minute, or build the head as pushed with koi up --pr ${pr} --head.`,
+		);
+	let said: { baseBranch: string; head: string };
 	let fetched: { head: string; merge: PullRequestRefs['merge'] };
 	for (let tries = 1; ; tries++) {
-		const asked = wait.canAsk ? await attempt(() => github.pullRequestMergeState(pr)) : undefined;
-		const fresh = asked !== undefined && !(asked instanceof Error);
-		if (fresh) said = { baseBranch: asked.baseBranch, head: asked.head };
+		const read = await readToMerge(pr, github, deps);
+		if (read instanceof Error) {
+			throw cannotMerge(
+				wait.baseBranch,
+				`it takes the base branch and head to merge from GitHub just before it merges, and gh could not read them in ${MERGE_STATE_READS} tries (${read.message})`,
+			);
+		}
+		said = read;
 		const refs = await git.fetchPullRequest(pr);
 		if (refs.head === undefined) throw new Error(noPullRequest(pr));
-		if (said.head === undefined || said.head === refs.head) {
+		if (said.head === refs.head) {
 			fetched = { head: refs.head, merge: refs.merge };
 			break;
 		}
-		if (!fresh || tries >= MERGE_INPUT_TRIES) {
+		if (tries >= MERGE_INPUT_TRIES) {
 			throw new Error(movedWhileMerging(pr, said.head, refs.head));
 		}
 	}
@@ -511,10 +529,7 @@ async function mergeItself(
 	try {
 		made = await git.mergeCommit(base, head);
 	} catch (err) {
-		const why = err instanceof Error ? err.message : String(err);
-		throw new Error(
-			`GitHub's merge of pull request ${pr} into ${baseBranch} (refs/pull/${pr}/merge on origin) is out of date. ${wait.behind.join(' ')} ${wait.gaveUp}, and koi could not merge the pull request itself: ${why}. Try again in a minute, or build the head as pushed with koi up --pr ${pr} --head.`,
-		);
+		throw cannotMerge(baseBranch, err instanceof Error ? err.message : String(err));
 	}
 	if ('conflicts' in made) {
 		throw new Error(conflicts(pr, baseBranch, { head, base }, made.conflicts));
@@ -545,6 +560,23 @@ function checkMerge(
 	if (behind.length > 0) return { behind };
 	const merge = { head, base, baseBranch: said.baseBranch };
 	return { merge: { commit: refs.merge.commit, merge, madeByKoi: false } };
+}
+
+// The base branch and head GitHub names for a pull request now, from one
+// successful read, or the error of the last of MERGE_STATE_READS tries.
+async function readToMerge(
+	pr: number,
+	github: GitHub,
+	deps: UpDeps,
+): Promise<{ baseBranch: string; head: string } | Error> {
+	let failed = new Error('gh was not asked');
+	for (let read = 1; read <= MERGE_STATE_READS; read++) {
+		if (read > 1) await deps.sleep(MERGE_STATE_RETRY_MS);
+		const asked = await attempt(() => github.pullRequestMergeState(pr));
+		if (!(asked instanceof Error)) return { baseBranch: asked.baseBranch, head: asked.head };
+		failed = asked;
+	}
+	return failed;
 }
 
 // What a call returns, or the error it threw.

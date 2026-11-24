@@ -19,6 +19,8 @@ import {
 	builtFrom,
 	MERGE_INPUT_TRIES,
 	MERGE_POLL_MS,
+	MERGE_STATE_READS,
+	MERGE_STATE_RETRY_MS,
 	MERGE_WAIT_MS,
 	type UpDeps,
 	up,
@@ -1555,23 +1557,79 @@ describe('up --pr against a real origin', () => {
 		expect(head.uploads[0]?.commit).toBe(pushed);
 	});
 
-	test('merges without waiting when gh cannot ask GitHub to recompute', async () => {
+	test('refuses to merge the pull request itself when gh cannot read it, rather than merge what gh pr view named', async () => {
 		const o = await pullRequestOrigin();
 		const moved = await moveMain(o);
+		let asked = 0;
 		const failing: GitHub = {
 			...github(o),
 			pullRequestMergeState: async () => {
+				asked += 1;
 				throw new Error('gh api exited 1: HTTP 502');
 			},
 		};
-		const fb = running(COMMIT);
+		const fb = fakeBox([]);
 		const d = all(o, fb.box, () => failing);
-		await up({ pr: 7, comment: false }, d.d);
-		expect(fb.uploads[0]?.merge).toEqual({ head: o.head7, base: moved, baseBranch: 'main' });
-		expect(d.waited()).toBe(0);
-		expect(d.progress).toContain(
-			`koi could not ask GitHub to recompute its merge of pull request 7 (gh api exited 1: HTTP 502); koi merges its head ${short(o.head7)} into main itself`,
+		const err = await up({ pr: 7, comment: false }, d.d).catch((e: unknown) => e);
+		expect((err as Error).message).toBe(
+			`GitHub's merge of pull request 7 into main (refs/pull/7/merge on origin) is out of date. Its base ${short(o.base)} is behind main, now at ${short(moved)}. koi could not ask GitHub to recompute its merge of pull request 7 (gh api exited 1: HTTP 502), and koi could not merge the pull request itself: it takes the base branch and head to merge from GitHub just before it merges, and gh could not read them in 3 tries (gh api exited 1: HTTP 502). Try again in a minute, or build the head as pushed with koi up --pr 7 --head.`,
 		);
+		// Once while it waits, then MERGE_STATE_READS times, a pause apart.
+		expect(MERGE_STATE_READS).toBe(3);
+		expect(asked).toBe(1 + MERGE_STATE_READS);
+		expect(d.waited()).toBe((MERGE_STATE_READS - 1) * MERGE_STATE_RETRY_MS);
+		expect(fb.uploads).toEqual([]);
+	});
+
+	test('reads GitHub again before merging when its read during the wait failed, and merges into the branch the pull request targets now', async () => {
+		const o = await pullRequestOrigin();
+		await moveMain(o);
+		const tip = await develop(o);
+		// gh pr view said main. The pull request is retargeted at develop
+		// while gh cannot answer koi's first read.
+		let asked = 0;
+		const retargeted: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 1) throw new Error('gh api exited 1: HTTP 502');
+				return mergeState(o, pr, null, 'develop');
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => retargeted);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(asked).toBe(2);
+		expect(result.merge).toEqual({ head: o.head7, base: tip, baseBranch: 'develop' });
+		expect(await parents(o, result.commit)).toEqual([tip, o.head7]);
+		expect(d.progress).toContain(
+			`koi could not ask GitHub to recompute its merge of pull request 7 (gh api exited 1: HTTP 502); koi merges its head ${short(o.head7)} into develop itself`,
+		);
+	});
+
+	test('tries a failed read again before merging, and merges into the branch its answer names', async () => {
+		const o = await pullRequestOrigin();
+		await moveMain(o);
+		const tip = await develop(o);
+		// GitHub says the pull request cannot merge into main, which ends the
+		// wait. It is retargeted at develop, and the next read fails once.
+		let asked = 0;
+		const retargeted: GitHub = {
+			...github(o),
+			pullRequestMergeState: async (pr) => {
+				asked += 1;
+				if (asked === 1) return mergeState(o, pr, false);
+				if (asked === 2) throw new Error('gh api exited 1: HTTP 502');
+				return mergeState(o, pr, null, 'develop');
+			},
+		};
+		const fb = running(COMMIT);
+		const d = all(o, fb.box, () => retargeted);
+		const result = await up({ pr: 7, comment: false }, d.d);
+		expect(asked).toBe(3);
+		expect(result.merge).toEqual({ head: o.head7, base: tip, baseBranch: 'develop' });
+		expect(await parents(o, result.commit)).toEqual([tip, o.head7]);
+		expect(d.waited()).toBe(MERGE_STATE_RETRY_MS);
 	});
 
 	test('ends the wait at its deadline on a clock that only moves forward, however long each step stalls', async () => {

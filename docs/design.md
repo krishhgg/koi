@@ -58,10 +58,14 @@ branch and head that GitHub's answer just named, so a PR retargeted or pushed du
 wait is checked against what it is now. The 90 seconds are a deadline on a clock that
 only moves forward, and each gh call, fetch and sleep in the wait gets only the time
 left. When the merge stays out of date (or GitHub says the PR cannot merge, or gh
-cannot ask, or a fetch during the wait fails), koi asks GitHub once more for the base
-branch and head, fetches both, and checks that origin's head is the one GitHub named;
-when the author pushed in between, it asks and fetches again, up to three times, then
-stops. The API's `base.sha` is not used: GitHub leaves it at the base of the PR's last
+cannot ask, or a fetch during the wait fails), koi reads the base branch and head from
+GitHub once more, whatever happened during the wait. A read that fails is tried again,
+three times in all, 5 seconds apart, each with gh's usual 2 minute limit. Without an
+answer koi stops before uploading rather than merge a base branch or head that an
+earlier answer named, since the PR may have been retargeted or pushed since. With one,
+koi fetches the PR and checks that origin's head is the one GitHub named; when the
+author pushed in between, it reads and fetches again, up to three times, then stops.
+The API's `base.sha` is not used: GitHub leaves it at the base of the PR's last
 push, even after it remakes the merge onto a later base, so koi takes the base's tip
 from origin. If GitHub's merge has caught up by then koi builds it; otherwise koi
 merges the PR's head into the base's tip itself, with `git merge-tree --write-tree`.
