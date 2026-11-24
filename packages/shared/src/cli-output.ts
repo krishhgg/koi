@@ -63,7 +63,7 @@ export const UpResultSchema = z
 			.record(z.string(), z.unknown())
 			.optional()
 			.describe(
-				"What the build of deployment kept of the project, as its recipe's build reported it, for a recipe that reports one: a JSON object of at most 16384 bytes whose shape the recipe defines. koi reads it from the built image and never interprets it. It describes deployment, which after a failed rebuild is the previous build, not commit. The build ran the pull request's code, so it is the recipe's account, not koi's.",
+				"What the build of deployment kept of the project, as its recipe's build reported it, for a recipe that reports one: a JSON object of at most 16384 bytes, nested at most 16 levels deep, whose shape the recipe defines. koi reads it from the built image and never interprets it. It describes deployment, which after a failed rebuild is the previous build, not commit. The build ran the pull request's code, so it is the recipe's account, not koi's.",
 			),
 		error: z.string().optional().describe('Why the build failed, when status is failed.'),
 		comment: z

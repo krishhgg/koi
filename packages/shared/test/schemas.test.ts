@@ -11,6 +11,7 @@ import {
 	DeploymentSliceSchema,
 	ImagePathSchema,
 	MAX_DEPLOYMENT_SLICE_BYTES,
+	MAX_DEPLOYMENT_SLICE_DEPTH,
 	MAX_PROJECT_NAME,
 	MAX_RECIPE_SLICE_BYTES,
 	parsedJsonBytes,
@@ -284,6 +285,14 @@ describe('sliceFile and the slice it reports', () => {
 		for (const bad of [[], 'core', 1, null, { n: Number.NaN }, { f: () => 1 }]) {
 			expect(DeploymentSliceSchema.safeParse(bad).success).toBe(false);
 		}
+		// Nested at most 16 deep: the store indents each level, so 8,000
+		// nested arrays in 16 KiB would take about 64 MB there.
+		const nested = (levels: number) =>
+			JSON.parse(`{"k":${'['.repeat(levels - 1)}${']'.repeat(levels - 1)}}`);
+		expect(DeploymentSliceSchema.safeParse(nested(MAX_DEPLOYMENT_SLICE_DEPTH)).success).toBe(true);
+		const deep = DeploymentSliceSchema.safeParse(nested(MAX_DEPLOYMENT_SLICE_DEPTH + 1));
+		expect(deep.error?.issues[0]?.message).toBe('at most 16 levels of objects and arrays');
+		expect(DeploymentSliceSchema.safeParse(nested(8000)).success).toBe(false);
 		// A deployment keeps it; one without it still parses.
 		const deployment = {
 			requestId: 'a'.repeat(16),

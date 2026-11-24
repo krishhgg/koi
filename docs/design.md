@@ -474,8 +474,9 @@ written to the box's disk. koid takes only an archive of one regular file, with 
 header checksums and octal sizes, and a PAX header before it only when no record sets
 the size or makes the file sparse. It refuses a symlink, a directory or any other
 entry, a file over 64 KiB, text that is not UTF-8, and anything but a JSON object of at
-most 16 KiB (`DeploymentSliceSchema`). Each of those fails the build, as a missing
-file does. If the container will not go, koid logs it and the build goes on; reconcile
+most 16 KiB and 16 levels of nesting (`DeploymentSliceSchema`; koid's store indents
+each level, so 16 KiB of deeply nested arrays would take tens of megabytes). Each of
+those fails the build, as a missing file does. If the container will not go, koid logs it and the build goes on; reconcile
 removes it with the other leftovers when koid next starts. koid
 keeps the object on the deployment, and `koi up --json` returns it as `slice`, beside
 the `deployment` it describes. koi never reads inside it. The build that wrote it ran

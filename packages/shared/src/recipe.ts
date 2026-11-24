@@ -107,6 +107,11 @@ export const MAX_RECIPE_SLICE_BYTES = 64 * 1024;
 // record beside it (packages/daemon/src/control.ts).
 export const MAX_DEPLOYMENT_SLICE_BYTES = 16 * 1024;
 
+// The deepest a deployment's slice may nest, counting the top-level object
+// as 1. koid's store indents every level, so 16 KiB of deeply nested arrays
+// would take tens of megabytes on its disk.
+export const MAX_DEPLOYMENT_SLICE_DEPTH = 16;
+
 // The most of a sliceFile koid reads from the image before it parses it.
 // Above MAX_DEPLOYMENT_SLICE_BYTES so that the file may be indented.
 export const MAX_SLICE_FILE_BYTES = 64 * 1024;
@@ -124,13 +129,18 @@ export const RecipeSliceSchema = jsonObjectSchema(MAX_RECIPE_SLICE_BYTES);
 // it to its sliceFile: the recipe owns the shape, as it owns `slice`. koid
 // reads it from the image once the build is done, keeps it on the
 // deployment, and koi up --json returns it as `slice`. koi checks only that
-// it is a JSON object of at most MAX_DEPLOYMENT_SLICE_BYTES. The build that
-// wrote it ran the pull request's code, so it says what the recipe's scripts
-// reported, not what koi saw.
-export const DeploymentSliceSchema = jsonObjectSchema(MAX_DEPLOYMENT_SLICE_BYTES);
+// it is a JSON object of at most MAX_DEPLOYMENT_SLICE_BYTES, nested at most
+// MAX_DEPLOYMENT_SLICE_DEPTH deep. The build that wrote it ran the pull
+// request's code, so it says what the recipe's scripts reported, not what koi
+// saw.
+export const DeploymentSliceSchema = jsonObjectSchema(
+	MAX_DEPLOYMENT_SLICE_BYTES,
+	MAX_DEPLOYMENT_SLICE_DEPTH,
+);
 
-// A JSON object of at most `max` bytes as JSON, kept as given.
-function jsonObjectSchema(max: number) {
+// A JSON object of at most `max` bytes as JSON and `maxDepth` levels of
+// objects and arrays, kept as given.
+function jsonObjectSchema(max: number, maxDepth = Number.POSITIVE_INFINITY) {
 	return z
 		.custom<Record<string, unknown>>(isPlainObject, 'a JSON object')
 		.superRefine((value, ctx) => {
@@ -142,8 +152,26 @@ function jsonObjectSchema(max: number) {
 				});
 			} else if (bytes > max) {
 				ctx.addIssue({ code: 'custom', message: `at most ${max} bytes as JSON` });
+			} else if (deeperThan(value, maxDepth)) {
+				ctx.addIssue({
+					code: 'custom',
+					message: `at most ${maxDepth} levels of objects and arrays`,
+				});
 			}
 		});
+}
+
+// Whether objects and arrays in `value`, one parsedJsonBytes accepted, nest
+// more than `max` levels deep, the outermost being level 1.
+function deeperThan(value: unknown, max: number): boolean {
+	const stack: [unknown, number][] = [[value, 1]];
+	for (let next = stack.pop(); next !== undefined; next = stack.pop()) {
+		const [v, depth] = next;
+		if (typeof v !== 'object' || v === null) continue;
+		if (depth > max) return true;
+		for (const child of Object.values(v)) stack.push([child, depth + 1]);
+	}
+	return false;
 }
 
 // An absolute path in a built image, such as /opt/app/koi-slice.json: letters,

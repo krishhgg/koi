@@ -27,7 +27,7 @@ is a JSON object of at most 64 KiB. The Dockerfile gets the file with
 
 A recipe that cuts the build down can report what it kept: `sliceFile` in `recipe.json`
 names an absolute path in the image, such as `/opt/app/koi-slice.json`, where the build
-writes a JSON object of at most 16 KiB, in a shape the recipe defines. koid reads it
+writes a JSON object of at most 16 KiB, nested at most 16 levels deep, in a shape the recipe defines. koid reads it
 from the built image before the container starts, fails the build when it is missing
 or not such an object, and `koi up --json` returns it as `slice`. Such a recipe also
 takes `koi up --keep NAME`: the build gets the names as the build argument `KOI_KEEP`,
