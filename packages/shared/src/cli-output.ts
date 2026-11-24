@@ -41,7 +41,7 @@ export const UpResultSchema = z
 		status: z
 			.enum(['running', 'failed'])
 			.describe(
-				'How the build koi up asked for ended: running once it deployed, failed when it did not. It does not say whether the container is up now.',
+				'How the build koi up asked for ended: running once it deployed, failed when it did not. With --keep it is also failed when koid returned no slice, as a koid older than --keep does, since that build ran without the names. It does not say whether the container is up now.',
 			),
 		commit: CommitSchema.describe(
 			"What koi built: for a pull request, the merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit. The merge is GitHub's (refs/pull/N/merge), or one koi made itself from the same two parents when GitHub's stayed out of date; koi makes its own the same way every time, so the parents give the commit.",
@@ -59,6 +59,12 @@ export const UpResultSchema = z
 		keysUrl: HttpsUrlSchema.describe(
 			"The preview's keys page, where a reviewer registers provider keys and gets koi tokens that work only in this preview.",
 		),
+		slice: z
+			.record(z.string(), z.unknown())
+			.optional()
+			.describe(
+				"What the build of deployment kept of the project, as its recipe's build reported it, for a recipe that reports one: a JSON object of at most 16384 bytes, nested at most 16 levels deep, whose shape the recipe defines. koi reads it from the built image and never interprets it. It describes deployment, which after a failed rebuild is the previous build, not commit. The build ran the pull request's code, so it is the recipe's account, not koi's.",
+			),
 		error: z.string().optional().describe('Why the build failed, when status is failed.'),
 		comment: z
 			.string()

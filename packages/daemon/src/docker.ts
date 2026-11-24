@@ -1,6 +1,6 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 import {
 	DigestSchema,
 	DockerContainerLabelsSchema,
@@ -13,6 +13,7 @@ import {
 } from '@koi/shared';
 import type { z } from 'zod';
 import { ExecError, type ExecOptions, exec, WHOLE_OUTPUT } from './exec.ts';
+import { tarFileText } from './tar.ts';
 
 export interface ContainerState {
 	exists: boolean;
@@ -27,12 +28,33 @@ export interface BuildOptions {
 	// Extra named build contexts (`--build-context name=dir`), such as the
 	// directory of a built-in recipe, which its Dockerfile copies files from.
 	contexts?: Record<string, string>;
+	// Build arguments (`--build-arg NAME=value`), such as KOI_KEEP for a
+	// recipe that slices. Each goes to docker as one argument, never through
+	// a shell.
+	buildArgs?: Record<string, string>;
 	tag: string;
 	labels: Record<string, string>;
 	timeoutMs: number;
 	onLine: (line: string) => void;
 	// Ends the build: koi down stops a preview's build this way.
 	signal?: AbortSignal | undefined;
+}
+
+export interface ImageFileOptions {
+	image: string;
+	// An absolute path in the image (ImagePathSchema).
+	path: string;
+	// The container the file is read through: created from the image, never
+	// started, and removed again. Labelled as a preview of the label, so
+	// that one koid leaves behind is removed with the other leftovers when
+	// it starts (Deployer.reconcile).
+	name: string;
+	labels: Record<string, string>;
+	// The most the file may hold.
+	maxBytes: number;
+	// Where a failure to remove the reader goes. The read stands, and
+	// reconcile removes the reader when koid next starts.
+	log: (line: string) => void;
 }
 
 export interface RunOptions {
@@ -89,6 +111,9 @@ export interface Docker {
 	// A locally built image has no repository digest, so this is the one
 	// Docker gives it.
 	imageDigest(image: string): Promise<string>;
+	// The text of the regular file at an absolute path in an image, read
+	// without running anything from it (readImageFileArgs).
+	readImageFile(options: ImageFileOptions): Promise<string>;
 	run(options: RunOptions): Promise<void>;
 	// The calls a verification run makes under its budget take the budget's
 	// signal: a docker command still pending when the run's time is up is
@@ -449,6 +474,28 @@ export function watchDeaths(
 // have no dots, so it cannot be another preview's.
 export function creatingName(name: string): string {
 	return `${name}.creating`;
+}
+
+// The name of the container koid reads a preview's sliceFile through, which
+// is never started. Like creatingName, it cannot be another preview's.
+export function readerName(name: string): string {
+	return `${name}.reader`;
+}
+
+// What a tar stream of one small file from `docker cp` adds to the file:
+// its header, a PAX header Docker may add for its attributes, padding, and
+// the two empty blocks at the end.
+const TAR_OVERHEAD_BYTES = 8 * 1024;
+
+// `docker create` for the container readImageFile reads through: no network,
+// an entrypoint that is never run, the labels given.
+export function readerArgs(options: ImageFileOptions): string[] {
+	const args = ['docker', 'create', '--name', options.name, '--network', 'none'];
+	args.push('--entrypoint', 'true');
+	for (const [key, value] of Object.entries(options.labels))
+		args.push('--label', `${key}=${value}`);
+	args.push(options.image);
+	return args;
 }
 
 // --- Verification run networks and their helpers ------------------------------
@@ -840,6 +887,9 @@ export function cliDocker(options: CliDockerOptions): Docker {
 			for (const [name, dir] of Object.entries(o.contexts ?? {})) {
 				args.push('--build-context', `${name}=${dir}`);
 			}
+			for (const [name, value] of Object.entries(o.buildArgs ?? {})) {
+				args.push('--build-arg', `${name}=${value}`);
+			}
 			args.push(o.context);
 			await ok(args, { timeoutMs: o.timeoutMs, onLine: o.onLine, signal: o.signal });
 		},
@@ -871,6 +921,44 @@ export function cliDocker(options: CliDockerOptions): Docker {
 				);
 			}
 			return id.data;
+		},
+		// Through a container created from the image and never started, so
+		// nothing in the image runs. docker cp prints whatever is at the path
+		// as a tar archive, cut off past the limit, and koid reads it in
+		// memory, never on the disk. docker cp resolves the path inside the
+		// image and archives a symlink at it as a symlink, so only an archive
+		// of one regular file is read (tarFileText).
+		async readImageFile(o) {
+			const cannot = `cannot read ${o.path} from the image`;
+			await docker.remove(o.name);
+			try {
+				await ok(readerArgs(o), { timeoutMs: 60_000 });
+				const copy = await run(['docker', 'cp', `${o.name}:${o.path}`, '-'], {
+					timeoutMs: 60_000,
+					maxBytes: o.maxBytes + TAR_OVERHEAD_BYTES,
+					raw: true,
+				}).catch((err: unknown) => {
+					// exec throws an ExecError only for output past maxBytes.
+					if (!(err instanceof ExecError)) throw err;
+					throw new Error(`${cannot}: it is more than ${o.maxBytes} bytes`);
+				});
+				if (copy.code !== 0 || copy.timedOut) {
+					throw new Error(`${cannot}: ${new ExecError(['docker', 'cp'], copy).message}`);
+				}
+				try {
+					return tarFileText(
+						copy.stdoutBytes ?? new Uint8Array(),
+						o.maxBytes,
+						posix.basename(o.path),
+					);
+				} catch (err) {
+					throw new Error(`${cannot}: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			} finally {
+				await docker.remove(o.name).catch((err: unknown) => {
+					o.log(`removing ${o.name}: ${err instanceof Error ? err.message : String(err)}`);
+				});
+			}
 		},
 		async run(o) {
 			if (o.files === undefined || o.files.length === 0) {

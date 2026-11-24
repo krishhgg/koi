@@ -47,6 +47,16 @@ describe('exec', () => {
 		await expect(run).rejects.toThrow('seq 1 printed more than 300000 bytes');
 	});
 
+	test('with raw, keeps stdout as the bytes printed, text or not, under the same limit', async () => {
+		const bytes = [0xff, 0xfe, 0x00, 0x0a, 0x80, 0x41];
+		const printf = ['printf', bytes.map((b) => `\\${b.toString(8).padStart(3, '0')}`).join('')];
+		const r = await exec(printf, { raw: true, maxBytes: 100 });
+		expect([...(r.stdoutBytes ?? [])]).toEqual(bytes);
+		expect(r.stdout).toBe('');
+		await expect(exec(printf, { raw: true, maxBytes: 5 })).rejects.toBeInstanceOf(ExecError);
+		expect((await exec(printf)).stdoutBytes).toBeUndefined();
+	});
+
 	// The docker CLI ends buildx only when it gets to handle the signal, so
 	// an abort asks first. These shells stand in for it: one ends its child
 	// on SIGTERM, the other ignores SIGTERM.

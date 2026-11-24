@@ -146,7 +146,7 @@ export async function run(
 			case 'up': {
 				const { box, domain } = await connect();
 				const result = await up(
-					{ pr: cli.pr, comment: cli.comment, head: cli.head },
+					{ pr: cli.pr, comment: cli.comment, head: cli.head, keep: cli.keep },
 					{
 						git: runtime.git ?? cliGit(runtime.cwd),
 						box,

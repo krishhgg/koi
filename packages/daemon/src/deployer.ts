@@ -3,11 +3,14 @@ import { join } from 'node:path';
 import {
 	ContainerUserSchema,
 	type Deployment,
+	DeploymentSliceSchema,
 	deploymentIdentity,
 	IN_FLIGHT_STATUSES,
 	LEASE_MAX_SECONDS,
 	type Lease,
 	type LeaseReply,
+	MAX_DEPLOYMENT_SLICE_BYTES,
+	MAX_SLICE_FILE_BYTES,
 	NO_SUCH_LEASE,
 	NO_SUCH_PREVIEW,
 	numericUser,
@@ -26,6 +29,7 @@ import {
 	type DiskUsage,
 	type Docker,
 	type RunOptions,
+	readerName,
 } from './docker.ts';
 import { type Egress, egressEnv, egressFiles } from './egress-config.ts';
 import { minFreeBytes } from './fsutil.ts';
@@ -123,6 +127,10 @@ export class NoSuchPreviewError extends Error {}
 // The preview holds no lease with that id.
 export class NoSuchLeaseError extends Error {}
 
+// The request asks for what its recipe does not do: koi up --keep for a
+// recipe with no sliceFile.
+export class UnsupportedRequestError extends Error {}
+
 // A pull request label belongs to that pull request of that repo; a branch
 // label to that exact branch. The label alone is not enough: an eight-letter
 // digest keeps accidental collisions away but not a crafted one.
@@ -169,6 +177,8 @@ interface Plan {
 	loginKeyEnv: string | undefined;
 	dockerfile: string;
 	context: string;
+	// Where a built-in recipe's build writes what it kept, in the image.
+	sliceFile: string | undefined;
 }
 
 // The plan `recipe` gives `request`. A recipe the request brings builds from
@@ -192,7 +202,18 @@ function planFrom(
 		context: recipe.build.context,
 		builtin,
 		loginKeyEnv: recipe.loginKeyEnv,
+		sliceFile: builtin !== undefined && 'sliceFile' in recipe ? recipe.sliceFile : undefined,
 	};
+}
+
+// Why a plan cannot take the request's --keep names, if it cannot: only a
+// recipe that reports its slice takes them, so the caller can see what was
+// kept.
+function keepRefused(plan: Plan): string | undefined {
+	if (plan.request.keep === undefined || plan.sliceFile !== undefined) return undefined;
+	const recipe =
+		plan.builtin === undefined ? "the repository's koi.yaml" : `the recipe ${plan.builtin.name}`;
+	return `koi up --keep needs a recipe that reports its slice (a sliceFile in its recipe.json), and ${recipe} has none; run koi up without --keep`;
 }
 
 // Statuses of a request that koid has accepted and not yet finished.
@@ -384,6 +405,8 @@ export class Deployer {
 	async up(id: string): Promise<{ label: string; queued: boolean }> {
 		const request = await this.deps.uploads.request(id);
 		const plan = await this.plan(request);
+		const refused = keepRefused(plan);
+		if (refused !== undefined) throw new UnsupportedRequestError(refused);
 		const { label } = request;
 		return this.lifecycle.run(label, async () => {
 			const existing = await this.deps.store.get(label);
@@ -567,6 +590,10 @@ export class Deployer {
 			// A copy that fails fails the build; a hash that fails (a symlink
 			// in the recipe, say) loses the snapshot, not the deploy.
 			const { plan, recipeCopy, recipe } = await this.copyRecipe(accepted, work, log);
+			// The copy's recipe may have dropped its sliceFile since up()
+			// accepted the request.
+			const refused = keepRefused(plan);
+			if (refused !== undefined) throw new Error(refused);
 			// The copy, when the recipe brings its Dockerfile (planFrom sets
 			// the root to the recipe only with a directory to copy).
 			const recipeRoot = plan.dockerfileRoot === 'recipe' ? recipeCopy : undefined;
@@ -578,6 +605,7 @@ export class Deployer {
 				dockerfile,
 				context,
 				contexts: recipeRoot === undefined ? {} : { recipe: recipeRoot },
+				...(request.keep !== undefined ? { buildArgs: { KOI_KEEP: request.keep.join(' ') } } : {}),
 				tag: image,
 				labels: { 'koi.preview': label, 'koi.request': id },
 				timeoutMs: plan.buildTimeoutMinutes * 60_000,
@@ -587,6 +615,10 @@ export class Deployer {
 			const user = chooseUser(plan.user, await deps.docker.imageUser(image));
 			const imageDigest = await deps.docker.imageDigest(image);
 			log.line(`image ${imageDigest}`);
+			const slice =
+				plan.sliceFile === undefined
+					? undefined
+					: await this.readSlice(image, plan.sliceFile, container, request, log);
 			const loginKey = await this.loginKey(label, attempt, plan.loginKeyEnv);
 			const env: Record<string, string> = {
 				...plan.env,
@@ -655,6 +687,7 @@ export class Deployer {
 				user,
 				env,
 				deployedAt: this.iso(),
+				...(slice !== undefined ? { slice } : {}),
 			};
 			await this.lifecycle.run(label, async () => {
 				await this.cutover(label, attempt, deployment, log, plan.loginKeyEnv !== undefined);
@@ -743,6 +776,47 @@ export class Deployer {
 			log.line(`the recipe's files were not hashed: ${message(err)}`);
 			return { plan, recipeCopy, recipe: undefined };
 		}
+	}
+
+	// What the build kept of the project: the JSON object the recipe's build
+	// wrote to its sliceFile in the image, read before the container starts.
+	// The build fails when the file is missing, unreadable, or not a JSON
+	// object of at most MAX_DEPLOYMENT_SLICE_BYTES.
+	private async readSlice(
+		image: string,
+		path: string,
+		container: string,
+		request: UpRequest,
+		log: BuildLog,
+	): Promise<Record<string, unknown>> {
+		const what = `the recipe's sliceFile ${path}`;
+		let text: string;
+		try {
+			text = await this.deps.docker.readImageFile({
+				image,
+				path,
+				name: readerName(container),
+				labels: { 'koi.preview': request.label, 'koi.request': request.id },
+				maxBytes: MAX_SLICE_FILE_BYTES,
+				log: (line) => this.deps.log(line),
+			});
+		} catch (err) {
+			throw new Error(`${what}: ${message(err)}`);
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (err) {
+			throw new Error(`${what} is not JSON: ${message(err)}`);
+		}
+		const slice = DeploymentSliceSchema.safeParse(parsed);
+		if (!slice.success) {
+			throw new Error(
+				`${what} is not a JSON object of at most ${MAX_DEPLOYMENT_SLICE_BYTES} bytes: ${slice.error.issues[0]?.message ?? 'invalid'}`,
+			);
+		}
+		log.line(`read the slice from ${path}`);
+		return slice.data;
 	}
 
 	// The record's login key, for a plan whose recipe names a variable to

@@ -1,9 +1,12 @@
 import { parseArgs } from 'node:util';
 import {
+	KeepNameSchema,
+	KeepSchema,
 	LEASE_MAX_SECONDS,
 	LeaseHolderSchema,
 	LeaseIdSchema,
 	LOG_TAIL_MAX_LINES,
+	MAX_KEEP,
 	PreviewLabelSchema,
 	PrNumberSchema,
 	SlugSchema,
@@ -67,6 +70,9 @@ export interface ParsedCli {
 	// With pr: build the pull request's head as pushed, not GitHub's merge of
 	// it into its base.
 	head: boolean;
+	// With up: names the recipe's slice keeps whatever the pull request
+	// changed (KeepSchema), each once; undefined without --keep.
+	keep: string[] | undefined;
 	build: boolean;
 	tail: number;
 	// Which target and config file (config.ts), and the domain to expect of
@@ -105,6 +111,7 @@ export function parseCli(argv: string[]): ParsedCli {
 			pr: { type: 'string' },
 			comment: { type: 'boolean', default: false },
 			head: { type: 'boolean', default: false },
+			keep: { type: 'string', multiple: true },
 			build: { type: 'boolean', default: false },
 			tail: { type: 'string' },
 			target: { type: 'string' },
@@ -192,6 +199,25 @@ export function parseCli(argv: string[]): ParsedCli {
 	if (values.comment && pr === undefined) throw new Error('--comment needs --pr');
 	if (values.head && pr === undefined) throw new Error('--head needs --pr');
 
+	let keep: string[] | undefined;
+	if (values.keep !== undefined) {
+		if (command !== 'up') throw new Error('--keep goes with up');
+		for (const name of values.keep) {
+			if (!KeepNameSchema.safeParse(name).success) {
+				throw new Error(
+					`--keep expects a name of 1 to 64 letters, digits, dots, dashes and underscores, from a letter or digit, got ${JSON.stringify(name)}`,
+				);
+			}
+		}
+		const parsed = KeepSchema.safeParse(values.keep);
+		if (!parsed.success) {
+			throw new Error(
+				`--keep takes at most ${MAX_KEEP} names, each once; got ${values.keep.length}${new Set(values.keep).size < values.keep.length ? ', with repeats' : ''}`,
+			);
+		}
+		keep = parsed.data;
+	}
+
 	let tail = 200;
 	if (values.tail !== undefined) {
 		// No more than koid gives, so that koi never shows fewer lines than asked
@@ -267,6 +293,7 @@ export function parseCli(argv: string[]): ParsedCli {
 		pr,
 		comment: values.comment,
 		head: values.head,
+		keep,
 		build: values.build,
 		tail,
 		target: values.target,
@@ -372,6 +399,9 @@ options:
                   or koi's own merge when GitHub's stays out of date
   --head          with --pr: build the pull request's head as pushed instead
   --comment       with --pr: post or update the preview comment on the pull request
+  --keep NAME     with up: have the recipe's slice keep NAME whatever the change
+                  touched, such as a node; repeat for more, at most ${MAX_KEEP}. Only
+                  for a recipe that reports its slice, which koi up --json returns
   --build         with logs: show the build log
   --tail N        with logs: how many lines, at most ${LOG_TAIL_MAX_LINES} (default 200)
   --target NAME   the target in the config file to use (then KOI_TARGET, the

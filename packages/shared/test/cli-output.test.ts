@@ -34,4 +34,11 @@ describe('schemas/', () => {
 		expect(up.properties.loginKey).toBeDefined();
 		expect(up.required).not.toContain('loginKey');
 	});
+
+	test('the up schema has slice, an optional object of any shape, so schemaVersion stays 1', () => {
+		const up = JSON.parse(cliOutputSchemaFiles()['koi-up.schema.json'] ?? '{}');
+		expect(up.properties.slice).toMatchObject({ type: 'object', additionalProperties: {} });
+		expect(up.required).not.toContain('slice');
+		expect(up.properties.schemaVersion.const).toBe(1);
+	});
 });

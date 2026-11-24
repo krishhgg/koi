@@ -14,6 +14,9 @@ export interface ResolvedRecipe {
 	recipe: UpRequest['recipe'];
 	// How long koid lets the build, and then the health check, take.
 	limits: Pick<Recipe, 'buildTimeoutMinutes' | 'healthTimeoutSeconds'>;
+	// Whether the recipe reports what its slice kept (a built-in recipe with
+	// a sliceFile), and so takes koi up --keep.
+	reportsSlice: boolean;
 }
 
 // In the order tried: a file at the root wins over one under .koi/.
@@ -42,6 +45,7 @@ export async function resolveRecipe(
 			project: projectForBuiltin(builtin, repoId),
 			recipe: { kind: 'builtin', name: builtin.name },
 			limits: limitsOf(builtin),
+			reportsSlice: builtin.sliceFile !== undefined,
 		};
 	}
 	for (const file of REPO_RECIPE_FILES) {
@@ -59,6 +63,7 @@ export async function resolveRecipe(
 			project: projectFromRepo(repoId),
 			recipe: { kind: 'repo', recipe },
 			limits: limitsOf(recipe),
+			reportsSlice: false,
 		};
 	}
 	throw new Error(

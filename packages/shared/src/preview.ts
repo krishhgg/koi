@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { DeploymentSliceSchema } from './recipe.ts';
 
 export const PreviewStatusSchema = z.enum([
 	// Accepted by koid and waiting for its turn to build.
@@ -100,6 +101,10 @@ export const DeploymentSchema = z.object({
 	user: z.string().min(1),
 	env: z.record(z.string(), z.string()),
 	deployedAt: z.iso.datetime(),
+	// What the build kept of the project, read from the image at the
+	// recipe's sliceFile (DeploymentSliceSchema). Absent for a recipe with
+	// none, and in records written before koid kept it.
+	slice: DeploymentSliceSchema.optional(),
 	// Set when koid stopped this deployment for good: "disk" when its writable
 	// layer grew past the limit. A visit does not start it again; the next
 	// deployment replaces it.

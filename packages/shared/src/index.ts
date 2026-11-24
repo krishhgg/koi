@@ -158,13 +158,18 @@ export {
 } from './providers.ts';
 export {
 	ContainerUserSchema,
+	DeploymentSliceSchema,
 	type DockerfileBuild,
 	DockerfileBuildSchema,
 	EnvNameSchema,
+	ImagePathSchema,
 	MAX_BUILD_TIMEOUT_MINUTES,
+	MAX_DEPLOYMENT_SLICE_BYTES,
+	MAX_DEPLOYMENT_SLICE_DEPTH,
 	MAX_HEALTH_TIMEOUT_SECONDS,
 	MAX_PROJECT_NAME,
 	MAX_RECIPE_SLICE_BYTES,
+	MAX_SLICE_FILE_BYTES,
 	numericUser,
 	PROJECT_NAME,
 	ProjectNameSchema,
@@ -204,6 +209,10 @@ export {
 } from './recorder.ts';
 export {
 	CommitSchema,
+	KEEP_NAME,
+	KeepNameSchema,
+	KeepSchema,
+	MAX_KEEP,
 	RepoIdSchema,
 	RequestIdSchema,
 	randomId,

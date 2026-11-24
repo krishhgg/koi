@@ -5,6 +5,7 @@ import {
 	ByteCountSchema,
 	deploymentIdentity,
 	type HostInfo,
+	IN_FLIGHT_STATUSES,
 	IndexCursorSchema,
 	LEASE_MAX_SECONDS,
 	LeaseHolderSchema,
@@ -42,6 +43,7 @@ import {
 	NoSuchLeaseError,
 	NoSuchPreviewError,
 	OwnershipError,
+	UnsupportedRequestError,
 } from './deployer.ts';
 import type { Docker } from './docker.ts';
 import type { PreviewStore } from './store.ts';
@@ -97,8 +99,11 @@ const LeaseBodySchema = z.object({
 // The CLI reads replies through SSM, which keeps only the first 24,000
 // characters of a command's output. A status reply carries at most
 // STATUS_LOG_CHARS of build log and STATUS_ERROR_CHARS of error, so with the
-// rest of the record it stays well under that. A list reply is at most
-// LIST_PAGE_CHARS, and the CLI asks for the next page until it has them all.
+// rest of the record it stays well under that. One with no log lines may
+// carry the deployment's slice instead, at most MAX_DEPLOYMENT_SLICE_BYTES
+// (16 KiB), which with the record and its error stays under it too. A list
+// reply is at most LIST_PAGE_CHARS, and the CLI asks for the next page until
+// it has them all.
 const STATUS_MAX_LINES = 200;
 const STATUS_LOG_CHARS = 12_000;
 const STATUS_ERROR_CHARS = 2_000;
@@ -223,19 +228,25 @@ export async function control(request: Request, deps: ControlDeps): Promise<Resp
 				// without one. The record may be on a newer attempt; the caller
 				// sees that from its attempt and requestId.
 				const deployment = deploymentIdentity(record);
+				const log =
+					attempt === undefined
+						? { next: 0, lines: [] }
+						: await deps.buildLogs.read(label, attempt, since, STATUS_MAX_LINES, STATUS_LOG_CHARS);
+				// The deployment's slice, at most MAX_DEPLOYMENT_SLICE_BYTES,
+				// only in a reply with no log lines, which has room for it, and
+				// not while a build is under way, when polls would carry the
+				// previous deployment's on every read.
+				const slice =
+					deployment !== undefined &&
+					log.lines.length === 0 &&
+					!IN_FLIGHT_STATUSES.has(record.status)
+						? record.deployment?.slice
+						: undefined;
 				const reply: StatusReply = {
 					record: statusRecord(record),
-					log:
-						attempt === undefined
-							? { next: 0, lines: [] }
-							: await deps.buildLogs.read(
-									label,
-									attempt,
-									since,
-									STATUS_MAX_LINES,
-									STATUS_LOG_CHARS,
-								),
+					log,
 					...(deployment !== undefined ? { deployment } : {}),
+					...(slice !== undefined ? { slice } : {}),
 				};
 				return Response.json(reply);
 			}
@@ -316,6 +327,9 @@ export async function control(request: Request, deps: ControlDeps): Promise<Resp
 		}
 		if (err instanceof NoSuchPreviewError || err instanceof NoSuchLeaseError) {
 			return Response.json({ error: err.message }, { status: 404 });
+		}
+		if (err instanceof UnsupportedRequestError) {
+			return Response.json({ error: err.message }, { status: 400 });
 		}
 		if (err instanceof CapacityError) return Response.json({ error: err.message }, { status: 507 });
 		return Response.json(

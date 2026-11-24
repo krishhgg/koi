@@ -33,6 +33,9 @@ export interface UpOptions {
 	// With pr: build the pull request's head as pushed, not GitHub's merge of
 	// it into its base.
 	head?: boolean | undefined;
+	// Names the recipe's slice keeps whatever the change touched (KeepSchema).
+	// Only for a recipe that reports its slice.
+	keep?: string[] | undefined;
 }
 
 export interface UpDeps {
@@ -240,7 +243,19 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 		}
 
 		const tarball = await finishTarball(tar, koiFiles(changed));
-		const { project, recipe, limits } = await resolveRecipe(repo, deps.builtins, read);
+		const { project, recipe, limits, reportsSlice } = await resolveRecipe(
+			repo,
+			deps.builtins,
+			read,
+		);
+		// Before anything is uploaded. koid checks again, against the recipe
+		// as installed on the box.
+		if (options.keep !== undefined && !reportsSlice) {
+			const which = recipe.kind === 'builtin' ? `the recipe ${recipe.name}` : `${repo}'s koi.yaml`;
+			throw new Error(
+				`--keep needs a recipe that reports what its slice kept (a sliceFile in its recipe.json), and ${which} has none; run koi up without --keep`,
+			);
+		}
 		const label = previewHostLabel(
 			project,
 			options.pr !== undefined ? { pr: options.pr } : { branch },
@@ -257,6 +272,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 			...(options.pr !== undefined ? { pr: options.pr } : {}),
 			...(merge !== undefined ? { merge } : {}),
 			dirty,
+			...(options.keep !== undefined ? { keep: options.keep } : {}),
 			recipe,
 			createdAt: deps.now().toISOString(),
 		});
@@ -278,19 +294,29 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 		const followed = await follow(label, request.id, buildMs, deps);
 		const record = followed?.record;
 		const deployment = followed?.deployment;
+		const slice = followed?.slice;
+		// A koid older than this CLI drops --keep from the request and has no
+		// slice to give, so the build ran without the names. No reply of
+		// koid's says its version before the upload, so koi up finds out
+		// here, and fails: the preview does not hold what was asked for.
+		const unkept =
+			options.keep !== undefined && record?.status === 'running' && slice === undefined
+				? `koid did not apply --keep: it returned no slice for ${label}, so it is probably older than this koi and built the preview without the names; update the box and run koi up again`
+				: undefined;
 		const error =
 			record === undefined
 				? `${label} was removed by koi down while koi up waited for its build`
-				: record.error;
+				: (unkept ?? record.error);
 		const result: UpResult = {
 			schemaVersion: 1,
 			label,
 			url,
-			status: record?.status === 'running' ? 'running' : 'failed',
+			status: record?.status === 'running' && unkept === undefined ? 'running' : 'failed',
 			commit,
 			...(options.pr !== undefined ? { pr: options.pr } : {}),
 			...(merge !== undefined ? { merge } : {}),
 			...(deployment !== undefined ? { deployment } : {}),
+			...(slice !== undefined ? { slice } : {}),
 			...(record?.loginKey !== undefined ? { loginKey: record.loginKey } : {}),
 			keysUrl: keysPageUrl(deps.domain, label),
 			...(error !== undefined ? { error } : {}),
@@ -755,7 +781,7 @@ async function follow(
 	id: string,
 	buildMs: number,
 	deps: UpDeps,
-): Promise<Pick<StatusReply, 'record' | 'deployment'> | undefined> {
+): Promise<Pick<StatusReply, 'record' | 'deployment' | 'slice'> | undefined> {
 	let attempt: string | undefined;
 	let next = 0;
 	let wait = true;
@@ -783,7 +809,7 @@ async function follow(
 			}
 		} else {
 			failing = undefined;
-			const { record, log, deployment } = read.reply;
+			const { record, log, deployment, slice } = read.reply;
 			// Lines of the attempt asked about, which is this request's.
 			for (const line of log.lines) deps.buildLine(line);
 			next = log.next;
@@ -813,8 +839,14 @@ async function follow(
 			if (record.status === 'running' || record.status === 'failed') {
 				// The build has finished; show the rest of its log first, however
 				// long that takes.
+				// That last read, with no lines, carries the deployment's
+				// slice when it has one.
 				if (log.lines.length === 0) {
-					return deployment === undefined ? { record } : { record, deployment };
+					return {
+						record,
+						...(deployment !== undefined ? { deployment } : {}),
+						...(slice !== undefined && deployment !== undefined ? { slice } : {}),
+					};
 				}
 				finished = true;
 				wait = false;

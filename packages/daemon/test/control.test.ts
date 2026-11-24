@@ -19,6 +19,7 @@ import {
 	NoSuchLeaseError,
 	NoSuchPreviewError,
 	OwnershipError,
+	UnsupportedRequestError,
 } from '../src/deployer.ts';
 import { memoryFile } from './fakes.ts';
 
@@ -218,6 +219,17 @@ describe('control API', () => {
 		expect(((await res.json()) as { error: string }).error).toContain('belongs to');
 	});
 
+	test('answers 400 with the reason when the request asks what its recipe does not do', async () => {
+		const d = deps({
+			up: async () => {
+				throw new UnsupportedRequestError('koi up --keep needs a recipe that reports its slice');
+			},
+		});
+		const res = await call(d, 'POST', '/up', { requestId: 'abcdefghij0123456' });
+		expect(res.status).toBe(400);
+		expect(((await res.json()) as { error: string }).error).toContain('--keep needs a recipe');
+	});
+
 	test('answers 507 with the reason when koid has no room for another preview', async () => {
 		const d = deps({
 			up: async () => {
@@ -299,6 +311,82 @@ describe('control API', () => {
 			await (await call(old, 'GET', '/previews/hello-pr-7')).json(),
 		);
 		expect('deployment' in reply).toBe(false);
+	});
+
+	test("status carries the deployment's slice only in a reply with no log lines, once nothing builds", async () => {
+		const slice = { nodes: { core: ['core'] }, apps: ['home'] };
+		const serving = (over: Partial<PreviewRecord>) =>
+			fullRecord({
+				status: 'running',
+				deployment: {
+					...(fullRecord().deployment as NonNullable<PreviewRecord['deployment']>),
+					deploymentId: B,
+					imageDigest: `sha256:${'1'.repeat(64)}`,
+					slice,
+				},
+				...over,
+			});
+		const read = async (d: ControlDeps, path: string) =>
+			StatusReplySchema.parse(await (await call(d, 'GET', path)).json());
+		const running = deps({}, 'one\ntwo\n', storeOf(serving({})));
+		// The record alone, and the read past the end of the log.
+		expect((await read(running, '/previews/hello-pr-7')).slice).toEqual(slice);
+		const end = Buffer.byteLength('one\ntwo\n');
+		expect((await read(running, `/previews/hello-pr-7?attempt=${A}&since=${end}`)).slice).toEqual(
+			slice,
+		);
+		// Not beside log lines, nor while a build is under way.
+		const page = await read(running, `/previews/hello-pr-7?attempt=${A}`);
+		expect(page.log.lines).toEqual(['one', 'two']);
+		expect('slice' in page).toBe(false);
+		const building = deps({}, '', storeOf(serving({ status: 'building' })));
+		expect('slice' in (await read(building, '/previews/hello-pr-7'))).toBe(false);
+		// Nor without a deployment identity to say what it describes.
+		const halted = serving({});
+		const stopped = deps(
+			{},
+			'',
+			storeOf({
+				...halted,
+				deployment: {
+					...(halted.deployment as NonNullable<PreviewRecord['deployment']>),
+					halted: 'disk',
+				},
+			}),
+		);
+		expect('slice' in (await read(stopped, '/previews/hello-pr-7'))).toBe(false);
+	});
+
+	test('a status reply with the largest slice and record still fits in the 24,000 characters SSM returns', async () => {
+		// The most a slice takes: multibyte text counts more in bytes than SSM
+		// counts in characters, so ASCII is the worst case for characters.
+		const slice = { names: 'n'.repeat(16 * 1024 - '{"names":""}'.length) };
+		const record = fullRecord({
+			status: 'failed',
+			error: '\u001b[31m'.repeat(1000),
+			branch: '"'.repeat(255),
+			loginKey: `koi-${'a'.repeat(24)}`,
+			merge: { head: 'e'.repeat(40), base: 'f'.repeat(40), baseBranch: '"'.repeat(255) },
+			lease: {
+				leaseId: 'l'.repeat(20),
+				deploymentId: B,
+				holder: '"'.repeat(200),
+				acquiredAt: '2026-10-06T10:00:00.000Z',
+				expiresAt: '2026-10-06T11:00:00.000Z',
+			},
+			deployment: {
+				...(fullRecord().deployment as NonNullable<PreviewRecord['deployment']>),
+				deploymentId: B,
+				imageDigest: `sha256:${'1'.repeat(64)}`,
+				merge: { head: 'e'.repeat(40), base: 'f'.repeat(40), baseBranch: '"'.repeat(255) },
+				slice,
+			},
+		});
+		const text = await (
+			await call(deps({}, '', storeOf(record)), 'GET', '/previews/hello-pr-7')
+		).text();
+		expect(StatusReplySchema.parse(JSON.parse(text)).slice).toEqual(slice);
+		expect(text.length).toBeLessThan(24_000);
 	});
 
 	test('takes and releases a lease', async () => {

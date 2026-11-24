@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +14,8 @@ import {
 	parseNetworks,
 	parseSize,
 	RECORDER_LIMITS,
+	readerArgs,
+	readerName,
 	recorderArgs,
 	runArgs,
 	SANDBOX_PROBE_LABEL,
@@ -22,7 +25,7 @@ import {
 	verifierArgs,
 	watchDeaths,
 } from '../src/docker.ts';
-import { type ExecResult, exec } from '../src/exec.ts';
+import { ExecError, type ExecOptions, type ExecResult, exec } from '../src/exec.ts';
 
 // cliDocker with a recorded exec: every command, answering with `stdout`.
 function recorded(stdout = '') {
@@ -636,6 +639,25 @@ describe('cliDocker', () => {
 		]);
 	});
 
+	test('passes build arguments to docker buildx one argument each', async () => {
+		const { calls, docker } = recorded();
+		await docker.build({
+			dockerfile: '/work/src/Dockerfile',
+			context: '/work/src',
+			buildArgs: { KOI_KEEP: 'llm_openai agent_rocketride' },
+			tag: 'koi-preview/hello:abc',
+			labels: {},
+			timeoutMs: 1000,
+			onLine: () => {},
+		});
+		const args = calls[0] ?? [];
+		expect(args.slice(args.indexOf('--build-arg'), args.indexOf('--build-arg') + 2)).toEqual([
+			'--build-arg',
+			'KOI_KEEP=llm_openai agent_rocketride',
+		]);
+		expect(args.at(-1)).toBe('/work/src');
+	});
+
 	test('hands docker buildx the build signal, so koi down can kill it', async () => {
 		const seen: Array<AbortSignal | undefined> = [];
 		const docker = cliDocker({
@@ -1163,6 +1185,131 @@ describe('cliDocker', () => {
 	test('lists tagged koi images only', async () => {
 		const { docker } = recorded('koi-preview/a:x\n<none>:<none>\n');
 		expect(await docker.listImages()).toEqual(['koi-preview/a:x']);
+	});
+});
+
+describe('readImageFile', () => {
+	const logged: string[] = [];
+	const options = {
+		image: 'koi-preview/hello:abc',
+		path: '/opt/app/koi-slice.json',
+		name: readerName('koi-hello-abc'),
+		labels: { 'koi.preview': 'hello', 'koi.request': 'abc' },
+		maxBytes: 100,
+		log: (line: string) => logged.push(line),
+	};
+	// What `docker cp` printed for a regular file, a symlink and a directory
+	// (tar.test.ts says how these were made).
+	const archive = (name: string) =>
+		readFileSync(join(import.meta.dir, 'fixtures', 'docker-cp', name));
+
+	// cliDocker whose `docker cp CONTAINER:PATH -` prints `copied`, and whose
+	// `docker rm` fails once the reader has been made when `stuck` is set.
+	function reading(copied: Partial<ExecResult> | Error, stuck = false) {
+		const calls: string[][] = [];
+		const copies: Array<ExecOptions | undefined> = [];
+		const docker = cliDocker({
+			builder: 'koi-builder',
+			exec: async (cmd, o): Promise<ExecResult> => {
+				calls.push(cmd);
+				const done = { code: 0, stdout: '', stderr: '', timedOut: false };
+				if (cmd[1] === 'cp') {
+					copies.push(o);
+					if (copied instanceof Error) throw copied;
+					return { ...done, ...copied };
+				}
+				if (cmd[1] === 'rm' && stuck && calls.some((c) => c[1] === 'create')) {
+					return {
+						...done,
+						code: 1,
+						stderr: 'Error response from daemon: device or resource busy',
+					};
+				}
+				return done;
+			},
+		});
+		return { calls, copies, docker };
+	}
+
+	test('reads the file from the archive docker cp prints, through a container it creates, never starts, and removes', async () => {
+		const r = reading({ stdoutBytes: archive('docker-file.tar') });
+		expect(await r.docker.readImageFile(options)).toBe('{"nodes":{"core":["core"]}}\n');
+		expect(r.calls.map((c) => c.slice(0, 2).join(' '))).toEqual([
+			'docker rm',
+			'docker create',
+			'docker cp',
+			'docker rm',
+		]);
+		expect(r.calls[1]).toEqual(readerArgs(options));
+		expect(r.calls[2]).toEqual([
+			'docker',
+			'cp',
+			'koi-hello-abc.reader:/opt/app/koi-slice.json',
+			'-',
+		]);
+		expect(r.calls.some((c) => c[1] === 'start' || c[1] === 'run')).toBe(false);
+		// One copy, as bytes, cut off a little past the file's limit.
+		expect(r.copies[0]?.raw).toBe(true);
+		expect(r.copies[0]?.maxBytes).toBeGreaterThan(100);
+		expect(r.copies[0]?.maxBytes).toBeLessThan(100 + 16 * 1024);
+	});
+
+	test('creates the reader with no network, an entrypoint that never runs, and the labels given', () => {
+		const args = readerArgs(options);
+		expect(args.slice(0, 2)).toEqual(['docker', 'create']);
+		expect(args.join(' ')).toContain('--network none');
+		expect(args.join(' ')).toContain('--entrypoint true');
+		expect(args.join(' ')).toContain('--label koi.preview=hello');
+		expect(args.at(-1)).toBe('koi-preview/hello:abc');
+		// Not a preview's name, nor a run helper's: removed with the leftovers.
+		expect(readerName('koi-hello-abc')).toBe('koi-hello-abc.reader');
+	});
+
+	test('refuses a symlink, a directory and a file over the limit, and removes the reader each time', async () => {
+		const cannot = 'cannot read /opt/app/koi-slice.json from the image';
+		for (const [name, why] of [
+			['docker-symlink.tar', 'it is a symlink, not a regular file'],
+			['docker-directory.tar', 'it is a directory, not a regular file'],
+		] as const) {
+			const r = reading({ stdoutBytes: archive(name) });
+			await expect(r.docker.readImageFile(options)).rejects.toThrow(`${cannot}: ${why}`);
+			expect(r.calls.at(-1)?.slice(0, 2)).toEqual(['docker', 'rm']);
+		}
+		const big = reading({ stdoutBytes: archive('docker-file.tar') });
+		await expect(big.docker.readImageFile({ ...options, maxBytes: 10 })).rejects.toThrow(
+			`${cannot}: it is more than 10 bytes`,
+		);
+		// Past the limit already as a stream.
+		const huge = reading(
+			new ExecError(['docker', 'cp'], { code: 0, stdout: '', stderr: '', timedOut: false }),
+		);
+		await expect(huge.docker.readImageFile(options)).rejects.toThrow(
+			`${cannot}: it is more than 100 bytes`,
+		);
+		expect(huge.calls.at(-1)?.slice(0, 2)).toEqual(['docker', 'rm']);
+	});
+
+	test('says what docker cp said when nothing is at the path', async () => {
+		const missing = reading({
+			code: 1,
+			stderr:
+				'Error response from daemon: Could not find the file /opt/app/koi-slice.json in container',
+		});
+		await expect(missing.docker.readImageFile(options)).rejects.toThrow(
+			'cannot read /opt/app/koi-slice.json from the image: docker cp exited 1: Error response from daemon: Could not find the file',
+		);
+	});
+
+	test('logs a reader it cannot remove, and keeps what it read or why it could not', async () => {
+		logged.length = 0;
+		const read = reading({ stdoutBytes: archive('docker-file.tar') }, true);
+		expect(await read.docker.readImageFile(options)).toBe('{"nodes":{"core":["core"]}}\n');
+		expect(logged).toEqual([
+			'removing koi-hello-abc.reader: docker rm exited 1: Error response from daemon: device or resource busy',
+		]);
+		const failed = reading({ stdoutBytes: archive('docker-symlink.tar') }, true);
+		await expect(failed.docker.readImageFile(options)).rejects.toThrow('it is a symlink');
+		expect(logged).toHaveLength(2);
 	});
 });
 

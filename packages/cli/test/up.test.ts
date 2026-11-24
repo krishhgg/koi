@@ -2,7 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deploymentIdentity, type PreviewRecord, type UpRequest, type UpResult } from '@koi/shared';
+import {
+	deploymentIdentity,
+	IN_FLIGHT_STATUSES,
+	type PreviewRecord,
+	RecipeSchema,
+	type UpRequest,
+	type UpResult,
+} from '@koi/shared';
 import { type BuildLog, BuildLogs } from '../../daemon/src/buildlog.ts';
 import { awsBox, type Box, BoxUnavailableError, type CtlResult } from '../src/box.ts';
 import {
@@ -26,6 +33,7 @@ import {
 	up,
 } from '../src/up.ts';
 import { koidClients, koidDeps, previewRecord, s3Stub, settings } from './koid.ts';
+import { schemaErrors } from './output-schemas.ts';
 import { asGitHub, pullRequestOrigin, shallowCheckout } from './pulls.ts';
 
 const COMMIT = 'c'.repeat(40);
@@ -135,12 +143,18 @@ function fakeBox(statuses: Array<{ record: PreviewRecord; log: string[] }>, upRe
 			const since = Number(args[3] ?? 0);
 			const lines = args[2] === record.attempt ? now.log.slice(since, since + 200) : [];
 			const next = since + lines.length;
+			// As koid: the slice only in a reply with no lines, once nothing builds.
+			const slice =
+				deployment !== undefined && lines.length === 0 && !IN_FLIGHT_STATUSES.has(record.status)
+					? now.record.deployment?.slice
+					: undefined;
 			return {
 				code: 0,
 				stdout: JSON.stringify({
 					record,
 					log: { next, lines },
 					...(deployment !== undefined ? { deployment } : {}),
+					...(slice !== undefined ? { slice } : {}),
 				}),
 				stderr: '',
 			};
@@ -816,6 +830,100 @@ describe('up from the working tree', () => {
 		);
 		expect(clock()).toBeGreaterThan(6 * 3_600_000);
 		expect(clock()).toBeLessThan(6 * 3_600_000 + 10_000);
+	});
+});
+
+describe('up with a recipe that reports its slice', () => {
+	// A built-in recipe for the fake repository, with a sliceFile.
+	const slicing = RecipeSchema.parse({
+		name: 'hello',
+		match: { repos: ['github.com/acme/hello'] },
+		port: 8080,
+		sliceFile: '/opt/app/koi-slice.json',
+		build: { kind: 'dockerfile', from: 'recipe' },
+	});
+	const served = (requestId: string, slice?: Record<string, unknown>) => ({
+		requestId,
+		deploymentId: 't'.repeat(20),
+		imageDigest: `sha256:${'1'.repeat(64)}`,
+		commit: COMMIT,
+		image: 'koi-preview/hello:r',
+		container: 'koi-hello-r',
+		port: 8080,
+		healthPath: '/',
+		healthTimeoutSeconds: 60,
+		user: '65534:65534',
+		env: {},
+		deployedAt: '2026-10-06T00:00:00.000Z',
+		...(slice !== undefined ? { slice } : {}),
+	});
+
+	test('sends the --keep names and returns the slice of the deployment it built', async () => {
+		const git = await fakeGit();
+		const slice = { schemaVersion: 1, nodes: { core: ['core'], llm_openai: ['keep'] } };
+		const fb = fakeBox([
+			// The previous deployment's slice is not shown while this one builds.
+			{
+				record: record({ status: 'building', deployment: served('p'.repeat(16), { old: true }) }),
+				log: ['a'],
+			},
+			{
+				record: record({ status: 'running', deployment: served('r'.repeat(16), slice) }),
+				log: ['a', 'ready'],
+			},
+		]);
+		const { d, progress } = deps(git, fb.box, { builtins: [slicing] });
+		const result = await up({ comment: false, keep: ['llm_openai', 'agent_rocketride'] }, d);
+		expect(fb.uploads[0]?.keep).toEqual(['llm_openai', 'agent_rocketride']);
+		expect(fb.uploads[0]?.recipe).toEqual({ kind: 'builtin', name: 'hello' });
+		expect(result.slice).toEqual(slice);
+		expect(result.deployment?.deploymentId).toBe('t'.repeat(20));
+		expect(schemaErrors('koi-up', result)).toEqual([]);
+		expect(progress.join('\n')).not.toContain('older');
+		// Without --keep the request has none, and the slice still comes back.
+		const plain = fakeBox([
+			{ record: record({ status: 'running', deployment: served('r'.repeat(16), slice) }), log: [] },
+		]);
+		const without = await up({ comment: false }, deps(git, plain.box, { builtins: [slicing] }).d);
+		expect('keep' in (plain.uploads[0] ?? {})).toBe(false);
+		expect(without.slice).toEqual(slice);
+	});
+
+	test('refuses --keep before uploading anything when the recipe reports no slice', async () => {
+		const git = await fakeGit();
+		const fb = fakeBox([{ record: record({ status: 'running' }), log: [] }]);
+		await expect(up({ comment: false, keep: ['llm_openai'] }, deps(git, fb.box).d)).rejects.toThrow(
+			"--keep needs a recipe that reports what its slice kept (a sliceFile in its recipe.json), and github.com/acme/hello's koi.yaml has none",
+		);
+		const { sliceFile: _none, ...quiet } = slicing;
+		await expect(
+			up({ comment: false, keep: ['llm_openai'] }, deps(git, fb.box, { builtins: [quiet] }).d),
+		).rejects.toThrow('and the recipe hello has none');
+		expect(fb.uploads).toEqual([]);
+		expect(fb.calls).toEqual([]);
+	});
+
+	test('fails when --keep was asked and koid gave no slice, as an older koid would, and not without --keep', async () => {
+		const reply = () => [
+			{ record: record({ status: 'running', deployment: served('r'.repeat(16)) }), log: [] },
+		];
+		const kept = await up(
+			{ comment: false, keep: ['llm_openai'] },
+			deps(await fakeGit(), fakeBox(reply()).box, { builtins: [slicing] }).d,
+		);
+		expect(kept.status).toBe('failed');
+		expect(kept.error).toBe(
+			`koid did not apply --keep: it returned no slice for ${kept.label}, so it is probably older than this koi and built the preview without the names; update the box and run koi up again`,
+		);
+		// The preview koid built is still named, for a caller that looks.
+		expect(kept.deployment?.deploymentId).toBe('t'.repeat(20));
+		expect(kept.slice).toBeUndefined();
+		const plain = await up(
+			{ comment: false },
+			deps(await fakeGit(), fakeBox(reply()).box, { builtins: [slicing] }).d,
+		);
+		expect(plain.status).toBe('running');
+		expect(plain.error).toBeUndefined();
 	});
 });
 

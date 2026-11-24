@@ -15,6 +15,7 @@ import {
 	type ContainerState,
 	type Docker,
 	type ExitState,
+	type ImageFileOptions,
 	type ImageInfo,
 	isPreview,
 	type Mount,
@@ -247,6 +248,10 @@ export class FakeDocker implements Docker {
 	// the whole identity here.
 	digests = new Map<string, string>();
 	builds: BuildOptions[] = [];
+	// Files in every built image, by absolute path, for readImageFile.
+	imageFiles = new Map<string, string>();
+	// What readImageFile was asked for, in order.
+	imageFileReads: ImageFileOptions[] = [];
 	runs: RunOptions[] = [];
 	starts: string[] = [];
 	imageUserValue = '';
@@ -340,6 +345,16 @@ export class FakeDocker implements Docker {
 	}
 	async imageUser() {
 		return this.imageUserValue;
+	}
+	async readImageFile(o: ImageFileOptions) {
+		this.imageFileReads.push(o);
+		if (!this.images.has(o.image)) throw new Error(`no such image ${o.image}`);
+		const text = this.imageFiles.get(o.path);
+		if (text === undefined) throw new Error(`cannot read ${o.path} from the image: no such file`);
+		if (new TextEncoder().encode(text).length > o.maxBytes) {
+			throw new Error(`cannot read ${o.path} from the image: it is more than ${o.maxBytes} bytes`);
+		}
+		return text;
 	}
 	async imageDigest(image: string) {
 		const digest = this.digests.get(image);

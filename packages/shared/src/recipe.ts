@@ -101,6 +101,21 @@ const runtimeFields = {
 // The most a recipe's `slice` may take, as JSON in UTF-8.
 export const MAX_RECIPE_SLICE_BYTES = 64 * 1024;
 
+// The most a deployment's slice may take, as JSON in UTF-8: what a recipe's
+// sliceFile says the build kept. koi up reads it back through koid ctl
+// status, whose reply has to stay under SSM's 24,000 characters with the
+// record beside it (packages/daemon/src/control.ts).
+export const MAX_DEPLOYMENT_SLICE_BYTES = 16 * 1024;
+
+// The deepest a deployment's slice may nest, counting the top-level object
+// as 1. koid's store indents every level, so 16 KiB of deeply nested arrays
+// would take tens of megabytes on its disk.
+export const MAX_DEPLOYMENT_SLICE_DEPTH = 16;
+
+// The most of a sliceFile koid reads from the image before it parses it.
+// Above MAX_DEPLOYMENT_SLICE_BYTES so that the file may be indented.
+export const MAX_SLICE_FILE_BYTES = 64 * 1024;
+
 // What a preview keeps of the project, for a recipe whose Dockerfile cuts the
 // build down to the pull request's change. The recipe owns the shape. Its own
 // build scripts read the field from the recipe.json in the "recipe" build
@@ -108,19 +123,68 @@ export const MAX_RECIPE_SLICE_BYTES = 64 * 1024;
 // at most MAX_RECIPE_SLICE_BYTES, and keeps the object it was given, every key
 // included. A record schema would drop an own `__proto__` key, which
 // JSON.parse makes, before the size check saw it.
-export const RecipeSliceSchema = z
-	.custom<Record<string, unknown>>(isPlainObject, 'a JSON object')
-	.superRefine((slice, ctx) => {
-		const bytes = parsedJsonBytes(slice);
-		if (bytes === undefined) {
-			ctx.addIssue({
-				code: 'custom',
-				message: 'only strings, finite numbers, booleans, null, arrays and objects',
-			});
-		} else if (bytes > MAX_RECIPE_SLICE_BYTES) {
-			ctx.addIssue({ code: 'custom', message: `at most ${MAX_RECIPE_SLICE_BYTES} bytes as JSON` });
-		}
-	});
+export const RecipeSliceSchema = jsonObjectSchema(MAX_RECIPE_SLICE_BYTES);
+
+// What a deployment's build kept of the project, as the recipe's build wrote
+// it to its sliceFile: the recipe owns the shape, as it owns `slice`. koid
+// reads it from the image once the build is done, keeps it on the
+// deployment, and koi up --json returns it as `slice`. koi checks only that
+// it is a JSON object of at most MAX_DEPLOYMENT_SLICE_BYTES, nested at most
+// MAX_DEPLOYMENT_SLICE_DEPTH deep. The build that wrote it ran the pull
+// request's code, so it says what the recipe's scripts reported, not what koi
+// saw.
+export const DeploymentSliceSchema = jsonObjectSchema(
+	MAX_DEPLOYMENT_SLICE_BYTES,
+	MAX_DEPLOYMENT_SLICE_DEPTH,
+);
+
+// A JSON object of at most `max` bytes as JSON and `maxDepth` levels of
+// objects and arrays, kept as given.
+function jsonObjectSchema(max: number, maxDepth = Number.POSITIVE_INFINITY) {
+	return z
+		.custom<Record<string, unknown>>(isPlainObject, 'a JSON object')
+		.superRefine((value, ctx) => {
+			const bytes = parsedJsonBytes(value, max);
+			if (bytes === undefined) {
+				ctx.addIssue({
+					code: 'custom',
+					message: 'only strings, finite numbers, booleans, null, arrays and objects',
+				});
+			} else if (bytes > max) {
+				ctx.addIssue({ code: 'custom', message: `at most ${max} bytes as JSON` });
+			} else if (deeperThan(value, maxDepth)) {
+				ctx.addIssue({
+					code: 'custom',
+					message: `at most ${maxDepth} levels of objects and arrays`,
+				});
+			}
+		});
+}
+
+// Whether objects and arrays in `value`, one parsedJsonBytes accepted, nest
+// more than `max` levels deep, the outermost being level 1.
+function deeperThan(value: unknown, max: number): boolean {
+	const stack: [unknown, number][] = [[value, 1]];
+	for (let next = stack.pop(); next !== undefined; next = stack.pop()) {
+		const [v, depth] = next;
+		if (typeof v !== 'object' || v === null) continue;
+		if (depth > max) return true;
+		for (const child of Object.values(v)) stack.push([child, depth + 1]);
+	}
+	return false;
+}
+
+// An absolute path in a built image, such as /opt/app/koi-slice.json: letters,
+// digits, dots, dashes and underscores in segments joined by single slashes,
+// with no . or .. segment. koid passes it to docker cp as one argument.
+export const ImagePathSchema = z
+	.string()
+	.max(255)
+	.regex(
+		/^(?:\/[A-Za-z0-9._-]+)+$/,
+		'an absolute path of letters, digits, dots, dashes and underscores',
+	)
+	.refine((p) => !p.split('/').some((s) => s === '.' || s === '..'), 'no . or .. segments');
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
@@ -142,7 +206,7 @@ function primitiveBytes(value: string | number): number {
 // means plain objects and arrays, without holes, of strings, finite numbers,
 // booleans and null, each object reached once, with only enumerable data
 // properties under string keys. It stops counting once the size passes
-// MAX_RECIPE_SLICE_BYTES and returns the count so far.
+// `max` (MAX_RECIPE_SLICE_BYTES unless given) and returns the count so far.
 //
 // It counts while it walks, with a stack rather than recursion, and never
 // passes an object to JSON.stringify. So no toJSON, getter or iterator on the
@@ -152,15 +216,18 @@ function primitiveBytes(value: string | number): number {
 //
 // It does not try to cover a Proxy, built-in prototypes changed by other
 // code, or exotic objects built in memory (a Map given Object.prototype).
-// Slices come from JSON.parse of a recipe.json. A number too large for a
+// Slices come from JSON.parse of a recipe.json or a sliceFile. A number too large for a
 // double, which JSON.parse reads as Infinity, is refused, since JSON.stringify
 // would write it back as null.
-export function parsedJsonBytes(value: unknown): number | undefined {
+export function parsedJsonBytes(
+	value: unknown,
+	max: number = MAX_RECIPE_SLICE_BYTES,
+): number | undefined {
 	const seen = new Set<object>();
 	const stack: unknown[] = [value];
 	let bytes = 0;
 	while (stack.length > 0) {
-		if (bytes > MAX_RECIPE_SLICE_BYTES) return bytes;
+		if (bytes > max) return bytes;
 		const v = stack.pop();
 		if (v === null || v === true) {
 			bytes += 4;
@@ -192,7 +259,7 @@ export function parsedJsonBytes(value: unknown): number | undefined {
 		if (types.isBoxedPrimitive(v)) return undefined;
 		const keys = Reflect.ownKeys(v);
 		// Each key takes at least a byte, so this many could never fit.
-		if (keys.length > MAX_RECIPE_SLICE_BYTES) return MAX_RECIPE_SLICE_BYTES + 1;
+		if (keys.length > max) return max + 1;
 		const length = array ? (v as unknown[]).length : 0;
 		let items = 0;
 		for (const key of keys) {
@@ -250,6 +317,12 @@ export const RecipeSchema = z.object({
 		.default({ repos: [] }),
 	...runtimeFields,
 	slice: RecipeSliceSchema.optional(),
+	// Where the recipe's build writes what it kept of the project, in the
+	// image: a JSON object of the recipe's own shape (DeploymentSliceSchema).
+	// koid reads it after the build, before the container starts, and fails
+	// the build when it is missing or not such an object. A recipe with one
+	// takes koi up --keep (UpRequestSchema).
+	sliceFile: ImagePathSchema.optional(),
 	build: DockerfileBuildSchema,
 });
 

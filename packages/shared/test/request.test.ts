@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	KeepSchema,
+	MAX_KEEP,
 	repoIdFromRemote,
 	requestKey,
 	sourceKey,
@@ -101,5 +103,46 @@ describe('repoIdFromRemote', () => {
 		'/local/path/repo',
 	])('rejects %p', (remote) => {
 		expect(() => repoIdFromRemote(remote)).toThrow();
+	});
+});
+
+describe('koi up --keep', () => {
+	const request = {
+		version: 1,
+		id: 'a'.repeat(16),
+		label: 'hello-pr-7',
+		project: 'hello',
+		repo: 'github.com/acme/hello',
+		commit: 'c'.repeat(40),
+		branch: 'feature/x',
+		dirty: false,
+		recipe: { kind: 'builtin', name: 'hello' },
+		createdAt: '2026-10-06T00:00:00.000Z',
+	};
+
+	test('a request carries the names, each once, at most 32, safe on a command line', () => {
+		expect(UpRequestSchema.parse({ ...request, keep: ['llm_openai', 'a.b-c'] }).keep).toEqual([
+			'llm_openai',
+			'a.b-c',
+		]);
+		expect(UpRequestSchema.parse(request).keep).toBeUndefined();
+		for (const keep of [
+			[],
+			['a', 'a'],
+			['-rf'],
+			['.hidden'],
+			['a b'],
+			['a;b'],
+			['$(id)'],
+			['a\nb'],
+			['x'.repeat(65)],
+			Array.from({ length: MAX_KEEP + 1 }, (_, i) => `n${i}`),
+		]) {
+			expect(KeepSchema.safeParse(keep).success).toBe(false);
+			expect(UpRequestSchema.safeParse({ ...request, keep }).success).toBe(false);
+		}
+		expect(KeepSchema.safeParse(Array.from({ length: MAX_KEEP }, (_, i) => `n${i}`)).success).toBe(
+			true,
+		);
 	});
 });

@@ -7,6 +7,8 @@ export interface ExecResult {
 	stdout: string;
 	stderr: string;
 	timedOut: boolean;
+	// With raw, stdout as the bytes the process wrote, not decoded.
+	stdoutBytes?: Uint8Array;
 }
 
 export interface ExecOptions {
@@ -24,6 +26,10 @@ export interface ExecOptions {
 	// it, the process is killed and exec throws an ExecError, so the caller
 	// never gets part of the output as if it were all of it.
 	maxBytes?: number;
+	// Keeps stdout as bytes, in stdoutBytes, for output that is not text,
+	// such as a tar stream; stdout is then empty and onLine gets none of it.
+	// All of it is kept, so set maxBytes too.
+	raw?: boolean;
 }
 
 const KEEP_BYTES = 256 * 1024;
@@ -66,6 +72,7 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 	options.signal?.addEventListener('abort', abort, { once: true });
 	const onLine = options.onLine;
 	let tooLarge = false;
+	const raw: Uint8Array[] | undefined = options.raw ? [] : undefined;
 	const overflow = () => {
 		tooLarge = true;
 		proc.kill('SIGKILL');
@@ -77,6 +84,7 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 				onLine && ((line) => onLine(line, 'stdout')),
 				options.maxBytes,
 				overflow,
+				raw,
 			),
 			collect(
 				proc.stderr,
@@ -86,7 +94,13 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 			),
 		]);
 		const code = await proc.exited;
-		const result = { code, stdout, stderr, timedOut };
+		const result: ExecResult = {
+			code,
+			stdout,
+			stderr,
+			timedOut,
+			...(raw !== undefined ? { stdoutBytes: Buffer.concat(raw) } : {}),
+		};
 		if (tooLarge) {
 			throw new ExecError(cmd, result, `printed more than ${options.maxBytes} bytes`);
 		}
@@ -100,12 +114,14 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 
 // Reads a stream to its end. With a limit, keeps all of it, or calls
 // `overflow` and returns nothing once it passes the limit; without one,
-// keeps the last KEEP_BYTES.
+// keeps the last KEEP_BYTES. With `raw`, puts each chunk there instead,
+// undecoded, and returns no text.
 async function collect(
 	stream: ReadableStream<Uint8Array>,
 	onLine: ((line: string) => void) | undefined,
 	limit: number | undefined,
 	overflow: () => void,
+	raw?: Uint8Array[],
 ): Promise<string> {
 	const decoder = new TextDecoder();
 	const whole: string[] = [];
@@ -117,6 +133,10 @@ async function collect(
 		if (limit !== undefined && bytes > limit) {
 			overflow();
 			return '';
+		}
+		if (raw !== undefined) {
+			raw.push(chunk.slice());
+			continue;
 		}
 		const text = decoder.decode(chunk, { stream: true });
 		if (limit === undefined) kept = (kept + text).slice(-KEEP_BYTES);
