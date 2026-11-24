@@ -74,7 +74,9 @@ Running `up` again for the same name replaces the preview and keeps its URL.
 `koi list`, `koi logs NAME` and `koi down NAME` complete the set. `koi lease NAME
 --minutes N` holds a preview so no build replaces it: `koi up` for that name is refused
 before anything is built until the lease expires or `koi release NAME LEASE` ends it,
-and `koi down` refuses it unless given `--force`.
+and `koi down` refuses it unless given `--force`. `koi down` on a preview that is still
+building stops the build and drops any request queued for it, and the `koi up` waiting
+on it ends with `failed`.
 
 The CLI uploads a tarball of the source to an S3 bucket and tells the daemon on the
 box to build it, through SSM. Only people with AWS credentials for the account can

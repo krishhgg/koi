@@ -636,6 +636,28 @@ describe('cliDocker', () => {
 		]);
 	});
 
+	test('hands docker buildx the build signal, so koi down can kill it', async () => {
+		const seen: Array<AbortSignal | undefined> = [];
+		const docker = cliDocker({
+			builder: 'koi-builder',
+			exec: async (_cmd, options): Promise<ExecResult> => {
+				seen.push(options?.signal);
+				return { code: 0, stdout: '', stderr: '', timedOut: false };
+			},
+		});
+		const { signal } = new AbortController();
+		await docker.build({
+			dockerfile: '/work/src/Dockerfile',
+			context: '/work/src',
+			tag: 'koi-preview/hello:abc',
+			labels: { 'koi.preview': 'hello' },
+			timeoutMs: 1000,
+			onLine: () => {},
+			signal,
+		});
+		expect(seen).toEqual([signal]);
+	});
+
 	test('runs previews in the slice it was given', async () => {
 		const calls: string[][] = [];
 		const docker = cliDocker({

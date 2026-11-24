@@ -31,6 +31,8 @@ export interface BuildOptions {
 	labels: Record<string, string>;
 	timeoutMs: number;
 	onLine: (line: string) => void;
+	// Ends the build: koi down stops a preview's build this way.
+	signal?: AbortSignal | undefined;
 }
 
 export interface RunOptions {
@@ -833,7 +835,7 @@ export function cliDocker(options: CliDockerOptions): Docker {
 				args.push('--build-context', `${name}=${dir}`);
 			}
 			args.push(o.context);
-			await ok(args, { timeoutMs: o.timeoutMs, onLine: o.onLine });
+			await ok(args, { timeoutMs: o.timeoutMs, onLine: o.onLine, signal: o.signal });
 		},
 		async pruneBuildCache(maxUsedSpace) {
 			await ok(

@@ -313,7 +313,17 @@ export class FakeDocker implements Docker {
 
 	async build(o: BuildOptions) {
 		this.builds.push(o);
-		await this.onBuild?.();
+		// The build's signal ends it at once, as it kills docker buildx,
+		// whatever onBuild is waiting for.
+		await new Promise<void>((resolve, reject) => {
+			const end = () => reject(new Error('docker buildx exited 137'));
+			if (o.signal?.aborted) {
+				end();
+				return;
+			}
+			o.signal?.addEventListener('abort', end, { once: true });
+			Promise.resolve(this.onBuild?.()).then(resolve, reject);
+		});
 		o.onLine('step 1/1');
 		for (const line of this.buildOutput) o.onLine(line);
 		if (this.buildError !== undefined) throw new Error(this.buildError);
