@@ -239,7 +239,7 @@ update the host.
 |---|---|---|
 | `internal` | One wildcard certificate from Caddy's own CA. | Every machine that visits previews trusts the CA's root, `/var/lib/caddy/pki/authorities/local/root.crt`: on the host itself, `sudo caddy trust`. |
 | `acme-http` | A certificate per preview name from Let's Encrypt, which cannot issue a wildcard over HTTP. Caddy gets one at the first visit of a name, once koid confirms the name is a preview's (`/__koi/tls-ask`), so a stranger cannot make the host order certificates for names of their choosing. | A DNS record `*.D` pointing at the host, and ports 80 and 443 open to the internet: Let's Encrypt checks each name over HTTP-01 on 80 or TLS-ALPN-01 on 443. Let's Encrypt allows 50 new certificates a week for a registered domain. |
-| `acme-dns:PROVIDER` | One wildcard certificate from Let's Encrypt over DNS-01, through `github.com/caddy-dns/PROVIDER` (`cloudflare`, `digitalocean`, `hetzner` and so on), which the installer builds Caddy with. | A DNS record `*.D` pointing at the host, port 443 open to visitors, and the provider's API token in `/etc/koi/caddy/env` (`KOI_DNS_API_TOKEN=...`, mode 0600), then `systemctl restart caddy`. The installer writes `/etc/koi/caddy/dns.caddy` with `dns PROVIDER {env.KOI_DNS_API_TOKEN}`; edit it for a provider that takes other arguments. It keeps both files on a run again. |
+| `acme-dns:PROVIDER` | One wildcard certificate from Let's Encrypt over DNS-01, through `github.com/caddy-dns/PROVIDER` (`cloudflare`, `digitalocean`, `hetzner` and so on), which the installer builds Caddy with. | A DNS record `*.D` pointing at the host, port 443 open to visitors, and the provider's API token. The installer writes `/etc/koi/caddy/dns.caddy` with `dns PROVIDER {env.KOI_DNS_API_TOKEN}`, and `/etc/koi/caddy/env` (mode 0600) with an empty `KOI_DNS_API_TOKEN=`. Caddy refuses the config without the token, so the first run stops before it starts koid: put the token in that file, edit the `dns` line for a provider that takes other arguments, and run the installer again. It keeps both files on a run again. To change the token later, edit the file and run `systemctl restart caddy`. |
 
 koid reads the mode from `KOI_TLS` in `/etc/koi/env` and writes the matching
 `tls` block into the Caddyfile it owns. With `acme-dns` the block imports
@@ -256,8 +256,8 @@ memory ceiling and restarts Docker once, adds iptables rules, and runs Caddy
 on port 443. Give it a machine, or a VM, of its own.
 
 When it finishes, the installer prints what is left to do once: the DNS record
-or `/etc/hosts` lines, the CA, the token, the ports, and for an SSH host the
-key to authorize and the fingerprint to hand to the CLI's operator.
+or `/etc/hosts` lines, the CA, the ports, and for an SSH host the key to
+authorize and the fingerprint to hand to the CLI's operator.
 
 ## Reaching a host over SSH
 

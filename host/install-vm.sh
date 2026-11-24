@@ -173,11 +173,32 @@ write_dns_files() {
 	if [ ! -e "$CADDY_ENV" ]; then
 		printf '%s\n' \
 			"# The token Caddy's DNS module reads for $provider (see $DNS_FILE)." \
-			'# Then: systemctl restart caddy' \
+			'# Set it and run install-vm.sh again. To change it later, set it here' \
+			'# and run systemctl restart caddy.' \
 			'KOI_DNS_API_TOKEN=' >"$CADDY_ENV.new"
 		install -o root -g root -m 0600 "$CADDY_ENV.new" "$CADDY_ENV"
 		rm -f "$CADDY_ENV.new"
 	fi
+}
+
+# With acme-dns, Caddy refuses a config whose provider line names an empty
+# token, so koid, which loads its config into Caddy as it starts, would fail
+# to start. The installer stops here instead, for the operator to set the
+# token and run it again, which then goes on. A provider line edited to take
+# other arguments is the operator's to fill.
+check_dns_env() {
+	case $TLS in acme-dns:*) ;; *) return 0 ;; esac
+	grep -qF '{env.KOI_DNS_API_TOKEN}' "$DNS_FILE" || return 0
+	# systemd takes the last assignment, quoted or not.
+	grep -E '^[[:space:]]*KOI_DNS_API_TOKEN=' "$CADDY_ENV" | tail -n 1 |
+		grep -Eq "=[\"']?[^\"'[:space:]]" && return 0
+	{
+		echo "koi: the DNS provider's API token is not set. Caddy refuses koid's config without"
+		echo '  it, so koid was not started. Put the token in'
+		echo "  $CADDY_ENV (KOI_DNS_API_TOKEN=...), check the provider line"
+		echo "  in $DNS_FILE, then run install-vm.sh again with the same arguments."
+	} >&2
+	exit 2
 }
 
 # koid's settings: the spool and a file where the AWS box has S3 and SSM,
@@ -250,8 +271,6 @@ next_steps() {
 		echo "  - Open ports 80 and 443 to the internet; Let's Encrypt checks each preview name there."
 		;;
 	acme-dns:*)
-		echo "  - Put the provider's API token in $CADDY_ENV (check $DNS_FILE),"
-		echo "    then run systemctl restart caddy."
 		echo "  - Open port 443 to whoever visits previews."
 		;;
 	esac
@@ -276,6 +295,7 @@ main() {
 	write_dns_files
 	write_env
 	add_users
+	check_dns_env
 	start_koid
 	next_steps
 }

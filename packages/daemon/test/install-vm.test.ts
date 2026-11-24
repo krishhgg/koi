@@ -172,10 +172,31 @@ describe('host/install-vm.sh checks', () => {
 describe('host/install-vm.sh, run whole', () => {
 	test('a VM: cloud-init.sh without the AWS parts, the bundles in deploy-host.sh order, the spool and the gateway', async () => {
 		const b = await box();
-		const r = await run(
-			b,
-			'main --domain previews.example.com --tls acme-dns:cloudflare --user alice',
+		const args = 'main --domain previews.example.com --tls acme-dns:cloudflare --user alice';
+		// The first run stops for the provider's token before koid starts.
+		const first = await run(b, args);
+		expect(first.code).toBe(2);
+		expect(first.stderr).toBe(
+			[
+				"koi: the DNS provider's API token is not set. Caddy refuses koid's config without",
+				'  it, so koid was not started. Put the token in',
+				`  ${b.dir}/etc/koi/caddy/env (KOI_DNS_API_TOKEN=...), check the provider line`,
+				`  in ${b.dir}/etc/koi/caddy/dns.caddy, then run install-vm.sh again with the same arguments.`,
+				'',
+			].join('\n'),
 		);
+		expect(first.calls).toEqual([
+			'cloud-init',
+			'egress install ',
+			'verify install ',
+			`ssh install ${b.bundle}/koi-ssh-gateway`,
+			'usermod -aG koi-control alice',
+		]);
+		expect(await first.read('etc/koi/caddy/env')).toEndWith('\nKOI_DNS_API_TOKEN=\n');
+		const env = join(b.dir, 'etc/koi/caddy/env');
+		await writeFile(env, `${await readFile(env, 'utf8')}KOI_DNS_API_TOKEN=cf-123\n`);
+		await writeFile(b.calls, '');
+		const r = await run(b, args);
 		expect(r.stderr).toBe('');
 		expect(r.code).toBe(0);
 		expect(await r.read('cloud-init.env')).toBe(
@@ -210,7 +231,9 @@ describe('host/install-vm.sh, run whole', () => {
 		expect(await r.read('etc/koi/caddy/dns.caddy')).toContain(
 			'\ndns cloudflare {env.KOI_DNS_API_TOKEN}\n',
 		);
-		expect(await r.read('etc/koi/caddy/env')).toEndWith('\nKOI_DNS_API_TOKEN=\n');
+		expect(await r.read('etc/koi/caddy/env')).toEndWith(
+			'\nKOI_DNS_API_TOKEN=\nKOI_DNS_API_TOKEN=cf-123\n',
+		);
 		// root:caddy, root:caddy and root:root on the host: only root makes
 		// entries there, Caddy reads the provider's line, and systemd the token.
 		const mode = async (path: string) =>
@@ -222,8 +245,36 @@ describe('host/install-vm.sh, run whole', () => {
 			'install -d -o root -g caddy -m 0750 "$CADDY_DIR"',
 		);
 		expect(r.stdout).toContain('a DNS record *.previews.example.com pointing at');
-		expect(r.stdout).toContain(`Put the provider's API token in ${b.dir}/etc/koi/caddy/env`);
+		expect(r.stdout).not.toContain('token');
+		expect(r.stdout).toContain('Open port 443 to whoever visits previews.');
 		expect(r.stdout).toContain('Authorize each CLI');
+	});
+
+	test('stops for a token that is empty however it is written, and not for a provider line that names none', async () => {
+		for (const [line, code] of [
+			['KOI_DNS_API_TOKEN=""', 2],
+			["KOI_DNS_API_TOKEN=''", 2],
+			['  KOI_DNS_API_TOKEN=   ', 2],
+			['KOI_DNS_API_TOKEN=x\nKOI_DNS_API_TOKEN=', 2],
+			['KOI_DNS_API_TOKEN=\nKOI_DNS_API_TOKEN="x"', 0],
+			["KOI_DNS_API_TOKEN='x'", 0],
+		] as const) {
+			const b = await box();
+			await mkdir(join(b.dir, 'etc/koi/caddy'));
+			await writeFile(join(b.dir, 'etc/koi/caddy/env'), `${line}\n`);
+			const r = await run(b, 'main --domain previews.example.com --tls acme-dns:cloudflare');
+			expect([line, r.code]).toEqual([line, code]);
+			expect([line, r.calls.includes('systemctl restart koid.service')]).toEqual([
+				line,
+				code === 0,
+			]);
+		}
+		const b = await box();
+		await mkdir(join(b.dir, 'etc/koi/caddy'));
+		await writeFile(join(b.dir, 'etc/koi/caddy/dns.caddy'), 'dns porkbun {\n\tapi_key x\n}\n');
+		const r = await run(b, 'main --domain previews.example.com --tls acme-dns:porkbun');
+		expect(r.code).toBe(0);
+		expect(await r.read('etc/koi/caddy/env')).toEndWith('\nKOI_DNS_API_TOKEN=\n');
 	});
 
 	test("a run again keeps the operator's provider line and token", async () => {
