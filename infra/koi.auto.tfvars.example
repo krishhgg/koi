@@ -2,3 +2,7 @@
 # OpenTofu reads *.auto.tfvars on its own. The account must hold the Route 53
 # hosted zone for the domain; previews are served at <label>.<domain>.
 domain = "previews.example.com"
+
+# An account still on the new-account Lambda quota of 10 can't reserve any of
+# it for the wake function (the default reserves 10). Uncomment there:
+# wake_reserved_concurrency = null

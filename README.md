@@ -158,7 +158,7 @@ OpenTofu.
    | `vpc_id`, `subnet_id` | the default VPC | Set both or neither. The subnet needs a route to an internet gateway. |
    | `tags` | `{}` | Added to every resource that takes tags, on top of the provider's `default_tags`. |
    | `verify_pool` | `10.213.0.0/20` | See [docs/verify.md](docs/verify.md), "Run network". |
-   | `wake_reserved_concurrency` | `null` | Reserves concurrency for the wake function, which also caps it. Lambda keeps 100 of a region's quota unreserved, so a reservation fails where other functions already hold all but 100 plus this many, and on the new-account quota of 10. The personal root reserves 10. |
+   | `wake_reserved_concurrency` | `null` | Reserves concurrency for the wake function, which also caps it. Lambda keeps 100 of a region's quota unreserved, so a reservation fails where other functions already hold all but 100 plus this many, and on the new-account quota of 10. The personal root reserves 10 unless its own `wake_reserved_concurrency` is set to `null`. |
    | `ubuntu_ami_name` | Ubuntu 24.04 | The AMI name pattern for a new box. |
 
    Outputs: `instance_id`, `uploads_bucket`, `previews_parameter`, `domain`,

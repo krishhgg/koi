@@ -44,7 +44,5 @@ module "koi" {
   ubuntu_ami_name = var.ubuntu_ami_name
   verify_pool     = var.verify_pool
 
-  # The personal account's Lambda quota is 400, so 10 for the wake function
-  # leaves plenty unreserved; it also caps what a flood of requests can cost.
-  wake_reserved_concurrency = 10
+  wake_reserved_concurrency = var.wake_reserved_concurrency
 }

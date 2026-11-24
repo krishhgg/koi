@@ -72,7 +72,7 @@ resource "aws_lambda_function" "wake" {
   #checkov:skip=CKV_AWS_173:The environment holds the instance ID, the parameter name and the domain, none of them secret.
   #checkov:skip=CKV_AWS_272:The code comes from this repository's build in the same apply; there is no separate publisher to verify.
   #checkov:skip=CKV_AWS_50:X-Ray would trace two API calls per request; the log group is enough.
-  #checkov:skip=CKV_AWS_115:var.wake_reserved_concurrency sets it; the module leaves it to the root, since a reservation fails in a region whose unreserved concurrency it would take below 100. infra/ reserves 10.
+  #checkov:skip=CKV_AWS_115:var.wake_reserved_concurrency sets it; the module leaves it to the root, since a reservation fails in a region whose unreserved concurrency it would take below 100. infra/ reserves 10 by default.
   function_name    = local.wake_name
   role             = aws_iam_role.wake.arn
   runtime          = "nodejs22.x"

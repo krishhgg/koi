@@ -33,3 +33,10 @@ variable "verify_pool" {
   type    = string
   default = null
 }
+
+# Reserved for the wake function, which also caps it. Set null in an account
+# still on the new-account Lambda quota of 10, where nothing can be reserved.
+variable "wake_reserved_concurrency" {
+  type    = number
+  default = 10
+}
