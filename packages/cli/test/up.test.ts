@@ -1379,6 +1379,24 @@ describe('up --pr against a real origin', () => {
 		expect(bodies[1]).toContain(`Built from ${asPushed}.`);
 	});
 
+	test('posts no comment for a preview koi down removed during the build', async () => {
+		const o = await pullRequestOrigin();
+		const fb = running(o.merge7);
+		// koid's answer to a status read once the record is gone. The
+		// github above throws on any comment.
+		const box: Box = {
+			...fb.box,
+			ctl: async (args) =>
+				args[0] === 'status'
+					? { code: 1, stdout: '', stderr: '{"error":"no such preview"}' }
+					: fb.box.ctl(args),
+		};
+		const result = await up({ pr: 7, comment: true }, run(o, box));
+		expect(result.status).toBe('failed');
+		expect(result.error).toMatch(/was removed by koi down while koi up waited for its build$/);
+		expect(result.comment).toBeUndefined();
+	});
+
 	test('stops before uploading when origin has no such pull request', async () => {
 		const o = await pullRequestOrigin();
 		const fb = fakeBox([]);

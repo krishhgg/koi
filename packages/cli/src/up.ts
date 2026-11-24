@@ -292,7 +292,14 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 			keysUrl: keysPageUrl(deps.domain, label),
 			...(error !== undefined ? { error } : {}),
 		};
-		if (options.comment && options.pr !== undefined && ownerRepo !== undefined) {
+		// No comment on a preview koi down removed: whoever removed it meant
+		// to, and a comment that GitHub refused would lose this result.
+		if (
+			options.comment &&
+			options.pr !== undefined &&
+			ownerRepo !== undefined &&
+			record !== undefined
+		) {
 			result.comment = await deps.github(ownerRepo).upsertComment(
 				options.pr,
 				commentMarker(label),
