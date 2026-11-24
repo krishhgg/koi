@@ -37,7 +37,7 @@ export interface Git {
 	// nothing of the checkout but its objects (see mergeIsolated). A shallow
 	// checkout that lacks the commit the two have in common is deepened from
 	// origin until it has it (see DEEPEN_STEPS). Throws when git cannot merge
-	// them at all: a git older than 2.40, or a head and base with no commit
+	// them at all: a git older than 2.43, or a head and base with no commit
 	// in common.
 	mergeCommit(base: string, head: string): Promise<{ commit: string } | { conflicts: string[] }>;
 	// An uncompressed tar of a commit's tree.
@@ -198,9 +198,10 @@ export function cliGit(
 		async mergeCommit(base, head) {
 			const version = (await git('version')).trim();
 			const known = /^git version (\d+)\.(\d+)/.exec(version);
-			if (known !== null && Number(known[1]) * 1000 + Number(known[2]) < 2040) {
+			const [major, minor] = MIN_GIT;
+			if (known !== null && Number(known[1]) * 1000 + Number(known[2]) < major * 1000 + minor) {
 				throw new Error(
-					`koi merges with git merge-tree --write-tree and git --attr-source, which need git 2.40 or later (this is ${version})`,
+					`koi merges with git merge-tree --write-tree and git --attr-source, which need git ${major}.${minor} or later (this is ${version})`,
 				);
 			}
 			// Where the checkout keeps its objects and its list of shallow
@@ -291,6 +292,11 @@ export function cliGit(
 // How long git may take to merge a pull request's head into its base.
 const MERGE_TIMEOUT_MS = 10 * 60_000;
 
+// The oldest git koi makes its own merge with. Older releases either lack
+// git --attr-source or abort when git merge-tree reads attributes through it,
+// which is how koi merges (see mergeIsolated).
+const MIN_GIT = [2, 43] as const;
+
 // A time limit for one fetch: the caller's, but never more than
 // FETCH_TIMEOUT_MS.
 function fetchTimeout(timeoutMs: number | undefined): number {
@@ -358,7 +364,7 @@ interface MergeIn {
 
 // koi's merge of a pull request, made in a temporary bare repository that
 // shares only the checkout's objects. The same two parents give the same
-// tree and commit in any checkout, on any machine with git 2.40 or later.
+// tree and commit in any checkout, on any machine with git 2.43 or later.
 //
 // The repository has no config but what git init writes, no work tree, no
 // index and no info/attributes, and git runs with isolatedEnv, so none of

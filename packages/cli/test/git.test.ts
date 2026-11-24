@@ -306,26 +306,34 @@ describe('mergeCommit', () => {
 		);
 	});
 
-	test('says it needs git 2.40, and merges nothing, on an older git', async () => {
+	test('says it needs git 2.43, and merges nothing, on an older git', async () => {
 		const o = await pullRequestOrigin();
 		await o.userGit('fetch', '-q', 'origin', 'refs/pull/7/head');
-		const calls: string[][] = [];
-		// git version as Apple's git of 2024 answers it.
-		const old = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
-			calls.push(cmd);
-			return cmd.at(-1) === 'version'
-				? Promise.resolve({
-						code: 0,
-						stdout: 'git version 2.39.5 (Apple Git-154)\n',
-						stderr: '',
-						timedOut: false,
-					})
-				: exec(cmd, options);
+		// git as it answers git version, and the commands koi ran past it.
+		const answering = (version: string) => {
+			const calls: string[][] = [];
+			const run = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+				calls.push(cmd);
+				return cmd.at(-1) === 'version'
+					? Promise.resolve({ code: 0, stdout: `${version}\n`, stderr: '', timedOut: false })
+					: exec(cmd, options);
+			};
+			return { run, calls };
 		};
-		await expect(cliGit(o.user, old).mergeCommit(o.base, o.head7)).rejects.toThrow(
-			'koi merges with git merge-tree --write-tree and git --attr-source, which need git 2.40 or later (this is git version 2.39.5 (Apple Git-154))',
-		);
-		expect(calls.some((c) => c.includes('merge-tree') || c.includes('fetch'))).toBe(false);
+		// Apple's git of 2024, and two later releases before 2.43.
+		for (const version of [
+			'git version 2.39.5 (Apple Git-154)',
+			'git version 2.40.0',
+			'git version 2.42.2',
+		]) {
+			const old = answering(version);
+			await expect(cliGit(o.user, old.run).mergeCommit(o.base, o.head7)).rejects.toThrow(
+				`koi merges with git merge-tree --write-tree and git --attr-source, which need git 2.43 or later (this is ${version})`,
+			);
+			expect(old.calls.some((c) => c.includes('merge-tree') || c.includes('fetch'))).toBe(false);
+		}
+		const current = answering('git version 2.43.0');
+		expect(await cliGit(o.user, current.run).mergeCommit(o.base, o.head7)).toHaveProperty('commit');
 	});
 
 	test("neither the checkout's nor the machine's attributes or merge drivers change the merge", async () => {

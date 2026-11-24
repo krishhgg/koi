@@ -64,8 +64,9 @@ when the author pushed in between, it asks and fetches again, up to three times,
 stops. The API's `base.sha` is not used: GitHub leaves it at the base of the PR's last
 push, even after it remakes the merge onto a later base, so koi takes the base's tip
 from origin. If GitHub's merge has caught up by then koi builds it; otherwise koi
-merges the PR's head into the base's tip itself, with `git merge-tree --write-tree`
-(git 2.40 or later), as GitHub would.
+merges the PR's head into the base's tip itself, with `git merge-tree --write-tree`.
+That needs git 2.43 or later: older releases lack `git --attr-source`, or abort when
+`git merge-tree` reads attributes through it, and koi refuses to merge with them.
 
 koi makes that merge in a temporary bare repository that shares only the checkout's
 objects, with no system or global git config, no work tree, index or

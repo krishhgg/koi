@@ -42,7 +42,7 @@ built, as in "Built from #2518 (abc1234) merged into develop (def5678)". GitHub 
 an old merge after the base alone moves on. koi then asks GitHub's API whether the pull
 request can merge, which makes GitHub recompute the merge, and fetches it again for up
 to 90 seconds. If it is still out of date, koi merges the head into the base's tip
-itself with `git merge-tree` (git 2.40 or later), and says so. That merge reads nothing
+itself with `git merge-tree` (git 2.43 or later), and says so. That merge reads nothing
 from your checkout or machine but the commits: no git config, no attributes or merge
 drivers of yours, only the `.gitattributes` in the base's tree. A pull request that
 conflicts with its base has no merge, and koi stops before uploading and says to rebase
