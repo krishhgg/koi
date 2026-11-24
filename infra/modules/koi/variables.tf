@@ -30,7 +30,7 @@ variable "create_zone" {
 }
 
 variable "name_prefix" {
-  description = "Prefix of every resource name: <prefix>-box, <prefix>-wake, <prefix>-uploads-<account>, /<prefix>/previews. The CLI's discovery without a config file assumes koi-uploads-<account>; with another prefix, name the bucket in the CLI's target."
+  description = "Prefix of every resource name: <prefix>-box, <prefix>-wake, <prefix>-uploads-<account>, /<prefix>/previews. The box's koi:bucket tag carries the bucket's name, which the CLI reads when no config file or KOI_BUCKET names it."
   type        = string
   default     = "koi"
   nullable    = false
