@@ -1447,6 +1447,19 @@ describe('scripts/host-settings.sh, run in bash', () => {
 		);
 	});
 
+	test("with KOI_INSTANCE_ID set, stops on another unset value instead of reading the personal root's", async () => {
+		// infra/ answers for domain, as the personal root's state would.
+		const r = await run('x=$(koi_setting KOI_DOMAIN domain)\necho "went on"', {
+			KOI_INSTANCE_ID: 'i-0fedcba9876543210',
+		});
+		expect(r.code).not.toBe(0);
+		expect(r.stdout).toBe('');
+		expect(r.stderr).toContain(
+			"KOI_INSTANCE_ID is set, so the deployment comes from another root, but KOI_DOMAIN is not; set it from that root's domain output",
+		);
+		expect(r.calls).toEqual([]);
+	});
+
 	test('takes the region from AWS_REGION, else from where the deployment comes from', async () => {
 		const env = await run('koi_region', { AWS_REGION: 'eu-west-1', PROFILE_REGION: 'us-west-2' });
 		expect(env.stdout).toBe('eu-west-1\n');
