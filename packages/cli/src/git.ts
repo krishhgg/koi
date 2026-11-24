@@ -20,11 +20,13 @@ export interface Git {
 	files(): Promise<string[]>;
 	// Fetches a pull request's refs from origin without touching local
 	// branches. A ref origin does not have comes back undefined; a fetch that
-	// fails (network, sign-in, a remote that is not there) throws.
-	fetchPullRequest(pr: number): Promise<PullRequestRefs>;
+	// fails (network, sign-in, a remote that is not there) throws, as does one
+	// that takes longer than `timeoutMs` (at most FETCH_TIMEOUT_MS).
+	fetchPullRequest(pr: number, options?: { timeoutMs?: number }): Promise<PullRequestRefs>;
 	// The branches on origin and the commit each is at now, by name, as
-	// asked of origin without fetching anything.
-	remoteBranchTips(): Promise<Map<string, string>>;
+	// asked of origin without fetching anything. Throws when origin does not
+	// answer within `timeoutMs` (at most FETCH_TIMEOUT_MS).
+	remoteBranchTips(options?: { timeoutMs?: number }): Promise<Map<string, string>>;
 	// Fetches a branch from origin without touching local branches, and
 	// returns the commit it is at. Throws when the fetch fails, a branch
 	// origin does not have included.
@@ -130,7 +132,7 @@ export function cliGit(
 			const out = await gitAll('ls-files', '--cached', '--others', '--exclude-standard', '-z');
 			return [...new Set(out.split('\0').filter((f) => f !== ''))];
 		},
-		async fetchPullRequest(pr) {
+		async fetchPullRequest(pr, options = {}) {
 			// One fetch takes every ref under refs/pull/N/ (GitHub keeps head and
 			// merge there) into refs of koi's own. FETCH_HEAD is shared, and
 			// another fetch in this repository can replace it before koi reads it.
@@ -142,7 +144,7 @@ export function cliGit(
 			// is just missing afterwards.
 			const prefix = `refs/koi/pr-${pr}-${randomSuffix()}`;
 			const args = ['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${pr}/*:${prefix}/*`];
-			await ok(await at(args), { timeoutMs: FETCH_TIMEOUT_MS });
+			await ok(await at(args), { timeoutMs: fetchTimeout(options.timeoutMs) });
 			const fetched = (await git('for-each-ref', '--format=%(refname)', `${prefix}/`))
 				.split('\n')
 				.filter((r) => r !== '');
@@ -160,12 +162,12 @@ export function cliGit(
 				for (const ref of fetched) await git('update-ref', '-d', ref).catch(() => {});
 			}
 		},
-		async remoteBranchTips() {
+		async remoteBranchTips(options = {}) {
 			// One line per branch: the commit, a tab, refs/heads/<name>.
 			const out = (
 				await ok(await at(['ls-remote', '--heads', 'origin']), {
 					maxBytes: FULL_OUTPUT,
-					timeoutMs: FETCH_TIMEOUT_MS,
+					timeoutMs: fetchTimeout(options.timeoutMs),
 				})
 			).stdout;
 			const tips = new Map<string, string>();
@@ -288,6 +290,12 @@ export function cliGit(
 
 // How long git may take to merge a pull request's head into its base.
 const MERGE_TIMEOUT_MS = 10 * 60_000;
+
+// A time limit for one fetch: the caller's, but never more than
+// FETCH_TIMEOUT_MS.
+function fetchTimeout(timeoutMs: number | undefined): number {
+	return Math.min(FETCH_TIMEOUT_MS, timeoutMs ?? FETCH_TIMEOUT_MS);
+}
 
 // How a shallow checkout is deepened to find the commit a pull request's
 // head and base have in common: by these many commits from where its

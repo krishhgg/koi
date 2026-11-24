@@ -92,6 +92,7 @@ export {
 	type GhComment,
 	GhCommentPagesSchema,
 	GhCommentSchema,
+	GhPullRequestMergeSchema,
 	GhPullRequestSchema,
 } from './github.ts';
 export {

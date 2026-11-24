@@ -76,6 +76,9 @@ export interface Runtime {
 	sleep?: (ms: number) => Promise<void>;
 	// The clock those waits measure by; Date unless a test passes its own.
 	now?: () => Date;
+	// A clock that only moves forward, in milliseconds, for koi up's
+	// deadlines; performance.now() unless a test passes its own.
+	clock?: () => number;
 	// One request to a preview's health URL, for koi lease; fetch unless a
 	// test passes its own.
 	probe?: (url: string) => Promise<HealthAnswer>;
@@ -154,6 +157,7 @@ export async function run(
 						buildLine: (line) => io.stderr(`  | ${line}\n`),
 						randomId,
 						now: runtime.now ?? (() => new Date()),
+						clock: runtime.clock ?? (() => performance.now()),
 						sleep: runtime.sleep ?? ((ms) => Bun.sleep(ms)),
 					},
 				);

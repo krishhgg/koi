@@ -53,10 +53,19 @@ GitHub may keep an old merge after the base alone moves on, through any number o
 fetches of the ref: only a request for the PR's mergeability (`GET
 /repos/{owner}/{repo}/pulls/{n}`, whose `mergeable` is null while GitHub works it out)
 makes it recompute the merge. So when the merge is out of date koi asks, fetches the
-merge again every 15 seconds for up to 90, and checks it each time. When it stays out
-of date (or GitHub says the PR cannot merge, or gh cannot ask), koi fetches the base
-branch and merges the PR's head into its tip itself, with `git merge-tree
---write-tree` (git 2.40 or later), as GitHub would.
+merge again every 15 seconds for up to 90, and checks it each time against the base
+branch and head that GitHub's answer just named, so a PR retargeted or pushed during the
+wait is checked against what it is now. The 90 seconds are a deadline on a clock that
+only moves forward, and each gh call, fetch and sleep in the wait gets only the time
+left. When the merge stays out of date (or GitHub says the PR cannot merge, or gh
+cannot ask, or a fetch during the wait fails), koi asks GitHub once more for the base
+branch and head, fetches both, and checks that origin's head is the one GitHub named;
+when the author pushed in between, it asks and fetches again, up to three times, then
+stops. The API's `base.sha` is not used: GitHub leaves it at the base of the PR's last
+push, even after it remakes the merge onto a later base, so koi takes the base's tip
+from origin. If GitHub's merge has caught up by then koi builds it; otherwise koi
+merges the PR's head into the base's tip itself, with `git merge-tree --write-tree`
+(git 2.40 or later), as GitHub would.
 
 koi makes that merge in a temporary bare repository that shares only the checkout's
 objects, with no system or global git config, no work tree, index or

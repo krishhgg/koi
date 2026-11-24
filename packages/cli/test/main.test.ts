@@ -72,6 +72,7 @@ function fakeRuntime(
 			clock += ms;
 		},
 		now: () => new Date(clock),
+		clock: () => clock,
 		calls,
 		probed,
 		events,
@@ -710,7 +711,7 @@ describe('run against koid through SSM', () => {
 		const github: GitHub = {
 			pullRequestBranches: async () => ({ head: 'feature', base: 'main' }),
 			pullRequestFiles: async () => ['pr.txt'],
-			pullRequestMergeable: async () => {
+			pullRequestMergeState: async () => {
 				throw new Error('the merge is current; there is nothing to recompute');
 			},
 			upsertComment: async () => {
