@@ -1864,9 +1864,10 @@ What the operator does on a box that exists: run `scripts/provision-host.sh`
 `10.213.0.0/20`, and runs the helper's `provision` when the helper is
 installed), then `scripts/deploy-host.sh` (installs the helper, runs its
 `provision` and restarts koid). Set `verify_pool` in `infra/koi.auto.tfvars`
-(or the module call of another root, and `KOI_VERIFY_POOL` for
-`provision-host.sh`) first if the default overlaps a network the box can
-reach. For the recorder:
+(or the module call of another root) first if the default overlaps a network
+the box can reach. For another root's box, `provision-host.sh` also needs
+`KOI_VERIFY_POOL` set to that root's `verify_pool` output every time, default
+pool or not. For the recorder:
 build the image on the box (`docker build -t koi-recorder:1 host/recorder`),
 copy `host/recorder/seccomp.json` to the seccomp path, add
 `KOI_RECORDER_IMAGE=<the image id>` to `/etc/koi/verify/env`, and restart

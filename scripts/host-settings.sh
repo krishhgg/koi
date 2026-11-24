@@ -5,19 +5,31 @@
 # comes from `tofu output` there. One made by another root, in another
 # account, sets KOI_INSTANCE_ID, KOI_BUCKET, KOI_PREVIEWS_PARAM, KOI_DOMAIN
 # and KOI_VERIFY_POOL from that root's module outputs, and the scripts never
-# run tofu.
+# run tofu. KOI_INSTANCE_ID set is what marks another root's deployment, as
+# in koi_region.
 
 # koi_setting VAR OUTPUT prints the environment variable VAR when it is set,
 # else the tofu output OUTPUT of infra/. Set and empty is a mistake, not an
-# absence, as for the CLI's own variables.
+# absence, as for the CLI's own variables. With KOI_INSTANCE_ID set, VAR must
+# be set too: on a machine where infra/ is initialised with the personal
+# backend, reading the output there would mix the personal deployment's
+# bucket, parameter or domain into another root's box.
 koi_setting() {
 	if [ -n "${!1+set}" ]; then
 		if [ -z "${!1}" ]; then
-			echo "$1 is set but empty; unset it to read the $2 output of infra/" >&2
+			if [ -n "${KOI_INSTANCE_ID+set}" ] && [ "$1" != KOI_INSTANCE_ID ]; then
+				echo "$1 is set but empty; set it from the other root's $2 output" >&2
+			else
+				echo "$1 is set but empty; unset it to read the $2 output of infra/" >&2
+			fi
 			return 1
 		fi
 		printf '%s\n' "${!1}"
 		return 0
+	fi
+	if [ -n "${KOI_INSTANCE_ID+set}" ]; then
+		echo "KOI_INSTANCE_ID is set, so the deployment comes from another root, but $1 is not; set it from that root's $2 output" >&2
+		return 1
 	fi
 	if ! tofu -chdir="$repo/infra" output -raw "$2"; then
 		echo "$1 is not set, and infra/ has no $2 output to read; set $1, or init infra/ with the personal backend" >&2

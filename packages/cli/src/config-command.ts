@@ -76,7 +76,7 @@ async function show(cli: ParsedCli, io: Io, deps: ConfigCommandDeps): Promise<nu
 				`  profile        ${legacy.profile}`,
 				`  region         ${legacy.region}`,
 				`  instanceId     ${legacy.instanceId ?? discovered('the one instance tagged koi:role=box, else Project=koi and Name=koi-box')}`,
-				`  uploadsBucket  ${legacy.uploadsBucket ?? discovered('koi-uploads-<account id>')}`,
+				`  uploadsBucket  ${legacy.uploadsBucket ?? discovered("the instance's koi:bucket tag, else koi-uploads-<account id>")}`,
 				`  domain         ${legacy.domain ?? discovered("the instance's Domain tag")}`,
 				`run koi config import-aws --name NAME to write these to ${resolved.configPath}`,
 				'',
