@@ -14,11 +14,14 @@ data "aws_iam_policy_document" "box_assume" {
 }
 
 resource "aws_iam_role" "box" {
-  name               = "koi-box"
+  name               = local.box_name
   assume_role_policy = data.aws_iam_policy_document.box_assume.json
+  tags               = var.tags
 }
 
 data "aws_iam_policy_document" "box" {
+  #checkov:skip=CKV_AWS_111:The SSM agent's registration and messaging actions and Route 53's ListHostedZones have no resource-level scoping; every other statement names its resource.
+  #checkov:skip=CKV_AWS_356:Same statements as CKV_AWS_111: the SsmAgent and AcmeFindZone actions take only "*".
   # What the SSM agent needs to register and take Run Command jobs. Written out
   # instead of attaching AmazonSSMManagedInstanceCore, which also grants
   # ssm:GetParameter(s) on every parameter in the account.
@@ -74,7 +77,7 @@ data "aws_iam_policy_document" "box" {
   statement {
     sid       = "AcmeTxtRecords"
     actions   = ["route53:ChangeResourceRecordSets"]
-    resources = [data.aws_route53_zone.root.arn]
+    resources = [local.zone_arn]
     condition {
       test     = "ForAllValues:StringEquals"
       variable = "route53:ChangeResourceRecordSetsRecordTypes"
@@ -89,12 +92,12 @@ data "aws_iam_policy_document" "box" {
   statement {
     sid       = "AcmeReadZone"
     actions   = ["route53:ListResourceRecordSets"]
-    resources = [data.aws_route53_zone.root.arn]
+    resources = [local.zone_arn]
   }
   statement {
     sid       = "AcmeChangeStatus"
     actions   = ["route53:GetChange"]
-    resources = ["arn:aws:route53:::change/*"]
+    resources = ["arn:${local.partition}:route53:::change/*"]
   }
   # ListHostedZonesByName has no resource-level scoping in IAM.
   statement {
@@ -105,22 +108,27 @@ data "aws_iam_policy_document" "box" {
 }
 
 resource "aws_iam_role_policy" "box" {
-  name   = "koi-box"
+  name   = local.box_name
   role   = aws_iam_role.box.id
   policy = data.aws_iam_policy_document.box.json
 }
 
 resource "aws_iam_instance_profile" "box" {
-  name = "koi-box"
+  name = local.box_name
   role = aws_iam_role.box.name
+  tags = var.tags
 }
 
 resource "aws_instance" "box" {
+  #checkov:skip=CKV_AWS_135:t3 and the other Nitro types are EBS-optimized by default, and setting ebs_optimized on a box made without it replaces the box, which wipes its build caches.
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
-  subnet_id              = sort(data.aws_subnets.default.ids)[0]
+  subnet_id              = local.subnet_id
   vpc_security_group_ids = [aws_security_group.box.id]
   iam_instance_profile   = aws_iam_instance_profile.box.name
+
+  # One-minute CloudWatch metrics while the box runs.
+  monitoring = true
 
   # `shutdown -h now` on the box stops the instance instead of terminating it.
   instance_initiated_shutdown_behavior = "stop"
@@ -128,14 +136,17 @@ resource "aws_instance" "box" {
   # Runs once, at first boot. Changing it does not re-run it on this box; use
   # scripts/provision-host.sh to apply host changes to a running box. Gzipped,
   # because EC2 caps user data at 16 KiB and the script is larger; cloud-init
-  # unpacks it before running it. The script reads the domain from KOI_DOMAIN
-  # and the verification pool from KOI_VERIFY_POOL, set on the lines in front
-  # of it; provision-host.sh prepends the same lines.
+  # unpacks it before running it. The script reads the domain from KOI_DOMAIN,
+  # the verification pool from KOI_VERIFY_POOL and the region from KOI_REGION,
+  # set on the lines in front of it; provision-host.sh prepends the same lines.
+  # files/cloud-init.sh links to host/cloud-init.sh; a copy of the module
+  # made with `cp -rL` carries the file itself.
   user_data_base64 = base64gzip(join("\n", [
     "#!/bin/bash",
     "KOI_DOMAIN=${var.domain}",
     "KOI_VERIFY_POOL=${var.verify_pool}",
-    file("${path.module}/../host/cloud-init.sh"),
+    "KOI_REGION=${local.region}",
+    file("${path.module}/files/cloud-init.sh"),
   ]))
   user_data_replace_on_change = false
 
@@ -153,12 +164,17 @@ resource "aws_instance" "box" {
     http_put_response_hop_limit = 1
   }
 
-  # The CLI finds the box by Name and reads the preview domain from Domain,
-  # so a team needs no settings beyond an AWS profile.
-  tags = {
-    Name   = "koi-box"
-    Domain = var.domain
-  }
+  # Without a config file the CLI finds the box by koi:role and reads the
+  # preview domain from Domain and the uploads bucket, whose name carries the
+  # prefix, from koi:bucket, so a team needs no settings beyond an AWS
+  # profile. koi:role rather than Project, which the caller's default_tags
+  # may set to anything.
+  tags = merge(var.tags, {
+    Name         = local.box_name
+    Domain       = var.domain
+    "koi:role"   = "box"
+    "koi:bucket" = local.uploads_name
+  })
 
   lifecycle {
     # A newer AMI or a reordered subnet list must not replace the box and wipe
@@ -172,9 +188,9 @@ resource "aws_instance" "box" {
 # Fixed address so CloudFront's origin hostname never changes.
 resource "aws_eip" "box" {
   domain = "vpc"
-  tags = {
-    Name = "koi-box"
-  }
+  tags = merge(var.tags, {
+    Name = local.box_name
+  })
 }
 
 resource "aws_eip_association" "box" {
@@ -185,9 +201,11 @@ resource "aws_eip_association" "box" {
 # Labels of previews that may wake the box. The daemon writes it; the wake
 # function reads it. Seeded empty here and never overwritten by apply.
 resource "aws_ssm_parameter" "previews" {
+  #checkov:skip=CKV2_AWS_34:Holds the labels of live previews, which are public hostnames, not secrets; the wake function and the box read it as plain JSON.
   name  = local.previews_ssm
   type  = "String"
   value = "[]"
+  tags  = var.tags
 
   lifecycle {
     ignore_changes = [value]

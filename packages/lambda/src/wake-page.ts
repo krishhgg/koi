@@ -12,8 +12,9 @@ export const WAKE_GIVE_UP_MS = 5 * 60 * 1000;
 // say so. A visit to the wake page counts as a bounce when it comes within
 // WAKE_BOUNCE_MS of a reload this page made; any later visit starts afresh.
 // The window has to outlast a slow failure: CloudFront waits up to 60 s for
-// the origin (origin_read_timeout in infra/cdn.tf) before answering 504, so a
-// bounce can take that long to arrive. Two minutes leaves room for both.
+// the origin (origin_read_timeout in infra/modules/koi/cdn.tf) before
+// answering 504, so a bounce can take that long to arrive. Two minutes leaves
+// room for both.
 export const WAKE_MAX_RELOADS = 3;
 export const WAKE_BOUNCE_MS = 120_000;
 

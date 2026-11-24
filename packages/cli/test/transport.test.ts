@@ -141,15 +141,15 @@ describe('openHost on the legacy AWS path', () => {
 		expect(opened.domain).toBe('previews.example.net');
 		expect(opened.resolved.kind).toBe('legacy');
 		expect(a.made).toEqual(['koi-cli@us-east-1']);
-		// The same discovery calls as before config files.
+		// The box by both tag sets, then the account for the bucket.
 		expect(a.calls.map((c) => c.name)).toEqual([
+			'DescribeInstancesCommand',
 			'DescribeInstancesCommand',
 			'GetCallerIdentityCommand',
 		]);
 		expect(a.calls[0]?.input).toMatchObject({
 			Filters: [
-				{ Name: 'tag:Project', Values: ['koi'] },
-				{ Name: 'tag:Name', Values: ['koi-box'] },
+				{ Name: 'tag:koi:role', Values: ['box'] },
 				{ Name: 'instance-state-name', Values: ['pending', 'running', 'stopping', 'stopped'] },
 			],
 		});
@@ -182,6 +182,7 @@ describe('openHost on the legacy AWS path', () => {
 		// The domain came from the flag, so the tag was not needed; the box
 		// still is.
 		expect(a.calls.map((c) => c.name)).toEqual([
+			'DescribeInstancesCommand',
 			'DescribeInstancesCommand',
 			'GetCallerIdentityCommand',
 		]);

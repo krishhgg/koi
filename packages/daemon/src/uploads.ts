@@ -34,8 +34,8 @@ export function s3Uploads(bucket: string, client: S3Client): Uploads {
 			if (request.id !== id) throw new Error(`request ${id} names itself ${request.id}`);
 			return request;
 		},
-		// The bucket's own rule expires objects (infra/uploads.tf) and nothing
-		// in koid deletes them, so there is nothing to hold or let go.
+		// The bucket's own rule expires objects (infra/modules/koi/uploads.tf)
+		// and nothing in koid deletes them, so there is nothing to hold or let go.
 		async claim() {},
 		async release() {},
 		async downloadSource(id, file) {

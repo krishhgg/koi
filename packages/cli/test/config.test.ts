@@ -744,7 +744,11 @@ describe('koi config import-aws', () => {
 		expect(out.stdout()).toContain('instanceId: i-0123456789abcdef0');
 		expect(out.stdout()).toContain('domain: previews.example.net');
 		expect(aws.made).toEqual(['koi-cli@us-east-1']);
-		expect(aws.calls).toEqual(['DescribeInstancesCommand', 'GetCallerIdentityCommand']);
+		expect(aws.calls).toEqual([
+			'DescribeInstancesCommand',
+			'DescribeInstancesCommand',
+			'GetCallerIdentityCommand',
+		]);
 	});
 
 	test('takes the domain from --domain, then KOI_DOMAIN, then the Domain tag', async () => {
