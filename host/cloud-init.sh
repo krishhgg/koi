@@ -4,7 +4,8 @@
 # update a box that already exists, so every step must be safe to repeat.
 # Installs Docker and Caddy, creates the koi user and directories, and arms an
 # idle shutdown so a box nobody is using stops itself. The daemon binary is
-# installed separately.
+# installed separately. host/install-vm.sh runs the same file on a host
+# outside AWS, with KOI_TLS and KOI_POWER (below) set for it.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -30,6 +31,27 @@ IDLE_MINUTES=10
 KOI_REGION=${KOI_REGION:-us-east-1}
 if ! [[ $KOI_REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
 	echo "koi: KOI_REGION '$KOI_REGION' is not an AWS region name" >&2
+	exit 1
+fi
+
+# How Caddy gets certificates for *.$DOMAIN; koid writes the same choice
+# into the Caddyfile it owns (KOI_TLS in /etc/koi/env, which koid reads, and
+# packages/daemon/src/caddy.ts). route53, the AWS box's: one wildcard
+# certificate over DNS-01 with the box's role. host/install-vm.sh passes
+# another for a host outside AWS: internal (Caddy's own CA), acme-http (a
+# certificate per preview name over HTTP-01 or TLS-ALPN-01) or
+# acme-dns:<provider> (a wildcard over DNS-01 with that caddy-dns module).
+KOI_TLS=${KOI_TLS:-route53}
+if ! [[ $KOI_TLS =~ ^(route53|internal|acme-http|acme-dns:[a-z0-9]+)$ ]]; then
+	echo "koi: KOI_TLS '$KOI_TLS' is not route53, internal, acme-http or acme-dns:<provider>" >&2
+	exit 1
+fi
+# ec2, the AWS box's: it stops itself after IDLE_MINUTES without activity,
+# and the wake function starts it. always-on: a host koi never stops
+# (host/install-vm.sh); no idle shutdown.
+KOI_POWER=${KOI_POWER:-ec2}
+if ! [[ $KOI_POWER =~ ^(ec2|always-on)$ ]]; then
+	echo "koi: KOI_POWER '$KOI_POWER' is not ec2 or always-on" >&2
 	exit 1
 fi
 
@@ -164,7 +186,8 @@ restart_docker_if_pending
 # loaded an upgraded library: koid, Docker and containerd among them, which
 # kills the build in flight ("the daemon restarted before this build
 # finished"). needrestart now leaves these services running on the old
-# libraries. The box stops when idle, and its next start loads the new ones.
+# libraries. The box stops when idle, and its next start loads the new ones;
+# an always-on host (host/install-vm.sh) loads them at its next reboot.
 install -d -m 0755 /etc/needrestart/conf.d
 cat > /etc/needrestart/conf.d/50-koi.conf <<'CONF'
 # Written by koi's host/cloud-init.sh: needrestart skips its automatic
@@ -397,8 +420,14 @@ mv -f /etc/sudoers.d/.koi-verify-net.new /etc/sudoers.d/koi-verify-net
 # --- Caddy with the Route 53 DNS module (wildcard certificate via DNS-01) ----
 # Download beside the binary and rename over it: overwriting a running
 # executable in place fails (ETXTBSY), a rename does not. The restart at the
-# end of this script picks up the new binary.
-curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/caddy-dns/route53" \
+# end of this script picks up the new binary. Outside AWS the build has the
+# chosen provider's DNS module, or none.
+case $KOI_TLS in
+route53) caddy_module='&p=github.com/caddy-dns/route53' ;;
+acme-dns:*) caddy_module="&p=github.com/caddy-dns/${KOI_TLS#acme-dns:}" ;;
+*) caddy_module='' ;;
+esac
+curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=amd64$caddy_module" \
 	-o /usr/local/bin/caddy.new
 chmod 755 /usr/local/bin/caddy.new
 mv -f /usr/local/bin/caddy.new /usr/local/bin/caddy
@@ -410,8 +439,19 @@ install -d -o caddy -g caddy /etc/caddy /var/lib/caddy /var/log/caddy
 # directory: koi's home is 0750, which Caddy cannot enter. The directory is
 # koi:caddy with the setgid bit, so files koid writes there are readable by
 # Caddy and by nobody else. This first version, written only when there is
-# none, sends everything to koid; koid replaces it on start.
+# none, sends everything to koid; koid replaces it on start. Outside AWS it
+# serves nothing until then: a Route 53 block would not load without the
+# module, and koid's file brings the chosen one.
 install -d -o koi -g caddy -m 2750 /var/lib/koi-caddy
+if [ ! -f /var/lib/koi-caddy/Caddyfile ] && [ "$KOI_TLS" != route53 ]; then
+	cat > /var/lib/koi-caddy/Caddyfile <<'CADDY'
+# Written by provisioning; koid replaces it on start.
+{
+	auto_https disable_redirects
+	admin 127.0.0.1:2019
+}
+CADDY
+fi
 if [ ! -f /var/lib/koi-caddy/Caddyfile ]; then
 	cat > /var/lib/koi-caddy/Caddyfile <<CADDY
 # Written by provisioning; koid replaces it on start.
@@ -440,7 +480,15 @@ chmod 0640 /var/lib/koi-caddy/Caddyfile
 rm -f /var/lib/koi/Caddyfile
 rm -f /etc/caddy/Caddyfile
 
-# Unquoted, for the region; nothing else in the unit expands.
+# What Caddy's DNS module reads from its environment: on AWS the region, with
+# credentials from the box's role; elsewhere a provider's token, from a file
+# of root's that host/install-vm.sh makes for the operator to fill.
+if [ "$KOI_TLS" = route53 ]; then
+	caddy_env="Environment=AWS_REGION=$KOI_REGION"
+else
+	caddy_env='EnvironmentFile=-/etc/caddy/koi.env'
+fi
+# Unquoted, for that line; nothing else in the unit expands.
 cat > /etc/systemd/system/caddy.service <<UNIT
 [Unit]
 Description=Caddy
@@ -450,7 +498,7 @@ Wants=network-online.target
 [Service]
 User=caddy
 Group=caddy
-Environment=AWS_REGION=$KOI_REGION
+$caddy_env
 Environment=XDG_DATA_HOME=/var/lib
 Environment=XDG_CONFIG_HOME=/var/lib
 ExecStart=/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile
@@ -506,7 +554,12 @@ UNIT
 # --- Idle shutdown ----------------------------------------------------------
 # Idle time counts from the later of this boot and koid's last activity stamp.
 # The stamp survives stop/start, so without the boot time a box woken after an
-# idle stop would power off again at the first check.
+# idle stop would power off again at the first check. An always-on host gets
+# none, and loses one an earlier run gave it.
+if [ "$KOI_POWER" = always-on ]; then
+	systemctl disable --now koi-idle.timer 2>/dev/null || true
+	rm -f /etc/systemd/system/koi-idle.timer /etc/systemd/system/koi-idle.service /usr/local/sbin/koi-idle-check
+else
 cat > /usr/local/sbin/koi-idle-check <<IDLE
 #!/bin/bash
 set -eu
@@ -543,19 +596,23 @@ OnUnitActiveSec=1min
 [Install]
 WantedBy=timers.target
 UNIT
+fi
 
 systemctl daemon-reload
 # Count this run as activity again right before the idle timer comes back, so
 # its first check does not power the box off on the strength of how long ago
 # it booted.
 touch /var/lib/koi/last-activity
-systemctl enable --now koi-firewall.service caddy.service koi-idle.timer
+# The idle timer is the AWS box's alone (above).
+idle_timer=()
+[ "$KOI_POWER" = always-on ] || idle_timer=(koi-idle.timer)
+systemctl enable --now koi-firewall.service caddy.service "${idle_timer[@]}"
 systemctl enable koid.service
 # On a re-run, pick up changed scripts and configuration.
 # Re-apply the firewall rules by running the script, not by restarting its
 # unit: koid Requires= that unit, so a restart would restart koid and kill any
 # build in progress. The script only adds rules that are missing.
 /usr/local/sbin/koi-firewall
-systemctl restart koi-idle.timer
+[ "$KOI_POWER" = always-on ] || systemctl restart koi-idle.timer
 systemctl reload-or-restart caddy.service
 logger -t koi "cloud-init provisioning complete"
