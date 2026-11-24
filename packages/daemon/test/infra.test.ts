@@ -46,6 +46,35 @@ describe('exec', () => {
 		await expect(run).rejects.toBeInstanceOf(ExecError);
 		await expect(run).rejects.toThrow('seq 1 printed more than 300000 bytes');
 	});
+
+	// The docker CLI ends buildx only when it gets to handle the signal, so
+	// an abort asks first. These shells stand in for it: one ends its child
+	// on SIGTERM, the other ignores SIGTERM.
+	test('ends an aborted process with SIGTERM, so it can end its children', async () => {
+		const stop = new AbortController();
+		const started = Date.now();
+		const run = exec(
+			['bash', '-c', "trap 'echo stopping; kill $!; exit 3' TERM; sleep 30 & echo up; wait"],
+			{ signal: stop.signal, onLine: (line) => line === 'up' && stop.abort() },
+		);
+		const result = await run;
+		expect(result.code).toBe(3);
+		expect(result.stdout).toBe('up\nstopping\n');
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
+
+	test('kills an aborted process that ignores SIGTERM once the grace ends', async () => {
+		const stop = new AbortController();
+		const started = Date.now();
+		const run = exec(['bash', '-c', 'trap "" TERM; echo up; while :; do sleep 0.1; done'], {
+			signal: stop.signal,
+			abortGraceMs: 300,
+			onLine: (line) => line === 'up' && stop.abort(),
+		});
+		const result = await run;
+		expect(result.code).not.toBe(0);
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
 });
 
 describe('extractTarball', () => {
