@@ -452,7 +452,11 @@ export async function main(argv: string[], runtime: Runtime = realRuntime): Prom
 		killRunning();
 		const code = 128 + (signal === 'SIGINT' ? 2 : 15);
 		const closed = open === undefined ? Promise.resolve() : closeHost(open).catch(() => {});
-		void closed.then(() => process.exit(code));
+		// What started while the host was closing is killed as well.
+		void closed.then(() => {
+			killRunning();
+			process.exit(code);
+		});
 	};
 	process.on('SIGINT', onSignal);
 	process.on('SIGTERM', onSignal);

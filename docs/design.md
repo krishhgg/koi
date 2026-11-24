@@ -57,7 +57,8 @@ merge again every 15 seconds for up to 90, and checks it each time against the b
 branch and head that GitHub's answer just named, so a PR retargeted or pushed during the
 wait is checked against what it is now. The 90 seconds are a deadline on a clock that
 only moves forward, and each gh call, fetch and sleep in the wait gets only the time
-left. When the merge stays out of date (or GitHub says the PR cannot merge, or gh
+left; a program killed at the deadline gets up to 2 seconds more for its output to end
+(`PIPE_GRACE_MS` in exec.ts). When the merge stays out of date (or GitHub says the PR cannot merge, or gh
 cannot ask, or a fetch during the wait fails), koi reads the base branch and head from
 GitHub once more, whatever happened during the wait. A read that fails is tried again,
 three times in all, 5 seconds apart, each with gh's usual 2 minute limit. Without an
