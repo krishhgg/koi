@@ -154,6 +154,10 @@ async function daemon(): Promise<void> {
 			domain: config.domain,
 			httpPort: config.httpPort,
 			logPort: config.logPort,
+			tls:
+				config.tls === 'acme-dns'
+					? { kind: 'acme-dns', file: config.tlsDnsFile }
+					: { kind: config.tls },
 			file: config.caddyfile,
 			adminUrl: config.caddyAdmin,
 		}),
@@ -269,6 +273,7 @@ async function daemon(): Promise<void> {
 	createHttpServer({
 		port: config.httpPort,
 		domain: config.domain,
+		tlsAsk: config.tls === 'acme-http',
 		deployer,
 		onVisit,
 		log,

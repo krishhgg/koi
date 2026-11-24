@@ -45,12 +45,98 @@ describe('renderCaddyfile', () => {
 		);
 	});
 
+	test("off AWS, with no CloudFront in front, gives koid's pages Caddy's peer's address", () => {
+		for (const tls of [
+			{ kind: 'internal' },
+			{ kind: 'acme-http' },
+			{ kind: 'acme-dns', file: '/etc/koi/caddy/dns.caddy' },
+		] as const) {
+			const text = renderCaddyfile({ ...base, routes: [], tls });
+			expect([tls.kind, text]).toEqual([
+				tls.kind,
+				expect.stringContaining(
+					'\thandle {\n\t\treverse_proxy 127.0.0.1:7777 {\n\t\t\theader_up X-Koi-Forwarded-For {http.request.remote.host}\n\t\t}\n\t}',
+				),
+			]);
+			expect(text).not.toContain('X-Forwarded-For}');
+		}
+	});
+
 	test('is stable for the same routes in any order', () => {
 		const a = { label: 'a', upstream: '172.19.0.2:80' };
 		const b = { label: 'b', upstream: '172.19.0.3:80' };
 		expect(renderCaddyfile({ ...base, routes: [a, b] })).toBe(
 			renderCaddyfile({ ...base, routes: [b, a] }),
 		);
+	});
+
+	test('renders the same file as before for the AWS box, which sets no TLS mode', () => {
+		const routes = [{ label: 'hello', upstream: '172.19.0.2:8080' }];
+		expect(renderCaddyfile({ ...base, routes, tls: { kind: 'route53' } })).toBe(
+			renderCaddyfile({ ...base, routes }),
+		);
+		expect(renderCaddyfile({ ...base, routes })).not.toContain('on_demand');
+	});
+
+	test("takes each other host's TLS mode in place of Route 53, and nothing else changes", () => {
+		const routes = [{ label: 'hello', upstream: '172.19.0.2:8080' }];
+		const route53 = renderCaddyfile({ ...base, routes });
+		const block = /\ttls \{\n\t\tdns route53[\s\S]*?\n\t\}\n/.exec(route53)?.[0] ?? '';
+		expect(block).not.toBe('');
+		// Off AWS the client's address is Caddy's peer's, not CloudFront's header.
+		const offAws = route53.replace(
+			'X-Koi-Forwarded-For {http.request.header.X-Forwarded-For}',
+			'X-Koi-Forwarded-For {http.request.remote.host}',
+		);
+		const internal = renderCaddyfile({ ...base, routes, tls: { kind: 'internal' } });
+		expect(internal).toBe(
+			offAws
+				.replace(block, '\ttls internal\n')
+				.replace('\tadmin 127.0.0.1:2019\n}', '\tadmin 127.0.0.1:2019\n\tskip_install_trust\n}'),
+		);
+		const dns = renderCaddyfile({
+			...base,
+			routes,
+			tls: { kind: 'acme-dns', file: '/etc/koi/caddy/dns.caddy' },
+		});
+		expect(dns).toBe(offAws.replace(block, '\ttls {\n\t\timport /etc/koi/caddy/dns.caddy\n\t}\n'));
+		// On demand, with koid's answer to which names are previews'.
+		const http = renderCaddyfile({ ...base, routes, tls: { kind: 'acme-http' } });
+		expect(http).toBe(
+			offAws
+				.replace(block, '\ttls {\n\t\ton_demand\n\t}\n')
+				.replace(
+					'\thandle /__koi/* {',
+					'\thandle /__koi/tls-ask {\n\t\trespond 404\n\t}\n\n\thandle /__koi/* {',
+				)
+				.replace(
+					'\tadmin 127.0.0.1:2019\n}',
+					'\tadmin 127.0.0.1:2019\n\ton_demand_tls {\n\t\task http://127.0.0.1:7777/__koi/tls-ask\n\t}\n}',
+				),
+		);
+	});
+
+	test("puts Caddy's admin API on a unix socket, mode 0660, when given one, and nothing else changes", () => {
+		const routes = [{ label: 'hello', upstream: '172.19.0.2:8080' }];
+		const tls = { kind: 'internal' } as const;
+		const port = renderCaddyfile({ ...base, routes, tls });
+		expect(port).toContain('\tadmin 127.0.0.1:2019\n');
+		expect(renderCaddyfile({ ...base, routes, tls, adminSocket: '/run/caddy/admin.sock' })).toBe(
+			port.replace('\tadmin 127.0.0.1:2019\n', '\tadmin unix//run/caddy/admin.sock|0660\n'),
+		);
+		for (const adminSocket of ['run/caddy.sock', '/a b', '/x}\n:80 {']) {
+			expect(() => renderCaddyfile({ ...base, routes, tls, adminSocket })).toThrow(
+				'bad admin socket',
+			);
+		}
+	});
+
+	test('refuses a DNS provider file that would not be one Caddyfile token', () => {
+		for (const file of ['relative.caddy', '/a b', '/x}\n:80 {', '/{env.X}']) {
+			expect(() =>
+				renderCaddyfile({ ...base, routes: [], tls: { kind: 'acme-dns', file } }),
+			).toThrow('bad DNS provider file');
+		}
 	});
 
 	test('refuses labels and upstreams that could inject config', () => {
@@ -114,6 +200,35 @@ describe('caddyApplier', () => {
 		expect(t.posts).toHaveLength(4);
 	});
 
+	test('loads through a unix socket for unix//PATH, and names that socket in the config', async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'koid-caddy-'));
+		const file = join(dir, 'Caddyfile');
+		const socket = join(dir, 'admin.sock');
+		const posts: Array<{ path: string; type: string | null; body: string }> = [];
+		const admin = Bun.serve({
+			unix: socket,
+			fetch: async (req) => {
+				posts.push({
+					path: new URL(req.url).pathname,
+					type: req.headers.get('content-type'),
+					body: await req.text(),
+				});
+				return new Response('');
+			},
+		});
+		try {
+			const tls = { kind: 'internal' } as const;
+			await caddyApplier({ ...base, tls, file, adminUrl: `unix/${socket}` }).apply([]);
+			const text = renderCaddyfile({ ...base, routes: [], tls, adminSocket: socket });
+			expect(text).toContain(`\tadmin unix/${socket}|0660\n`);
+			const post = { path: '/load', type: 'text/caddyfile', body: text };
+			expect(posts).toEqual([post, post]);
+			expect(await readFile(file, 'utf8')).toBe(text);
+		} finally {
+			await admin.stop(true);
+		}
+	});
+
 	test('a Caddy that restarts between the load and the save ends up running the new config', async () => {
 		// What the fake Caddy runs: the last config it accepted, or the file
 		// when it starts.
@@ -136,6 +251,24 @@ describe('caddyApplier', () => {
 		await t.caddy.apply(after);
 		expect(running).toBe(renderCaddyfile({ ...base, routes: after }));
 		expect(await t.read()).toBe(running);
+	});
+
+	test("with a DNS provider, leaves Caddy's reason out of the error, since it may quote the provider's key", async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'koid-caddy-'));
+		const caddy = caddyApplier({
+			...base,
+			tls: { kind: 'acme-dns', file: '/etc/koi/caddy/dns.caddy' },
+			file: join(dir, 'Caddyfile'),
+			adminUrl: 'http://127.0.0.1:2019',
+			fetch: (async () =>
+				new Response("API token 'abc123' appears invalid", {
+					status: 400,
+				})) as unknown as typeof fetch,
+		});
+		const err = await caddy.apply([]).catch((e: unknown) => e);
+		expect(String(err)).toBe(
+			"Error: caddy rejected the config: 400 (the reason is in Caddy's log: journalctl -u caddy)",
+		);
 	});
 
 	test('a failed second load fails the apply, and the next apply sends again', async () => {

@@ -41,12 +41,8 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 echo "building koid and the SSH gateway"
-(cd "$repo/packages/daemon" && bun build --compile --target=bun-linux-x64 --outfile "$work/koid" ./src/main.ts >/dev/null)
-(cd "$repo" && bun build --compile --target=bun-linux-x64 --outfile "$work/koi-ssh-gateway" ./host/ssh/koi-ssh-gateway.ts >/dev/null)
-tar -czf "$work/recipes.tar.gz" -C "$repo/recipes" .
-tar -czf "$work/egress.tar.gz" -C "$repo/host/egress" --exclude=test --exclude=__pycache__ .
-tar -czf "$work/ssh.tar.gz" -C "$repo/host/ssh" --exclude=test .
-tar -czf "$work/verify.tar.gz" -C "$repo/host/verify" --exclude=test --exclude=__pycache__ .
+# The same build a host outside AWS installs from (host/install-vm.sh).
+"$repo/scripts/host-bundle.sh" "$work" >/dev/null
 koid_sha=$(sha256sum "$work/koid" | cut -d' ' -f1)
 gateway_sha=$(sha256sum "$work/koi-ssh-gateway" | cut -d' ' -f1)
 recipes_sha=$(sha256sum "$work/recipes.tar.gz" | cut -d' ' -f1)

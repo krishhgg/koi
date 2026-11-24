@@ -11,7 +11,7 @@ import {
 	utimes,
 	writeFile,
 } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { parseCli } from '../src/args.ts';
 import type { Clients } from '../src/box.ts';
@@ -468,6 +468,60 @@ describe('resolveTarget', () => {
 			'default',
 		]);
 		expect(n.lines).toEqual([]);
+	});
+
+	test('--local is the built-in local target, needs no file and beats every other selector', async () => {
+		const h = await configured('fallback');
+		const repo = await checkout('version: 1\ntarget: aliased\n');
+		const local = await resolveTarget({
+			flags: { local: true },
+			env: { HOME: h, KOI_TARGET: 'fromenv' },
+			checkoutDir: repo,
+			notice: () => {},
+		});
+		expect(local).toEqual({
+			kind: 'target',
+			name: 'local',
+			source: 'local',
+			target: {
+				domain: 'koi.test',
+				address: { scheme: 'https', port: 443 },
+				transport: { kind: 'local', controlSocket: '/run/koi/control.sock' },
+				power: { kind: 'always-on' },
+			},
+			configPath: join(h, '.config', 'koi', 'config.yaml'),
+		});
+		// No file at all, or a broken one, is no matter; the socket comes
+		// from KOID_CONTROL_SOCKET, as koid ctl takes it, and the domain from
+		// --domain or KOI_DOMAIN.
+		const broken = await home();
+		await mkdir(join(broken, '.config', 'koi'), { recursive: true });
+		await writeFile(join(broken, '.config', 'koi', 'config.yaml'), 'version: 7\n', { mode: 0o600 });
+		const elsewhere = await resolveTarget({
+			flags: { local: true },
+			env: { HOME: broken, KOID_CONTROL_SOCKET: '~/vm/control.sock', KOI_DOMAIN: 'dev.koi.test' },
+			checkoutDir: '/nonexistent',
+			notice: () => {},
+		});
+		expect(elsewhere.kind === 'target' && elsewhere.target.transport).toEqual({
+			kind: 'local',
+			controlSocket: join(homedir(), 'vm', 'control.sock'),
+		});
+		expect(elsewhere.kind === 'target' && elsewhere.target.domain).toBe('dev.koi.test');
+		for (const [flags, env, why] of [
+			[{ local: true, target: 'team' }, { HOME: h }, '--local and --target both pick a target'],
+			[{ local: true }, { HOME: h, KOID_CONTROL_SOCKET: '' }, 'KOID_CONTROL_SOCKET is empty'],
+			[
+				{ local: true },
+				{ HOME: h, KOID_CONTROL_SOCKET: 'control.sock' },
+				'is not an absolute path',
+			],
+			[{ local: true }, { HOME: h, KOI_BUCKET: 'b' }, 'KOI_BUCKET applies to AWS targets only'],
+		] as const) {
+			await expect(
+				resolveTarget({ flags, env, checkoutDir: '/nonexistent', notice: () => {} }),
+			).rejects.toThrow(why);
+		}
 	});
 
 	test('no config file and nothing selected is the legacy AWS path', async () => {

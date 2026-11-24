@@ -143,10 +143,11 @@ async function smallBody(request: Request): Promise<string | undefined> {
 	return new TextDecoder().decode(Buffer.concat(chunks));
 }
 
-// Where a request came from, for limits. CloudFront appends the viewer's
-// address to X-Forwarded-For, and Caddy passes that header on as
+// Where a request came from, for limits. On the AWS box CloudFront appends
+// the viewer's address to X-Forwarded-For, and Caddy passes that header on as
 // X-Koi-Forwarded-For (see caddy.ts), so its last entry is the viewer's.
-// Entries before it are whatever the client sent. An IPv6 address counts by
+// Entries before it are whatever the client sent. On a host without
+// CloudFront, Caddy sets the header to its peer's address alone. An IPv6 address counts by
 // its /64, which one subscriber usually holds whole; an IPv4 address written
 // as IPv6 (::ffff:...) is that IPv4 address. Without an address, every such
 // request shares the source 'unknown'.

@@ -111,10 +111,21 @@ the box's `Domain` tag (which the CLI reads), the wake function's environment,
 | Create or change the AWS stack | `AWS_PROFILE=<admin> infra/bootstrap.sh` |
 | Re-run host provisioning on the running box | `AWS_PROFILE=<admin> scripts/provision-host.sh` |
 | Install a new koid, recipes, egress proxy and SSH gateway | `AWS_PROFILE=<admin> scripts/deploy-host.sh` |
+| Set up, or update, a plain Linux VM as a host | `scripts/host-bundle.sh DIR`, copy `DIR` to the VM, then `sudo DIR/install-vm.sh --domain D --tls MODE` there |
+| Set up this machine as a host for `koi up --local` | `scripts/host-bundle.sh DIR`, then `sudo DIR/install-vm.sh --local --user "$USER"` |
 | Let a CLI reach a host over SSH | On the host, after the deploy: append the CLI's public key to `/etc/ssh/koi-connect/authorized_keys` and read `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`; on the CLI, `koi target trust NAME --fingerprint SHA256:...` (see [docs/configuration.md](docs/configuration.md)) |
 
 Update the box before the CLI; see Updating the box and the CLI in
 [docs/design.md](docs/design.md).
+
+koi also runs without AWS. `host/install-vm.sh` sets up an Ubuntu 24.04 VM
+anywhere, which the CLI reaches over SSH, or the machine the CLI runs on, which
+`koi up --local` reaches through koid's control socket. It runs the same
+provisioning as the AWS box without the AWS parts: certificates come from
+Caddy's own CA or from Let's Encrypt over HTTP-01 or a DNS provider of your
+choice instead of Route 53, nothing stops the host when it is idle, and koid
+takes uploads through its socket instead of S3. See Setting up a Linux host and
+A local host in [docs/configuration.md](docs/configuration.md).
 
 ### From another root
 
@@ -221,7 +232,9 @@ are its limits, each with the file that decides it.
   volumes together pass 10 GiB (`DISK_LIMIT_BYTES` in `packages/daemon/src/deployer.ts`,
   the timer in `packages/daemon/src/main.ts`). A preview can fill the disk between two
   checks.
-- The host installer is for a dedicated machine, not a personal workstation.
+- The host installer is for a dedicated machine, not a personal workstation, and
+  `host/install-vm.sh`, `--local` included, runs it too: for `koi up --local` on a
+  workstation, a Linux VM there is the cleaner host.
   `host/cloud-init.sh` writes `cgroup-parent: koi.slice` into `/etc/docker/daemon.json`,
   so from then on every container on the machine that names no cgroup parent starts
   under koi's memory ceiling, and it restarts Docker when that setting changes. A
@@ -233,10 +246,19 @@ are its limits, each with the file that decides it.
   the restart stops every container. The installer adds iptables rules and installs
   Caddy, which serves `*.<domain>` on port 443 with a wildcard certificate from a
   DNS-01 challenge and does not redirect port 80 (`auto_https disable_redirects`); the
-  security group opens only 443 (`infra/modules/koi/network.tf`). A timer checks every minute and
+  security group opens only 443 (`infra/modules/koi/network.tf`). Outside AWS the
+  certificates come from the TLS mode `install-vm.sh` was given, and which ports are
+  open is the operator's to decide. On the AWS box a timer checks every minute and
   powers the machine off (`systemctl poweroff`) once 10 minutes pass with no activity.
   A koi request, a build and an open connection to a preview all count as activity;
   koid looks for open connections every 30 seconds (`packages/daemon/src/main.ts`).
+- On a local host, any member of the `koi-control` group can run any koid command
+  and upload source, as a holder of a `koi-connect` key can over SSH: koid makes its
+  control socket mode 0660 in that group (`packages/daemon/src/control.ts`), and
+  `install-vm.sh --user` adds accounts to it. The CLI talks only to a socket on a path
+  no other account could have written to (`socketPathProblem` in
+  `packages/cli/src/transports/local.ts`), and checks koid's descriptor before it
+  sends any source.
 - A preview never holds a provider key that was registered on the keys page. That key
   stays in the reviewer's browser and in the egress proxy's memory. The preview gets a
   per-preview token, and the proxy swaps it for the key only in that provider's own
@@ -284,7 +306,7 @@ are its limits, each with the file that decides it.
 | `packages/lambda` | The wake function behind CloudFront: the "waking up" page and the API that starts the box. |
 | `schemas` | JSON Schemas of what `koi up`, `koi lease` and `koi release` print with `--json`, written by `bun scripts/json-schemas.ts`. |
 | `infra` | OpenTofu for the AWS pieces: the koi module (`modules/koi`) and the personal deployment's root. |
-| `host` | Box provisioning (`cloud-init.sh`), the egress proxy (`egress/`), the verification firewall helper (`verify/`), the SSH gateway for the CLI (`ssh/`), and the recorder (`recorder/`) and verifier (`verifier/`) images a verification run uses. |
+| `host` | Box provisioning (`cloud-init.sh`), the installer for a host outside AWS (`install-vm.sh`), the egress proxy (`egress/`), the verification firewall helper (`verify/`), the SSH gateway for the CLI (`ssh/`), and the recorder (`recorder/`) and verifier (`verifier/`) images a verification run uses. |
 | `recipes` | Built-in recipes, one directory each. |
 | `examples/hello` | The smallest preview: a static page. |
 
@@ -294,10 +316,15 @@ are its limits, each with the file that decides it.
 bun install
 bun run typecheck && bun run lint && bun run test
 KOI_DOCKER_TESTS=1 bun run test packages/daemon   # also build and run a real container
+KOI_DOCKER_TESTS=1 bun run test packages/cli/test/local.integration.test.ts   # koi up --local, end to end
 uv run --with mitmproxy==12.2.3 --with pytest pytest host/egress/test
 uv run --with pytest pytest host/verify/test   # the verification firewall helper
 uv run --with pytest pytest host/verifier      # the verifier's supervisor and runner clients
 ```
+
+The local end-to-end test runs koid from source and Caddy in a container on the
+host's network, so it needs port 443 free and no `koi-previews0` or
+`koi-build0` bridge, as on a machine that is not itself a koi host.
 
 After changing the `--json` output schemas in `packages/shared/src/cli-output.ts`, run
 `bun scripts/json-schemas.ts` and commit what it writes to `schemas/`. A test fails while

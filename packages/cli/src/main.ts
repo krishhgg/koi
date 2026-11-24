@@ -126,7 +126,7 @@ export async function run(
 	let host: Box | undefined;
 	const connect = async () => {
 		const opened = await runtime.box({
-			flags: { target: cli.target, config: cli.config, domain: cli.domain },
+			flags: { target: cli.target, config: cli.config, domain: cli.domain, local: cli.local },
 			env: await environment(),
 			checkoutDir: await checkoutDir(runtime),
 			notice: progress,

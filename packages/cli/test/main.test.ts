@@ -479,6 +479,7 @@ describe('run', () => {
 			target: 'team',
 			config: '/tmp/k.yaml',
 			domain: 'd.example.com',
+			local: false,
 		});
 		expect(seen[0]?.env).toEqual({ HOME: '/home/u', KOI_TARGET: 'team' });
 		expect(seen[0]?.checkoutDir).toBe('/checkout');
@@ -487,8 +488,16 @@ describe('run', () => {
 		const { git: _git, ...noGit } = runtime;
 		const plain = await capture(['list'], noGit);
 		expect(plain.code).toBe(0);
-		expect(seen[1]?.flags).toEqual({ target: undefined, config: undefined, domain: undefined });
+		expect(seen[1]?.flags).toEqual({
+			target: undefined,
+			config: undefined,
+			domain: undefined,
+			local: false,
+		});
 		expect(seen[1]?.checkoutDir).toBe('/nonexistent');
+		const local = await capture(['list', '--local'], noGit);
+		expect(local.code).toBe(0);
+		expect(seen[2]?.flags.local).toBe(true);
 	});
 
 	test('config show prints the target from the config file the environment names', async () => {

@@ -24,7 +24,17 @@ const ConfigSchema = z.object({
 	stateDir: z.string().startsWith('/'),
 	recipesDir: z.string().startsWith('/'),
 	caddyfile: z.string().startsWith('/'),
-	caddyAdmin: z.url(),
+	// Caddy's admin API: an http URL, as on the AWS box, or unix//PATH, Caddy's
+	// own way to write a unix socket, which host/install-vm.sh sets so that no
+	// other account on the host can change Caddy's config (caddy.ts). The path
+	// goes into the Caddyfile as one token.
+	caddyAdmin: z.union([z.url(), z.string().regex(/^unix\/\/[A-Za-z0-9._/-]+$/)]),
+	// How Caddy gets certificates (caddy.ts, CaddyTls): route53 on the AWS
+	// box, which sets nothing; host/install-vm.sh sets another for a host
+	// outside AWS. With acme-dns, the file that holds the provider's `dns`
+	// line, which Caddy reads and koid never does.
+	tls: z.enum(['route53', 'internal', 'acme-http', 'acme-dns']),
+	tlsDnsFile: z.string().regex(/^\/[A-Za-z0-9._/-]+$/),
 	// Docker's data root. Images, containers, volumes and the build cache
 	// all live on the filesystem that holds it.
 	dockerRoot: z.string().startsWith('/'),
@@ -110,6 +120,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 		recipesDir: env.KOI_RECIPES_DIR ?? '/usr/local/share/koi/recipes',
 		caddyfile: env.KOI_CADDYFILE ?? '/var/lib/koi-caddy/Caddyfile',
 		caddyAdmin: env.KOI_CADDY_ADMIN ?? 'http://127.0.0.1:2019',
+		tls: env.KOI_TLS || 'route53',
+		tlsDnsFile: env.KOI_TLS_DNS_FILE ?? '/etc/koi/caddy/dns.caddy',
 		dockerRoot: env.KOI_DOCKER_ROOT ?? '/var/lib/docker',
 		network: env.KOI_PREVIEW_NETWORK ?? 'koi-previews',
 		buildNetwork: env.KOI_BUILD_NETWORK ?? 'koi-build',

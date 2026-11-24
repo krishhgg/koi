@@ -25,13 +25,13 @@ import {
 	UnsupportedCapabilityError,
 } from '../src/transport.ts';
 import {
-	digestFile,
 	HostKeyError,
 	SSH_DEFAULT_LIMITS,
 	type SshLimits,
 	sshFailureIsTransient,
 	sshTransport,
 } from '../src/transports/ssh.ts';
+import { digestFile } from '../src/transports/upload.ts';
 import { hostInfoFor, previewRecord } from './koid.ts';
 
 const TARGET: SshTarget = {

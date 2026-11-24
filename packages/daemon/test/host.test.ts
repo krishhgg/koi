@@ -1273,9 +1273,12 @@ describe('host/cloud-init.sh', () => {
 				/cat > \/etc\/systemd\/system\/caddy\.service <<UNIT\n([\s\S]*?)\nUNIT\n/.exec(
 					script,
 				)?.[1] ?? '';
-			expect(caddy).toContain('Environment=AWS_REGION=$KOI_REGION\n');
-			// The heredoc is unquoted for the region, so nothing else in it may expand.
-			expect(caddy.replace('$KOI_REGION', '')).not.toMatch(/[$`\\]/);
+			expect(caddy).toContain('\n$caddy_unit\n');
+			expect(script).toContain(
+				'if [ "$KOI_TLS" = route53 ]; then\n\tcaddy_unit="Environment=AWS_REGION=$KOI_REGION"\n',
+			);
+			// The heredoc is unquoted for that line, so nothing else in it may expand.
+			expect(caddy.replace('$caddy_unit', '')).not.toMatch(/[$`\\]/);
 			const box = readFileSync(
 				resolve(import.meta.dir, '../../../infra/modules/koi/box.tf'),
 				'utf8',
@@ -1510,6 +1513,168 @@ describe('scripts/host-settings.sh, run in bash', () => {
 			const read = [...text.matchAll(/^(\w+)=\$\(koi_(?:setting|region)\b/gm)].map((m) => m[1]);
 			expect(read.length).toBeGreaterThan(2);
 			for (const v of read) expect(text).toMatch(new RegExp(`koi_check(_pool)? "\\$${v}"`));
+		}
+	});
+});
+
+// The parts of host/cloud-init.sh that host/install-vm.sh switches with
+// KOI_TLS and KOI_POWER, run in bash with the box's paths moved under a
+// directory of this test's and curl and systemctl replaced by functions that
+// log their calls. The AWS box sets neither, and must get what it got before
+// they existed.
+describe('host/cloud-init.sh outside AWS, run in bash', () => {
+	const script = readFileSync(resolve(import.meta.dir, '../../../host/cloud-init.sh'), 'utf8');
+	const section = (from: string, to: string) => {
+		const start = script.indexOf(from);
+		const end = script.indexOf(to, start);
+		if (start < 0 || end < 0) throw new Error(`cloud-init.sh has no section from ${from} to ${to}`);
+		return script.slice(start, end + to.length);
+	};
+	// The settings and their checks, from the domain to the verification pool.
+	const settings = section(
+		// biome-ignore lint/suspicious/noTemplateCurlyInString: bash's syntax, not a template of this file
+		'if [ -z "${KOI_DOMAIN:-}" ]; then',
+		'is not ec2 or always-on" >&2\n\texit 1\nfi\n',
+	);
+	// The Caddy download, its first Caddyfile and its unit.
+	const caddy = section('case $KOI_TLS in', '\nUNIT\n');
+	// The idle shutdown and the end of the script.
+	const tail = section(
+		'if [ "$KOI_POWER" = always-on ]; then\n\tsystemctl disable',
+		'systemctl reload-or-restart caddy.service\n',
+	);
+
+	async function provision(env: Record<string, string>, body: string) {
+		const dir = await mkdtemp(join(tmpdir(), 'koi-cloud-init-'));
+		const calls = join(dir, 'calls');
+		const moved = body
+			.replaceAll('/var/lib/koi-caddy/', `${dir}/`)
+			.replaceAll('/etc/systemd/system/', `${dir}/`)
+			.replaceAll('/usr/local/sbin/', `${dir}/`)
+			.replaceAll('/var/lib/koi/', `${dir}/koi/`)
+			.replaceAll('/usr/local/bin/caddy', `${dir}/caddy`);
+		await mkdir(join(dir, 'koi'));
+		const file = join(dir, 'run.sh');
+		await writeFile(
+			file,
+			[
+				'set -euo pipefail',
+				`calls='${calls}'`,
+				': > "$calls"',
+				'curl() { echo "curl $*" >> "$calls"; }',
+				'systemctl() { echo "systemctl $*" >> "$calls"; }',
+				// Accounts, owners and removals are the box's, and none of
+				// them may reach this machine's.
+				'id() { :; }',
+				'useradd() { :; }',
+				'usermod() { echo "usermod $*" >> "$calls"; }',
+				'install() { :; }',
+				'chmod() { :; }',
+				'chown() { :; }',
+				'mv() { :; }',
+				'rm() { echo "rm $*" >> "$calls"; }',
+				'logger() { :; }',
+				`printf '#!/bin/bash\\necho "firewall" >> "%s"\\n' "$calls" > '${dir}/koi-firewall'`,
+				`command chmod 755 '${dir}/koi-firewall'`,
+				settings,
+				moved,
+			].join('\n'),
+		);
+		const vars = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+		const r = await exec(['env', '-i', 'PATH=/usr/bin:/bin', ...vars, 'bash', file], {
+			timeoutMs: 30_000,
+		});
+		const lines = (await readFile(calls, 'utf8').catch(() => '')).split('\n').filter((l) => l);
+		const read = (name: string) => readFile(join(dir, name), 'utf8').catch(() => undefined);
+		return { ...r, calls: lines, read, dir };
+	}
+
+	const box = { KOI_DOMAIN: 'previews.example.com', KOI_REGION: 'eu-west-1' };
+
+	test('the AWS box gets Caddy with Route 53, its region, the Route 53 Caddyfile and the idle timer', async () => {
+		const r = await provision(box, `${caddy}\n${tail}`);
+		expect(r.stderr).toBe('');
+		expect(r.code).toBe(0);
+		expect(r.calls[0]).toBe(
+			`curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/caddy-dns/route53 -o ${r.dir}/caddy.new`,
+		);
+		expect(await r.read('caddy.service')).toContain(
+			'\nGroup=caddy\nEnvironment=AWS_REGION=eu-west-1\nEnvironment=XDG_DATA_HOME=/var/lib\n',
+		);
+		expect(await r.read('caddy.service')).not.toContain('EnvironmentFile');
+		expect(await r.read('caddy.service')).not.toContain('RuntimeDirectory');
+		const first = (await r.read('Caddyfile')) ?? '';
+		expect(first).toContain('\tadmin 127.0.0.1:2019\n');
+		expect(first).toContain('*.previews.example.com {\n\ttls {\n\t\t# Route 53');
+		expect(first).toContain('dns route53 {');
+		// The admin API stays on its port, and koi out of Caddy's group.
+		expect(r.calls.filter((c) => c.startsWith('usermod'))).toEqual([]);
+		expect(await r.read('koi-idle-check')).toContain('\nlimit=600\n');
+		expect(r.calls).toContain(
+			'systemctl enable --now koi-firewall.service caddy.service koi-idle.timer',
+		);
+		expect(r.calls).toContain('systemctl restart koi-idle.timer');
+	});
+
+	test('a host outside AWS gets the Caddy build for its TLS mode, an empty first Caddyfile and its token file', async () => {
+		for (const [tls, module] of [
+			['internal', ''],
+			['acme-http', ''],
+			['acme-dns:cloudflare', '&p=github.com/caddy-dns/cloudflare'],
+		] as const) {
+			const r = await provision(
+				{ ...box, KOI_TLS: tls, KOI_POWER: 'always-on' },
+				`${caddy}\n${tail}`,
+			);
+			expect([tls, r.code, r.stderr]).toEqual([tls, 0, '']);
+			expect(r.calls[0]).toBe(
+				`curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64${module} -o ${r.dir}/caddy.new`,
+			);
+			const unit = (await r.read('caddy.service')) ?? '';
+			// The token file, and /run/caddy for the admin socket, which only
+			// root and the caddy group may enter.
+			expect(unit).toContain(
+				'\nGroup=caddy\nEnvironmentFile=-/etc/koi/caddy/env\nRuntimeDirectory=caddy\nRuntimeDirectoryMode=0750\nEnvironment=XDG_DATA_HOME=/var/lib\n',
+			);
+			expect(unit).not.toContain('AWS_REGION');
+			// Caddy serves nothing until koid writes its file with the mode's
+			// block, and its admin API is the socket, mode 0660, from the start.
+			expect(await r.read('Caddyfile')).toBe(
+				'# Written by provisioning; koid replaces it on start.\n{\n\tauto_https disable_redirects\n\tadmin unix//run/caddy/admin.sock|0660\n}\n',
+			);
+			// koid opens the socket as a member of Caddy's group.
+			expect(r.calls.filter((c) => c.startsWith('usermod'))).toEqual(['usermod -aG caddy koi']);
+		}
+	});
+
+	test('an always-on host gets no idle shutdown, and loses one an earlier run gave it', async () => {
+		const r = await provision({ ...box, KOI_TLS: 'internal', KOI_POWER: 'always-on' }, tail);
+		expect(r.code).toBe(0);
+		expect(await r.read('koi-idle-check')).toBeUndefined();
+		expect(await r.read('koi-idle.timer')).toBeUndefined();
+		expect(r.calls).toContain('systemctl disable --now koi-idle.timer');
+		expect(r.calls).toContain(
+			`rm -f ${r.dir}/koi-idle.timer ${r.dir}/koi-idle.service ${r.dir}/koi-idle-check`,
+		);
+		const timer = r.calls.filter((c) => c.startsWith('systemctl') && c.includes('koi-idle'));
+		expect(timer).toEqual(['systemctl disable --now koi-idle.timer']);
+		expect(r.calls).toContain('systemctl enable --now koi-firewall.service caddy.service');
+		expect(r.calls).toContain('firewall');
+	});
+
+	test('a TLS mode or power it does not know stops it before anything is done', async () => {
+		for (const [env, why] of [
+			[
+				{ KOI_TLS: 'letsencrypt' },
+				"KOI_TLS 'letsencrypt' is not route53, internal, acme-http or acme-dns:<provider>",
+			],
+			[{ KOI_TLS: 'acme-dns:../x' }, "KOI_TLS 'acme-dns:../x' is not"],
+			[{ KOI_TLS: 'acme-dns:cloud flare' }, "KOI_TLS 'acme-dns:cloud flare' is not"],
+			[{ KOI_POWER: 'sometimes' }, "KOI_POWER 'sometimes' is not ec2 or always-on"],
+		] as const) {
+			const r = await provision({ ...box, ...env }, 'echo went on');
+			expect([env, r.code, r.stdout]).toEqual([env, 1, '']);
+			expect(r.stderr).toContain(why);
 		}
 	});
 });

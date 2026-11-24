@@ -403,6 +403,20 @@ refuses the connection is reported as one its operator must start. The AWS box
 gets the gateway and the account too, from `scripts/deploy-host.sh`, but its
 security group admits no SSH, so nothing is opened there.
 
+### Reaching koid on the same machine
+
+A local target reaches koid through its control socket with nothing in
+between (`packages/cli/src/transports/local.ts`). The CLI runs koid ctl's own
+client against the socket, as the gateway does, and sends the source to the
+upload API over a connection to it, in the same requests the SSH tunnel
+carries (`transports/upload.ts`, which both transports use). Access is decided
+where it is for the gateway: the socket is mode 0660 in `koi-control`, and an
+account in that group stands where a `koi-connect` key does. In place of a
+pinned host key, the CLI refuses a socket on a path another account could have
+written to, then checks koid's descriptor before any source goes out. The host
+is set up by `host/install-vm.sh --local`, which runs `host/cloud-init.sh`
+without its AWS parts: certificates from Caddy's own CA, no idle shutdown.
+
 ### Updating the box and the CLI
 
 `scripts/deploy-host.sh` installs koid, the built-in recipes and the egress proxy on

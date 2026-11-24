@@ -169,11 +169,33 @@ export const REPO_TARGET_FILE = '.koi/target.yaml';
 export const MAX_REPO_ALIAS_BYTES = 4096;
 
 // The selectors the command line gives: which file, which target, and the
-// domain to expect of the host instead of the target's own.
+// domain to expect of the host instead of the target's own. `local` is
+// --local, the built-in local target.
 export interface TargetFlags {
 	target?: string | undefined;
 	config?: string | undefined;
 	domain?: string | undefined;
+	local?: boolean | undefined;
+}
+
+// The socket koid makes on a host set up by host/install-vm.sh, and the
+// domain the docs set up for a local host.
+export const LOCAL_SOCKET = '/run/koi/control.sock';
+export const LOCAL_DOMAIN = 'koi.test';
+
+// What --local stands for: koid on this machine at its usual socket, or at
+// KOID_CONTROL_SOCKET, which `koid ctl` reads too, serving previews under
+// koi.test. No config file is needed or read for it.
+export function localTarget(env: Env): Target {
+	const socket =
+		env.KOID_CONTROL_SOCKET === undefined
+			? LOCAL_SOCKET
+			: nonEmpty(env.KOID_CONTROL_SOCKET, 'KOID_CONTROL_SOCKET');
+	return TargetSchema.parse({
+		domain: LOCAL_DOMAIN,
+		transport: { kind: 'local', controlSocket: socket },
+		power: { kind: 'always-on' },
+	});
 }
 
 export type Env = Record<string, string | undefined>;
@@ -307,7 +329,7 @@ export async function loadRepoAlias(
 	return parsed.data.target;
 }
 
-export type TargetSource = 'flag' | 'env' | 'repo' | 'default';
+export type TargetSource = 'flag' | 'env' | 'repo' | 'default' | 'local';
 
 export type ResolvedTarget =
 	// No config file and nothing selected: the AWS deployment as the
@@ -331,14 +353,14 @@ export interface ResolveOptions {
 }
 
 // Which target koi uses, and with what overrides. The target comes from
-// --target, then KOI_TARGET, then the checkout's .koi/target.yaml, then the
-// file's defaultTarget. With no config file and none of those, the legacy
-// AWS path. A config file that selects nothing is an error, not legacy: the
-// user has targets and must pick one. Then field overrides: command line
-// flags, then the documented environment variables, over the target.
+// --local, which needs no file, or --target, then KOI_TARGET, then the
+// checkout's .koi/target.yaml, then the file's defaultTarget. With no config
+// file and none of those, the legacy AWS path. A config file that selects
+// nothing is an error, not legacy: the user has targets and must pick one.
+// Then field overrides: command line flags, then the documented environment
+// variables, over the target.
 export async function resolveTarget(o: ResolveOptions): Promise<ResolvedTarget> {
 	const { path, explicit } = configPath(o.flags, o.env);
-	const loaded = await loadUserConfig(path, explicit, o.notice);
 	for (const v of AWS_ENV) if (o.env[v] !== undefined) nonEmpty(o.env[v], v);
 	const domainOverride =
 		o.flags.domain !== undefined
@@ -346,6 +368,19 @@ export async function resolveTarget(o: ResolveOptions): Promise<ResolvedTarget> 
 			: o.env.KOI_DOMAIN !== undefined
 				? nonEmpty(o.env.KOI_DOMAIN, 'KOI_DOMAIN')
 				: undefined;
+	if (o.flags.local) {
+		if (o.flags.target !== undefined) {
+			throw new Error('--local and --target both pick a target; pass one of them');
+		}
+		return {
+			kind: 'target',
+			name: 'local',
+			source: 'local',
+			target: withOverrides(localTarget(o.env), 'local', domainOverride, o.env),
+			configPath: path,
+		};
+	}
+	const loaded = await loadUserConfig(path, explicit, o.notice);
 
 	let selected: { name: string; source: TargetSource } | undefined;
 	if (o.flags.target !== undefined) {
@@ -403,6 +438,8 @@ function describeSelection(s: { name: string; source: TargetSource }, checkoutDi
 			return `${join(checkoutDir, REPO_TARGET_FILE)} names the target ${quoted}`;
 		case 'default':
 			return `defaultTarget names ${quoted}`;
+		case 'local':
+			return '--local names the built-in local target';
 	}
 }
 
