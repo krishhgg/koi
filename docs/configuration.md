@@ -53,7 +53,7 @@ Each target has these fields.
 | `address` | `scheme` and `port` of the preview URLs. Only `https` on `443` works in this version; the field is reserved. |
 | `transport` | How koi reaches the host: `aws-ssm`, `ssh` or `local`. See the examples. |
 | `aws` | `profile` (default `koi-cli`), `region` (default `us-east-1`), `instanceId` and `uploadsBucket`. Required with the `aws-ssm` transport or `ec2` power, and not allowed otherwise. Wake and commands use the same instance. |
-| `power` | `ec2`: koi starts the instance before use, and it stops itself when idle. `always-on`: koi never stops the host and never starts it; when the host does not answer, koi stops with an error and the host's operator must start it. The `ssh` transport takes `always-on` only. |
+| `power` | `ec2`: koi starts the instance before use, and it stops itself when idle. `always-on`: koi never stops the host and never starts it; when the host does not answer, koi stops with an error and the host's operator must start it. The `ssh` and `local` transports take `always-on` only. |
 
 ## Repository alias
 
@@ -76,11 +76,13 @@ rather than rely on the alias.
 
 In this order, the first that applies:
 
-1. `--target NAME`
-2. `KOI_TARGET`
-3. The checkout's `.koi/target.yaml`
-4. `defaultTarget` in the user's file
-5. With no config file at all: the AWS deployment as the environment and
+1. `--local`: koid on this machine, a target built into koi that needs no
+   config file (see A local host). It cannot be combined with `--target`.
+2. `--target NAME`
+3. `KOI_TARGET`
+4. The checkout's `.koi/target.yaml`
+5. `defaultTarget` in the user's file
+6. With no config file at all: the AWS deployment as the environment and
    discovery describe it (see Without a config file)
 
 A config file that selects nothing is an error, not a fall back to discovery.
@@ -190,6 +192,71 @@ names the public half of a key that ssh-agent holds. Exactly one of the two.
 `power` must be `always-on`: koi cannot start a host over SSH. The walkthrough
 below says how to set the host and the key up.
 
+## Setting up a Linux host
+
+`host/install-vm.sh` makes a plain Linux machine a koi host: an Ubuntu 24.04
+VM at any provider, which the CLI reaches over SSH, or a machine the CLI runs
+on, with `--local`. It runs `host/cloud-init.sh`, the AWS box's provisioning,
+for Docker, the memory slice, the preview and build networks, the BuildKit
+builder, the firewall and Caddy, with the AWS parts switched off. Then it
+installs what `scripts/deploy-host.sh` installs on the AWS box: koid, the
+recipes, the egress proxy, the verification helper and, unless `--local`, the
+SSH gateway. What differs from the AWS box:
+
+- Certificates come from the TLS mode given to the installer, not from Route 53.
+- Nothing stops the host when it is idle, and there is no wake page: the host
+  is always on.
+- koid takes uploads through its control socket into a spool
+  (`KOI_UPLOADS=spool`), and keeps the list of live previews in a file
+  (`KOI_LIVE=file`), where the AWS box uses S3 and SSM.
+
+The installer takes its files from the directory it is in. Build that
+directory on a machine with this repository and Bun, copy it whole, and run
+the installer there as root:
+
+```sh
+scripts/host-bundle.sh /tmp/koi-host
+scp -r /tmp/koi-host vm:
+ssh vm sudo koi-host/install-vm.sh --domain previews.example.com --tls acme-http
+```
+
+`scripts/host-bundle.sh` builds koid and the gateway the way
+`scripts/deploy-host.sh` does, packs the recipes, the egress proxy, the SSH
+installer and the verification helper, and writes the SHA-256 of every file to
+`SHA256SUMS`. The installer refuses a directory whose files do not match it.
+Every step can be repeated: run the installer again with a new bundle to
+update the host.
+
+| Option | Meaning |
+|---|---|
+| `--domain D` | Previews are served at `<label>.D`. Required, except with `--local`, where it defaults to `koi.test`. |
+| `--tls MODE` | How Caddy gets certificates for `*.D`; see the table below. Required, except with `--local`, where it defaults to `internal`. |
+| `--local` | This machine, for the local transport: no SSH gateway. |
+| `--user NAME` | An account that may use koid through its control socket. Repeat it for more. |
+| `--verify-pool CIDR` | The network verification runs are carved from, as `var.verify_pool` on AWS. Default `10.213.0.0/20`. |
+
+| TLS mode | Certificates | What the host needs |
+|---|---|---|
+| `internal` | One wildcard certificate from Caddy's own CA. | Every machine that visits previews trusts the CA's root, `/var/lib/caddy/pki/authorities/local/root.crt`: on the host itself, `sudo caddy trust`. |
+| `acme-http` | A certificate per preview name from Let's Encrypt, which cannot issue a wildcard over HTTP. Caddy gets one at the first visit of a name, once koid confirms the name is a preview's (`/__koi/tls-ask`), so a stranger cannot make the host order certificates for names of their choosing. | A DNS record `*.D` pointing at the host, and ports 80 and 443 open to the internet: Let's Encrypt checks each name over HTTP-01 on 80 or TLS-ALPN-01 on 443. Let's Encrypt allows 50 new certificates a week for a registered domain. |
+| `acme-dns:PROVIDER` | One wildcard certificate from Let's Encrypt over DNS-01, through `github.com/caddy-dns/PROVIDER` (`cloudflare`, `digitalocean`, `hetzner` and so on), which the installer builds Caddy with. | A DNS record `*.D` pointing at the host, port 443 open to visitors, and the provider's API token in `/etc/caddy/koi.env` (`KOI_DNS_API_TOKEN=...`, mode 0600), then `systemctl restart caddy`. The installer writes `/etc/caddy/koi-dns.caddy` with `dns PROVIDER {env.KOI_DNS_API_TOKEN}`; edit it for a provider that takes other arguments. It keeps both files on a run again. |
+
+koid reads the mode from `KOI_TLS` in `/etc/koi/env` and writes the matching
+`tls` block into the Caddyfile it owns. With `acme-dns` the block imports
+`/etc/caddy/koi-dns.caddy`, which root owns and Caddy reads, and the token is in
+Caddy's environment alone, so koid never sees it. The AWS box sets no `KOI_TLS`
+and keeps its Route 53 block.
+
+The installer changes the machine as `host/cloud-init.sh` changes the AWS box
+(see Trust model and limits in the README): it sets Docker's default cgroup
+parent to `koi.slice`, which puts every container on the machine under koi's
+memory ceiling and restarts Docker once, adds iptables rules, and runs Caddy
+on port 443. Give it a machine, or a VM, of its own.
+
+When it finishes, the installer prints what is left to do once: the DNS record
+or `/etc/hosts` lines, the CA, the token, the ports, and for an SSH host the
+key to authorize and the fingerprint to hand to the CLI's operator.
+
 ## Reaching a host over SSH
 
 An SSH target is a Linux host that runs koid with its upload spool
@@ -205,15 +272,14 @@ keys from a root-owned file outside its home.
 
 ### On the host
 
-1. Install the gateway. `scripts/deploy-host.sh` builds it and runs
-   `host/ssh/install.sh`, which creates the `koi-connect` account and the
-   `koi-control` group, installs the binary at
-   `/usr/local/libexec/koi-ssh-gateway`, writes the sshd `Match User
-   koi-connect` block to `/etc/ssh/sshd_config.d/00-koi-connect.conf`,
-   checks it, and reloads sshd. A reload leaves open sessions alone. The
-   standalone installer for a plain VM is a later change; until then run
-   `host/ssh/install.sh` by hand as root with the gateway binary as its
-   argument, after `host/cloud-init.sh`.
+1. Install the gateway. On a plain VM `host/install-vm.sh` does it with
+   the rest of koi (see Setting up a Linux host); on the AWS box
+   `scripts/deploy-host.sh` does. Both run `host/ssh/install.sh`, which
+   creates the `koi-connect` account and the `koi-control` group, installs
+   the binary at `/usr/local/libexec/koi-ssh-gateway`, writes the sshd
+   `Match User koi-connect` block to
+   `/etc/ssh/sshd_config.d/00-koi-connect.conf`, checks it, and reloads
+   sshd. A reload leaves open sessions alone.
 
    The account's password field is `*`, which no password hashes to, so no
    password logs in. The account is not locked. A locked account has a field
@@ -394,22 +460,117 @@ second counts as one. A limit the command sets stands instead.
   start`: sshd and the gateway answer but koid does not. koi waits up to
   five minutes for a koid that is starting.
 
-### A local Docker host (reserved)
+### A local host
 
 ```yaml
 version: 1
 targets:
-  local:
+  dev:
     domain: koi.test
-    address:
-      scheme: https
-      port: 443
     transport:
       kind: local
-      controlSocket: /run/koi-local/control.sock
+      controlSocket: /run/koi/control.sock
     power:
       kind: always-on
 ```
+
+`controlSocket` is koid's control socket: `/run/koi/control.sock` on a host
+`host/install-vm.sh` set up, or wherever a VM tool forwards it. `power` must be
+`always-on`: koi cannot start koid. `koi up --local` stands for this target with
+no file at all, the socket taken from `KOID_CONTROL_SOCKET` when it is set. See
+A local host below.
+
+## A local host
+
+A local target reaches koid on the machine koi runs on, through koid's control
+socket: no SSH, SSM or bucket in between. koid's network rules use the Linux
+firewall, so the host is Linux: this machine, or a Linux VM whose socket a
+tool forwards to the machine koi runs on (a Mac, say).
+
+The CLI speaks to the socket as the SSH gateway does on its host. A command
+runs koid ctl's own client (`packages/daemon/src/ctl.ts`) in the CLI's
+process, with the same arguments, replies and exit codes as `koid ctl` on the
+host. `koi up` sends the source over a connection to the socket, in the same
+three requests the SSH tunnel carries: a ticket for the request id, size and
+digest, the archive, the commit. koid checks the digest as it does over SSH.
+
+Who may do this is decided on the host, as for the SSH gateway. koid makes the
+socket mode 0660 with the group `koi-control`, in a directory of mode 2750, so
+root, koid's account and the members of `koi-control` can open it, and no one
+else. `install-vm.sh --user NAME` puts an account in that group, as the SSH
+installer puts `koi-connect` there, and a member may do what a holder of a
+`koi-connect` key may: any koid command, and uploads.
+
+What stands in for the SSH host key is the socket's path. Before it sends
+anything, koi checks that no account but root, the one running koi and the
+accounts those two gave a directory to could have put the socket, or anything
+on the way to it, there: each directory from `/` down is writable by its owner
+alone, or is sticky like `/tmp` with koi's next entry owned by an account it
+already trusts. The path is walked as written and again as it resolves. A
+directory its group or anyone may write to is refused, as OpenSSH's StrictModes
+refuses one on the way to `authorized_keys`, since another user of the machine
+could put a socket of their own there and receive the source. Then, as over
+SSH, koid's descriptor must name the target's domain before any of the source
+goes out.
+
+### Once, on the machine
+
+1. Build the bundle and install koid for this machine, with your account in
+   `koi-control`:
+
+   ```sh
+   scripts/host-bundle.sh /tmp/koi-host
+   sudo /tmp/koi-host/install-vm.sh --local --user "$USER"
+   ```
+
+   That serves previews under `koi.test` with Caddy's own CA. Pass `--domain`
+   for another domain; `koi up --local` then needs the same `--domain`, or
+   `KOI_DOMAIN`.
+2. Log out and in again, or start a shell with `newgrp koi-control`, so the
+   new group applies.
+3. Trust Caddy's CA: `sudo caddy trust` adds its root to the system's trust
+   store, and to Firefox's and Chrome's when `certutil` (`libnss3-tools`) is
+   installed. For another machine, or a program with a store of its own, the
+   root is `/var/lib/caddy/pki/authorities/local/root.crt`.
+4. Names: `/etc/hosts` takes no wildcard, so add a line per preview,
+   `127.0.0.1 hello.koi.test`, or let a local resolver answer for the whole
+   domain, as dnsmasq does with `address=/koi.test/127.0.0.1`. Browsers, and
+   systemd-resolved as Ubuntu runs it, already resolve every `*.localhost`
+   name to the machine itself, so `--domain koi.localhost` needs neither
+   there.
+
+Then, in a checkout, `koi up --local`, and `koi list --local`, `koi down NAME
+--local` and the rest. A target with `transport: local` in the config file
+works the same way, with `--target`.
+
+### A Linux VM on a Mac
+
+Run the installer with `--local` inside the VM, and forward the VM's
+`/run/koi/control.sock` to a socket on the Mac. With Lima, for example:
+
+```yaml
+portForwards:
+  - guestSocket: /run/koi/control.sock
+    hostSocket: "{{.Dir}}/sock/koi.sock"
+```
+
+Then name that socket on the Mac: a target with it as `controlSocket`, or
+`KOID_CONTROL_SOCKET=~/.lima/koi/sock/koi.sock koi up --local`. The account in
+the VM that the tool forwards as must be in `koi-control`. Forward the VM's
+port 443 to the Mac as well, and point the names at the address that reaches
+it.
+
+### Errors
+
+- `there is no control socket at ...`: koid is not running there. koi cannot
+  start it: `sudo systemctl start koid`, or set the machine up as above.
+- `this account may not open ...`: the account is not in `koi-control` in this
+  session. Run the installer with `--user`, then log in again.
+- `koi does not trust the control socket of target ...`: a directory on the
+  way to the socket can be written by others. Use a socket in a directory only
+  root, you or koid's account can write to.
+- `waiting for koid at ... to start`: the socket is there and koid does not
+  answer yet. koi waits up to five minutes, as over SSH.
 
 ## Moving the existing AWS deployment to the file
 
@@ -527,8 +688,8 @@ The schema accepts these so a file written for a later koi reads cleanly, but
 this version stops with a plain error when a command selects them:
 
 - the `ssh` transport with `ec2` power (an SSH host koi would also start),
-- the `local` transport and `koi up --local`,
+  and the `local` transport with `ec2` power,
 - an SSH `channel` on an `aws-ssm` target,
 - an `address.port` other than 443,
 - following a container log live (`koi logs` shows a bounded tail), and the
-  control channel for interactive verification, on either transport.
+  control channel for interactive verification, on any transport.
