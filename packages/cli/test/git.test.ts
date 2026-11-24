@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { type ExecOptions, type ExecResult, exec } from '../src/exec.ts';
+import { type ExecOptions, type ExecResult, exec, execOk } from '../src/exec.ts';
 import { cliGit, FETCH_TIMEOUT_MS, finishTarball, koiFiles, packWorkingTree } from '../src/git.ts';
 import { pullRequestOrigin, shallowCheckout } from './pulls.ts';
 
@@ -300,30 +300,131 @@ describe('mergeCommit', () => {
 
 	test('throws, rather than finding no conflicts, for a commit the repository lacks', async () => {
 		const o = await pullRequestOrigin();
-		// Pull request 8 was never fetched. git merge-tree exits 1 for this
-		// too, as it does for a conflict, but prints no tree.
+		// Pull request 8 was never fetched.
 		await expect(cliGit(o.user).mergeCommit(o.base, o.head8)).rejects.toThrow(
-			`git merge-tree exited 1: merge-tree: ${o.head8} - not something we can merge`,
+			`git merge-base exited 128: fatal: Not a valid commit name ${o.head8}`,
 		);
 	});
 
-	test('says it needs git 2.38 when git merge-tree does not know --write-tree', async () => {
+	test('says it needs git 2.40, and merges nothing, on an older git', async () => {
 		const o = await pullRequestOrigin();
 		await o.userGit('fetch', '-q', 'origin', 'refs/pull/7/head');
-		// The answer of a git before 2.38.
-		const old = (cmd: string[], options?: ExecOptions): Promise<ExecResult> =>
-			cmd.includes('merge-tree')
+		const calls: string[][] = [];
+		// git version as Apple's git of 2024 answers it.
+		const old = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+			calls.push(cmd);
+			return cmd.at(-1) === 'version'
 				? Promise.resolve({
-						code: 129,
-						stdout: '',
-						stderr:
-							"error: unknown option `write-tree'\nusage: git merge-tree <base-tree> <branch1> <branch2>\n",
+						code: 0,
+						stdout: 'git version 2.39.5 (Apple Git-154)\n',
+						stderr: '',
 						timedOut: false,
 					})
 				: exec(cmd, options);
+		};
 		await expect(cliGit(o.user, old).mergeCommit(o.base, o.head7)).rejects.toThrow(
-			/^this git does not know git merge-tree --write-tree, which koi merges with; it needs git 2\.38 or later \(git version /,
+			'koi merges with git merge-tree --write-tree and git --attr-source, which need git 2.40 or later (this is git version 2.39.5 (Apple Git-154))',
 		);
+		expect(calls.some((c) => c.includes('merge-tree') || c.includes('fetch'))).toBe(false);
+	});
+
+	test("neither the checkout's nor the machine's attributes or merge drivers change the merge", async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/8/head');
+		const conflict = { conflicts: ['base.txt'] };
+		const union = 'base.txt merge=union\n';
+		// An untracked .gitattributes in the work tree, which git merge-tree
+		// in the checkout reads.
+		await writeFile(join(o.user, '.gitattributes'), union);
+		expect(await cliGit(o.user).mergeCommit(o.base, o.head8)).toEqual(conflict);
+		await rm(join(o.user, '.gitattributes'));
+		// The checkout's own attributes file.
+		await mkdir(join(o.user, '.git', 'info'), { recursive: true });
+		await writeFile(join(o.user, '.git', 'info', 'attributes'), union);
+		expect(await cliGit(o.user).mergeCommit(o.base, o.head8)).toEqual(conflict);
+		await rm(join(o.user, '.git', 'info', 'attributes'));
+		// A merge driver the user's global config sets up for every path,
+		// which takes the base's side and reports success.
+		const home = await mkdtemp(join(tmpdir(), 'koi-home-'));
+		await writeFile(join(home, 'attributes'), '* merge=keep-base\n');
+		await writeFile(
+			join(home, 'gitconfig'),
+			`[core]\n\tattributesFile = ${join(home, 'attributes')}\n[merge "keep-base"]\n\tdriver = true\n`,
+		);
+		// git as it runs in that user's environment, where koi's own
+		// variables still come last.
+		const machine = (cmd: string[], options?: ExecOptions): Promise<ExecResult> =>
+			exec(cmd, {
+				...options,
+				env: { GIT_CONFIG_GLOBAL: join(home, 'gitconfig'), ...options?.env },
+			});
+		expect(
+			(
+				await execOk(['git', 'config', '--get', 'merge.keep-base.driver'], {
+					env: { GIT_CONFIG_GLOBAL: join(home, 'gitconfig') },
+				})
+			).stdout,
+		).toBe('true\n');
+		expect(await cliGit(o.user, machine).mergeCommit(o.base, o.head8)).toEqual(conflict);
+	});
+
+	test("the checkout's merge.renormalize does not change the merge", async () => {
+		// A file committed with CRLF line ends. The base adds `* text=auto` and
+		// stores the file with LF; the head changes a line and keeps CRLF. git
+		// merges the two cleanly only when it renormalizes them.
+		const dir = await mkdtemp(join(tmpdir(), 'koi-git-'));
+		const git = async (...args: string[]) =>
+			(
+				await execOk([
+					'git',
+					'-C',
+					dir,
+					'-c',
+					'user.email=t@example.com',
+					'-c',
+					'user.name=t',
+					...args,
+				])
+			).stdout.trim();
+		await git('init', '-q', '-b', 'main');
+		await writeFile(join(dir, 'file.txt'), 'a\r\nb\r\nc\r\n');
+		await git('add', 'file.txt');
+		await git('commit', '-q', '-m', 'crlf');
+		await git('checkout', '-q', '-b', 'head');
+		await writeFile(join(dir, 'file.txt'), 'a\r\nB\r\nc\r\n');
+		await git('commit', '-q', '-am', 'head');
+		const head = await git('rev-parse', 'HEAD');
+		await git('checkout', '-q', 'main');
+		await writeFile(join(dir, '.gitattributes'), '* text=auto\n');
+		await writeFile(join(dir, 'file.txt'), 'a\nb\nc\n');
+		await git('add', '.gitattributes', 'file.txt');
+		await git('commit', '-q', '-m', 'base');
+		const base = await git('rev-parse', 'HEAD');
+		const conflict = { conflicts: ['file.txt'] };
+		expect(await cliGit(dir).mergeCommit(base, head)).toEqual(conflict);
+		await git('config', 'merge.renormalize', 'true');
+		expect(await cliGit(dir).mergeCommit(base, head)).toEqual(conflict);
+	});
+
+	test("takes attributes from the base's .gitattributes, not the head's", async () => {
+		const o = await pullRequestOrigin();
+		// main moves on by a commit that merges base.txt as a union.
+		await o.author('checkout', '-q', '--detach', o.base);
+		const unionBase = await o.commit('.gitattributes', 'base.txt merge=union\n', 'union');
+		await o.author('push', '-q', o.origin, `${unionBase}:refs/heads/main`);
+		await o.userGit('fetch', '-q', 'origin', 'main', 'refs/pull/8/head');
+		const made = await cliGit(o.user).mergeCommit(unionBase, o.head8);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		expect(await o.userGit('show', `${made.commit}:base.txt`)).toBe('base moved\nsomething else');
+		// The pull request adds the same rule, and the base it merges into has
+		// none.
+		await o.author('checkout', '-q', '--detach', o.head8);
+		const unionHead = await o.commit('.gitattributes', 'base.txt merge=union\n', 'union too');
+		await o.author('push', '-q', o.origin, `${unionHead}:refs/pull/8/head`);
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/8/head');
+		expect(await cliGit(o.user).mergeCommit(o.base, unionHead)).toEqual({
+			conflicts: ['base.txt'],
+		});
 	});
 });
 

@@ -1,5 +1,6 @@
 import type { Stats } from 'node:fs';
-import { lstat, realpath } from 'node:fs/promises';
+import { copyFile, lstat, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { ExecError, type ExecOptions, type ExecResult, exec, execOk, FULL_OUTPUT } from './exec.ts';
 
@@ -30,8 +31,10 @@ export interface Git {
 	fetchBranch(branch: string): Promise<string>;
 	// Merges a pull request's head into a base commit, as GitHub makes
 	// refs/pull/N/merge, when the two merge cleanly: the commit, made as
-	// localMerge describes, or the files that conflict. Throws when git
-	// cannot merge them at all, as a git older than 2.38 cannot.
+	// localMerge describes, or the files that conflict. The merge reads
+	// nothing of the checkout but its objects (see mergeIsolated). Throws
+	// when git cannot merge them at all: a git older than 2.40, or a head and
+	// base with no commit in common.
 	mergeCommit(base: string, head: string): Promise<{ commit: string } | { conflicts: string[] }>;
 	// An uncompressed tar of a commit's tree.
 	archive(commit: string, out: string): Promise<void>;
@@ -189,52 +192,36 @@ export function cliGit(
 			}
 		},
 		async mergeCommit(base, head) {
-			// Rename handling pinned to git's defaults, so that a user's merge
-			// settings do not change the tree.
-			const mergeTree = await at([
-				'-c',
-				'merge.renames=true',
-				'-c',
-				'merge.directoryRenames=conflict',
-				'merge-tree',
-				'--write-tree',
-				'-z',
-				'--name-only',
-				'--no-messages',
-				base,
-				head,
-			]);
-			const merged = await run(mergeTree, { maxBytes: FULL_OUTPUT, timeoutMs: MERGE_TIMEOUT_MS });
-			if (merged.code === 129 && !merged.timedOut && /write-tree/.test(merged.stderr)) {
+			const version = (await git('version')).trim();
+			const known = /^git version (\d+)\.(\d+)/.exec(version);
+			if (known !== null && Number(known[1]) * 1000 + Number(known[2]) < 2040) {
 				throw new Error(
-					`this git does not know git merge-tree --write-tree, which koi merges with; it needs git 2.38 or later (${(await git('version')).trim()})`,
+					`koi merges with git merge-tree --write-tree and git --attr-source, which need git 2.40 or later (this is ${version})`,
 				);
 			}
-			// With -z and --name-only: the tree, then each conflicted path, each
-			// ended by a NUL. It exits 0 for a clean merge and 1 for one with
-			// conflicts, but also 1, printing no tree, for a commit it cannot
-			// find. Any other answer, as for histories with no commit in common,
-			// means no merge was made.
-			const [tree = '', ...paths] = merged.stdout.split('\0');
-			const conflicted = names(paths.join('\0'));
-			const clean = merged.code === 0 && conflicted.length === 0;
-			const conflicting = merged.code === 1 && conflicted.length > 0;
-			if (merged.timedOut || !/^[0-9a-f]{40}$/.test(tree) || !(clean || conflicting)) {
-				throw new ExecError(mergeTree, merged, MERGE_TIMEOUT_MS);
+			// Where the checkout keeps its objects and its list of shallow
+			// commits, for a linked work tree too, and the hash its objects use.
+			const [objects = '', shallow = ''] = (
+				await git(
+					'rev-parse',
+					'--path-format=absolute',
+					'--git-path',
+					'objects',
+					'--git-path',
+					'shallow',
+				)
+			).split('\n');
+			const format = (await git('rev-parse', '--show-object-format')).trim();
+			const work = await mkdtemp(join(tmpdir(), 'koi-merge-'));
+			try {
+				return await mergeIsolated(
+					{ run, dir: join(work, 'repo'), objects, shallow, format },
+					base,
+					head,
+				);
+			} finally {
+				await rm(work, { recursive: true, force: true });
 			}
-			if (conflicting) return { conflicts: conflicted };
-			const made = localMerge(
-				tree,
-				base,
-				head,
-				(await git('show', '-s', '--format=%ct', base, head))
-					.split('\n')
-					.filter((t) => t !== '')
-					.map(Number),
-			);
-			return {
-				commit: (await ok(await at(made.args), { env: made.env })).stdout.trim(),
-			};
 		},
 		async archive(commit, out) {
 			await ok(await at(['archive', '--format=tar', `--output=${out}`, commit]), {
@@ -293,6 +280,144 @@ export function cliGit(
 // How long git may take to merge a pull request's head into its base.
 const MERGE_TIMEOUT_MS = 10 * 60_000;
 
+// The settings git merges by, pinned, so that nothing set for the user's
+// checkout or machine changes the tree. Each is git's default:
+// renormalizing off, renames found (up to 7,000 files, git's limit for a
+// merge), and a file in a renamed directory left as a conflict.
+// core.attributesFile is empty so that git reads no per-user attributes
+// file, which it otherwise looks for under $XDG_CONFIG_HOME with no config
+// at all.
+const MERGE_SETTINGS = [
+	'core.attributesFile=',
+	'merge.renormalize=false',
+	'merge.renames=true',
+	'diff.renames=true',
+	'merge.renameLimit=7000',
+	'merge.directoryRenames=conflict',
+];
+
+// The environment for a git that reads nothing of the user's: no system or
+// global config file, no config passed down from a git that started koi
+// (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT), no system attributes file, and
+// none of koi's own GIT_* variables, any of which can name another
+// repository, index, work tree or attributes source.
+function isolatedEnv(): Record<string, string | undefined> {
+	const env: Record<string, string | undefined> = {
+		GIT_CONFIG_PARAMETERS: undefined,
+		GIT_CONFIG_COUNT: undefined,
+	};
+	for (const name of Object.keys(process.env)) {
+		if (name.startsWith('GIT_')) env[name] = undefined;
+	}
+	return {
+		...env,
+		GIT_CONFIG_NOSYSTEM: '1',
+		GIT_CONFIG_GLOBAL: '/dev/null',
+		GIT_ATTR_NOSYSTEM: '1',
+	};
+}
+
+// What mergeIsolated needs of the user's checkout.
+interface MergeIn {
+	run: (cmd: string[], options?: ExecOptions) => Promise<ExecResult>;
+	// The temporary repository to make, which must not exist yet.
+	dir: string;
+	// The checkout's object directory, its shallow file, and its object
+	// format (sha1 or sha256).
+	objects: string;
+	shallow: string;
+	format: string;
+}
+
+// koi's merge of a pull request, made in a temporary bare repository that
+// shares only the checkout's objects. The same two parents give the same
+// tree and commit in any checkout, on any machine with git 2.40 or later.
+//
+// The repository has no config but what git init writes, no work tree, no
+// index and no info/attributes, and git runs with isolatedEnv, so none of
+// the user's config, attributes or merge drivers reach the merge. Its
+// GIT_OBJECT_DIRECTORY is the checkout's, so git reads the parents from
+// there and writes the merged tree and the commit there, where git archive
+// and git diff read them afterwards. A shallow checkout's list of shallow
+// commits is copied in, so that git stops its walks where the checkout's
+// history stops.
+//
+// Attributes (which paths merge as union or as binary, and the like) come
+// from the .gitattributes files in the base's tree and nowhere else:
+// --attr-source names that tree, and there is nothing else to read them
+// from. That is what git merge reads when the base is checked out in a
+// fresh clone. No merge driver runs, since none is configured: a path whose
+// attributes name one merges as text, and only git's own union and binary
+// apply.
+//
+// GitHub merges with the same algorithm (ort), but it may read attributes
+// from elsewhere, and LFS or union settings can make its tree differ from
+// koi's. The record says koi made the merge, and what the commit-match rule
+// checks is the commit and its parents, not that GitHub would have made
+// the same tree.
+async function mergeIsolated(
+	m: MergeIn,
+	base: string,
+	head: string,
+): Promise<{ commit: string } | { conflicts: string[] }> {
+	const env = { ...isolatedEnv(), GIT_DIR: m.dir, GIT_OBJECT_DIRECTORY: m.objects };
+	const git = (args: string[], options: ExecOptions = {}) =>
+		m.run(['git', ...MERGE_SETTINGS.flatMap((s) => ['-c', s]), ...args], {
+			...options,
+			env: { ...env, ...options.env },
+		});
+	const gitOk = async (args: string[], options: ExecOptions = {}) => {
+		const r = await git(args, options);
+		if (r.code !== 0 || r.timedOut) throw new ExecError(['git', ...args], r, options.timeoutMs);
+		return r.stdout;
+	};
+	const init = ['git', 'init', '--quiet', '--bare', '--template=', `--object-format=${m.format}`];
+	const made = await m.run([...init, m.dir], { env: isolatedEnv() });
+	if (made.code !== 0) throw new ExecError(init, made);
+
+	if ((await lstatOrMissing(m.shallow)) !== undefined) {
+		await copyFile(m.shallow, join(m.dir, 'shallow'));
+	}
+	// The commit the head left the base at.
+	const found = await git(['merge-base', base, head]);
+	if (found.code === 1 && !found.timedOut) {
+		throw new Error(
+			`the pull request's head ${head} and the base ${base} have no commit in common, so git cannot merge them`,
+		);
+	}
+	if (found.code !== 0 || found.timedOut) throw new ExecError(['git', 'merge-base'], found);
+
+	const mergeTree = [
+		`--attr-source=${base}`,
+		'merge-tree',
+		'--write-tree',
+		'-z',
+		'--name-only',
+		'--no-messages',
+		base,
+		head,
+	];
+	const merged = await git(mergeTree, { maxBytes: FULL_OUTPUT, timeoutMs: MERGE_TIMEOUT_MS });
+	// With -z and --name-only: the tree, then each conflicted path, each
+	// ended by a NUL. It exits 0 for a clean merge and 1 for one with
+	// conflicts, but also 1, printing no tree, for a commit it cannot find.
+	// Any other answer means no merge was made.
+	const [tree = '', ...paths] = merged.stdout.split('\0');
+	const conflicted = names(paths.join('\0'));
+	const clean = merged.code === 0 && conflicted.length === 0;
+	const conflicting = merged.code === 1 && conflicted.length > 0;
+	if (merged.timedOut || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(tree) || !(clean || conflicting)) {
+		throw new ExecError(['git', ...mergeTree], merged, MERGE_TIMEOUT_MS);
+	}
+	if (conflicting) return { conflicts: conflicted };
+	const times = (await gitOk(['show', '-s', '--format=%ct', base, head]))
+		.split('\n')
+		.filter((t) => t !== '')
+		.map(Number);
+	const commit = localMerge(tree, base, head, times);
+	return { commit: (await gitOk(commit.args, { env: commit.env })).trim() };
+}
+
 // Who koi's own merge commits name as author and committer. The address is
 // under .invalid, which no one can hold.
 const KOI_MERGE_IDENT = { name: 'koi', email: 'koi@koi.invalid' };
@@ -303,7 +428,9 @@ const KOI_MERGE_IDENT = { name: 'koi', email: 'koi@koi.invalid' };
 // goes into the commit is fixed by the parents, so anyone with them gets
 // the same commit:
 //
-//   tree       what git merge-tree --write-tree <base> <head> writes
+//   tree       what git merge-tree --write-tree <base> <head> writes in
+//              isolation (see mergeIsolated): git's default settings, and
+//              attributes from the base's .gitattributes only
 //   parents    the base, then the head, as GitHub orders its merge's
 //   message    "Merge <head> into <base>", GitHub's own for its merge
 //   author and committer

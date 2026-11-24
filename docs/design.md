@@ -56,10 +56,22 @@ makes it recompute the merge. So when the merge is out of date koi asks, fetches
 merge again every 15 seconds for up to 90, and checks it each time. When it stays out
 of date (or GitHub says the PR cannot merge, or gh cannot ask), koi fetches the base
 branch and merges the PR's head into its tip itself, with `git merge-tree
---write-tree` (git 2.38 or later), as GitHub would. koi commits that merge with `git
-commit-tree`: parents the base then the head, message `Merge <head> into <base>`,
-author and committer `koi <koi@koi.invalid>` at the later parent's commit time in UTC,
-unsigned. So the commit follows from its two parents, and anyone can make it again.
+--write-tree` (git 2.40 or later), as GitHub would.
+
+koi makes that merge in a temporary bare repository that shares only the checkout's
+objects, with no system or global git config, no work tree, index or
+`info/attributes`, and the merge settings pinned to git's defaults (no renormalizing,
+renames on, a rename limit of 7,000). Attributes come from the `.gitattributes` files in
+the base's tree and nowhere else (`git --attr-source=<base>`), as `git merge` reads them
+with the base checked out in a fresh clone, and no merge driver runs. So the same two
+parents give the same tree on any machine. GitHub merges with the same algorithm, but
+may read attributes from elsewhere, and LFS or union settings can make its tree differ
+from koi's; koi does not promise the same tree as GitHub's.
+
+koi commits that merge with `git commit-tree`: parents the base then the head, message
+`Merge <head> into <base>`, author and committer `koi <koi@koi.invalid>` at the later
+parent's commit time in UTC, unsigned. So the commit follows from its two parents, and
+anyone can make it again.
 koi records it exactly as it records GitHub's merge (the commit, and `merge.head`,
 `merge.base`, `merge.baseBranch`), so deployment and lease checks, which compare those
 fields, hold as they would for GitHub's. The output and the comment add that koi made

@@ -41,8 +41,20 @@ describe('exec', () => {
 		expect(commandName(['git', '-C', '/repo', '-c', 'a=b', 'fetch', '--quiet', 'origin'])).toBe(
 			'git fetch',
 		);
+		expect(
+			commandName(['git', '-C', '/repo', '--attr-source=abc', 'merge-tree', '--write-tree']),
+		).toBe('git merge-tree');
 		expect(commandName(['gh', 'pr', 'view', '7', '--repo', 'acme/hello'])).toBe('gh pr view');
 		expect(commandName(['gh', 'api', '--paginate', 'repos/acme/hello'])).toBe('gh api');
+	});
+
+	test('sets the variables it is given, and removes the ones given as undefined', async () => {
+		expect(process.env.HOME).toBeDefined();
+		const r = await execOk(['env'], { env: { HOME: undefined, KOI_EXEC_TEST: 'set' } });
+		const names = r.stdout.split('\n').map((line) => line.split('=')[0]);
+		expect(names).toContain('KOI_EXEC_TEST');
+		expect(names).not.toContain('HOME');
+		expect(r.stdout).toContain('KOI_EXEC_TEST=set\n');
 	});
 
 	test('reports the end of stderr when a command fails', async () => {

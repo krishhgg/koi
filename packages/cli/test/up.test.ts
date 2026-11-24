@@ -1533,13 +1533,13 @@ describe('up --pr against a real origin', () => {
 	test('stops before uploading when git is too old to merge the pull request itself', async () => {
 		const o = await pullRequestOrigin();
 		const moved = await moveMain(o);
-		// git as one before 2.38 answers git merge-tree --write-tree.
+		// git version as Apple's git of 2024 answers it.
 		const old = (cmd: string[], options?: ExecOptions): Promise<ExecResult> =>
-			cmd.includes('merge-tree')
+			cmd.at(-1) === 'version'
 				? Promise.resolve({
-						code: 129,
-						stdout: '',
-						stderr: "error: unknown option `write-tree'\n",
+						code: 0,
+						stdout: 'git version 2.39.5 (Apple Git-154)\n',
+						stderr: '',
 						timedOut: false,
 					})
 				: asGitHub()(cmd, options);
@@ -1547,7 +1547,7 @@ describe('up --pr against a real origin', () => {
 		const d = deps(cliGit(o.user, old), fb.box, { github: () => github });
 		await expect(up({ pr: 7, comment: false }, d.d)).rejects.toThrow(
 			new RegExp(
-				`^GitHub's merge of pull request 7 into main \\(refs/pull/7/merge on origin\\) is out of date\\. Its base ${short(o.base)} is behind main, now at ${short(moved)}\\. GitHub did not recompute its merge of pull request 7 within 90 seconds, and koi could not merge the pull request itself: this git does not know git merge-tree --write-tree, which koi merges with; it needs git 2\\.38 or later \\(git version [^)]*\\)\\. Try again in a minute, or build the head as pushed with koi up --pr 7 --head\\.$`,
+				`^GitHub's merge of pull request 7 into main \\(refs/pull/7/merge on origin\\) is out of date\\. Its base ${short(o.base)} is behind main, now at ${short(moved)}\\. GitHub did not recompute its merge of pull request 7 within 90 seconds, and koi could not merge the pull request itself: koi merges with git merge-tree --write-tree and git --attr-source, which need git 2\\.40 or later \\(this is git version 2\\.39\\.5 \\(Apple Git-154\\)\\)\\. Try again in a minute, or build the head as pushed with koi up --pr 7 --head\\.$`,
 			),
 		);
 		expect(fb.uploads).toEqual([]);

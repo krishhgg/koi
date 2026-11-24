@@ -18,8 +18,9 @@ export interface ExecOptions {
 	stdin?: string;
 	// The most stdout to accept, in bytes. Default 256 KiB.
 	maxBytes?: number;
-	// Variables to set for the program, on top of koi's own environment.
-	env?: Record<string, string>;
+	// Variables to set for the program, on top of koi's own environment. A
+	// variable given as undefined is removed from the program's environment.
+	env?: Record<string, string | undefined>;
 }
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
@@ -80,17 +81,31 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 	}
 }
 
-function spawn(cmd: string[], stdin: string | undefined, env: Record<string, string> | undefined) {
+function spawn(
+	cmd: string[],
+	stdin: string | undefined,
+	env: Record<string, string | undefined> | undefined,
+) {
 	try {
 		return Bun.spawn(cmd, {
 			stdin: stdin === undefined ? 'ignore' : new TextEncoder().encode(stdin),
 			stdout: 'pipe',
 			stderr: 'pipe',
-			...(env !== undefined ? { env: { ...process.env, ...env } } : {}),
+			...(env !== undefined ? { env: withEnv(env) } : {}),
 		});
 	} catch (err) {
 		throw new SpawnError(cmd[0] ?? '', err);
 	}
+}
+
+// koi's environment with `env` on top, less the variables `env` gives as
+// undefined.
+function withEnv(env: Record<string, string | undefined>): Record<string, string> {
+	const merged: Record<string, string> = {};
+	for (const [name, value] of Object.entries({ ...process.env, ...env })) {
+		if (value !== undefined) merged[name] = value;
+	}
+	return merged;
 }
 
 // Calls onLine for each complete line, and once for a last line with no newline.
@@ -178,8 +193,9 @@ export async function execOk(cmd: string[], options: ExecOptions = {}): Promise<
 	return result;
 }
 
-// The program and its subcommand: git's -C and -c options are skipped, and
-// at most two words that look like subcommands are kept (gh pr view).
+// The program and its subcommand: git's -C and -c options, and its long
+// options before the subcommand, are skipped, and at most two words that
+// look like subcommands are kept (gh pr view).
 export function commandName(cmd: string[]): string {
 	const [program = '', ...rest] = cmd;
 	const words = [program];
@@ -189,6 +205,7 @@ export function commandName(cmd: string[]): string {
 			i++;
 			continue;
 		}
+		if (program === 'git' && words.length === 1 && word.startsWith('--')) continue;
 		if (!/^[a-z][a-z-]*$/.test(word)) break;
 		words.push(word);
 	}
