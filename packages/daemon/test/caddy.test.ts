@@ -112,6 +112,21 @@ describe('renderCaddyfile', () => {
 		);
 	});
 
+	test("puts Caddy's admin API on a unix socket, mode 0660, when given one, and nothing else changes", () => {
+		const routes = [{ label: 'hello', upstream: '172.19.0.2:8080' }];
+		const tls = { kind: 'internal' } as const;
+		const port = renderCaddyfile({ ...base, routes, tls });
+		expect(port).toContain('\tadmin 127.0.0.1:2019\n');
+		expect(renderCaddyfile({ ...base, routes, tls, adminSocket: '/run/caddy/admin.sock' })).toBe(
+			port.replace('\tadmin 127.0.0.1:2019\n', '\tadmin unix//run/caddy/admin.sock|0660\n'),
+		);
+		for (const adminSocket of ['run/caddy.sock', '/a b', '/x}\n:80 {']) {
+			expect(() => renderCaddyfile({ ...base, routes, tls, adminSocket })).toThrow(
+				'bad admin socket',
+			);
+		}
+	});
+
 	test('refuses a DNS provider file that would not be one Caddyfile token', () => {
 		for (const file of ['relative.caddy', '/a b', '/x}\n:80 {', '/{env.X}']) {
 			expect(() =>
@@ -179,6 +194,35 @@ describe('caddyApplier', () => {
 		expect(await readdir(t.dir)).toEqual(['Caddyfile']);
 		await t.caddy.apply([{ label: 'a', upstream: '172.19.0.2:80' }]);
 		expect(t.posts).toHaveLength(4);
+	});
+
+	test('loads through a unix socket for unix//PATH, and names that socket in the config', async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'koid-caddy-'));
+		const file = join(dir, 'Caddyfile');
+		const socket = join(dir, 'admin.sock');
+		const posts: Array<{ path: string; type: string | null; body: string }> = [];
+		const admin = Bun.serve({
+			unix: socket,
+			fetch: async (req) => {
+				posts.push({
+					path: new URL(req.url).pathname,
+					type: req.headers.get('content-type'),
+					body: await req.text(),
+				});
+				return new Response('');
+			},
+		});
+		try {
+			const tls = { kind: 'internal' } as const;
+			await caddyApplier({ ...base, tls, file, adminUrl: `unix/${socket}` }).apply([]);
+			const text = renderCaddyfile({ ...base, routes: [], tls, adminSocket: socket });
+			expect(text).toContain(`\tadmin unix/${socket}|0660\n`);
+			const post = { path: '/load', type: 'text/caddyfile', body: text };
+			expect(posts).toEqual([post, post]);
+			expect(await readFile(file, 'utf8')).toBe(text);
+		} finally {
+			await admin.stop(true);
+		}
 	});
 
 	test('a Caddy that restarts between the load and the save ends up running the new config', async () => {

@@ -37,6 +37,9 @@ DNS_FILE=$CADDY_DIR/dns.caddy
 # the unit cloud-init.sh replaces.
 STOCK_CADDYFILE=/etc/caddy/Caddyfile
 CADDY_UNIT=/etc/systemd/system/caddy.service
+# Caddy's admin API, which cloud-init.sh puts on a socket koid opens as a
+# member of the caddy group, in the form KOI_CADDY_ADMIN and caddy take.
+CADDY_ADMIN=unix//run/caddy/admin.sock
 # Where Caddy keeps its own CA's root (XDG_DATA_HOME=/var/lib in its unit).
 CADDY_ROOT=/var/lib/caddy/pki/authorities/local/root.crt
 KOID_HEALTH=http://127.0.0.1:7777/__koi/health
@@ -238,7 +241,8 @@ check_dns_env() {
 }
 
 # koid's settings: the spool and a file where the AWS box has S3 and SSM,
-# the TLS mode Caddy runs with, and the egress proxy its installer set up.
+# the TLS mode Caddy runs with, Caddy's admin socket, and the egress proxy
+# its installer set up.
 write_env() {
 	local egress_host egress_port
 	egress_host=$(. "$EGRESS_ENV" && printf '%s' "$KOI_EGRESS_HOST")
@@ -248,6 +252,7 @@ write_env() {
 		'KOI_UPLOADS=spool' \
 		'KOI_LIVE=file' \
 		"KOI_TLS=${TLS%%:*}" \
+		"KOI_CADDY_ADMIN=$CADDY_ADMIN" \
 		"KOI_EGRESS_PROXY=http://$egress_host:$egress_port" \
 		'KOI_EGRESS_CA=/etc/koi/egress/ca.pem' >"$KOI_ENV.new"
 	mv -f "$KOI_ENV.new" "$KOI_ENV"
@@ -300,7 +305,8 @@ next_steps() {
 	fi
 	case $TLS in
 	internal)
-		echo "  - Trust Caddy's CA on each machine that visits previews: here, sudo caddy trust;"
+		echo "  - Trust Caddy's CA on each machine that visits previews: here,"
+		echo "    sudo caddy trust --address $CADDY_ADMIN;"
 		echo "    elsewhere, add $CADDY_ROOT from this host to its trust store."
 		;;
 	acme-http)

@@ -259,6 +259,9 @@ describe('host/install-vm.sh, run whole', () => {
 				'KOI_UPLOADS=spool',
 				'KOI_LIVE=file',
 				'KOI_TLS=acme-dns',
+				// koid reaches Caddy's admin API on its socket, not on a port
+				// any account on the host could use.
+				'KOI_CADDY_ADMIN=unix//run/caddy/admin.sock',
 				'KOI_EGRESS_PROXY=http://172.18.0.1:3128',
 				'KOI_EGRESS_CA=/etc/koi/egress/ca.pem',
 				'',
@@ -337,7 +340,8 @@ describe('host/install-vm.sh, run whole', () => {
 		expect(await r.read('etc/koi/env')).toContain('\nKOI_TLS=internal\n');
 		expect(await r.read('etc/koi/caddy/dns.caddy')).toBeUndefined();
 		expect(r.stdout).toContain('127.0.0.1 hello.koi.test');
-		expect(r.stdout).toContain('sudo caddy trust');
+		// caddy trust asks the admin API for the root, on its socket.
+		expect(r.stdout).toContain('sudo caddy trust --address unix//run/caddy/admin.sock;');
 		expect(r.stdout).toContain('alice: log out and in again (or run newgrp koi-control)');
 		expect(r.stdout).toContain('koi up --local');
 	});

@@ -237,7 +237,7 @@ update the host.
 
 | TLS mode | Certificates | What the host needs |
 |---|---|---|
-| `internal` | One wildcard certificate from Caddy's own CA. | Every machine that visits previews trusts the CA's root, `/var/lib/caddy/pki/authorities/local/root.crt`: on the host itself, `sudo caddy trust`. |
+| `internal` | One wildcard certificate from Caddy's own CA. | Every machine that visits previews trusts the CA's root, `/var/lib/caddy/pki/authorities/local/root.crt`: on the host itself, `sudo caddy trust --address unix//run/caddy/admin.sock`. |
 | `acme-http` | A certificate per preview name from Let's Encrypt, which cannot issue a wildcard over HTTP. Caddy gets one at the first visit of a name, once koid confirms the name is a preview's (`/__koi/tls-ask`), so a stranger cannot make the host order certificates for names of their choosing. | A DNS record `*.D` pointing at the host, and ports 80 and 443 open to the internet: Let's Encrypt checks each name over HTTP-01 on 80 or TLS-ALPN-01 on 443. Let's Encrypt allows 50 new certificates a week for a registered domain. |
 | `acme-dns:PROVIDER` | One wildcard certificate from Let's Encrypt over DNS-01, through `github.com/caddy-dns/PROVIDER` (`cloudflare`, `digitalocean`, `hetzner` and so on), which the installer builds Caddy with. | A DNS record `*.D` pointing at the host, port 443 open to visitors, and the provider's API token. The installer writes `/etc/koi/caddy/dns.caddy` with `dns PROVIDER {env.KOI_DNS_API_TOKEN}`, and `/etc/koi/caddy/env` (mode 0600) with an empty `KOI_DNS_API_TOKEN=`. Caddy refuses the config without the token, so the first run stops before it starts koid: put the token in that file, edit the `dns` line for a provider that takes other arguments, and run the installer again. It keeps both files on a run again. To change the token later, edit the file and run `systemctl restart caddy`. |
 
@@ -248,6 +248,15 @@ Caddy's environment alone, so koid never sees it. Both files are in
 `/etc/koi/caddy`, a directory of root's that Caddy may read, so that no other
 account can put a file or a link there. The AWS box sets no `KOI_TLS`
 and keeps its Route 53 block.
+
+Caddy's admin API, through which koid loads each new Caddyfile, is a unix
+socket outside AWS: `/run/caddy/admin.sock`, mode 0660 in the `caddy` group,
+in a directory only root and that group may enter. Provisioning puts koid's
+account, `koi`, in the group, and the installer sets `KOI_CADDY_ADMIN` to the
+socket. On `127.0.0.1:2019`, as on the AWS box, any account on the machine
+could change what Caddy serves, or have it answer with its environment and so
+the provider's token. Commands that talk to the admin API take the socket with
+`--address unix//run/caddy/admin.sock`, as root or as a member of the group.
 
 The installer changes the machine as `host/cloud-init.sh` changes the AWS box
 (see Trust model and limits in the README): it sets Docker's default cgroup
@@ -533,9 +542,10 @@ must name the target's domain before any of the source goes out.
    `KOI_DOMAIN`.
 2. Log out and in again, or start a shell with `newgrp koi-control`, so the
    new group applies.
-3. Trust Caddy's CA: `sudo caddy trust` adds its root to the system's trust
-   store, and to Firefox's and Chrome's when `certutil` (`libnss3-tools`) is
-   installed. For another machine, or a program with a store of its own, the
+3. Trust Caddy's CA: `sudo caddy trust --address unix//run/caddy/admin.sock`
+   adds its root to the system's trust store, and to Firefox's and Chrome's
+   when `certutil` (`libnss3-tools`) is installed. It asks Caddy's admin API
+   for the root, which listens on that socket. For another machine, or a program with a store of its own, the
    root is `/var/lib/caddy/pki/authorities/local/root.crt`.
 4. Names: `/etc/hosts` takes no wildcard, so add a line per preview,
    `127.0.0.1 hello.koi.test`, or let a local resolver answer for the whole

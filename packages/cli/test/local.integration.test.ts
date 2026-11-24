@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -17,11 +17,13 @@ import { toYaml } from '../src/config-command.ts';
 //
 // Caddy runs in a container on the host's network, the only way a test
 // without root can bind 443 there; koid and the previews are on the host's
-// side of it as on a real host. koid's startup check wants the bridges
-// provisioning names (koi-previews0, koi-build0), so the test needs a
-// machine where they are free, and port 443 and Caddy's admin port 2019
-// with it. The firewall rules, the slice and the egress proxy need root and
-// are not set up: the preview has no way out, which hello does not need.
+// side of it as on a real host. It runs as this user, so that its admin API,
+// a unix socket of mode 0660 as on a host outside AWS, is one koid may open,
+// as koid opens it through the caddy group there. koid's startup check wants
+// the bridges provisioning names (koi-previews0, koi-build0), so the test
+// needs a machine where they are free, and port 443 with them. The firewall
+// rules, the slice and the egress proxy need root and are not set up: the
+// preview has no way out, which hello does not need.
 const enabled = process.env.KOI_DOCKER_TESTS === '1';
 const run = randomUUID().replace(/-/g, '').slice(0, 10);
 const network = `koi-it-local-${run}`;
@@ -34,6 +36,7 @@ const repo = resolve(import.meta.dir, '../../..');
 
 let dir = '';
 let socket = '';
+let adminSocket = '';
 let koid: Subprocess<'ignore', 'pipe', 'pipe'> | undefined;
 let koidLog = '';
 
@@ -72,6 +75,17 @@ async function must(cmd: string[], o: Parameters<typeof sh>[1] = {}): Promise<st
 function listening(port: number): Promise<boolean> {
 	return new Promise((done) => {
 		const c = connect({ host: '127.0.0.1', port });
+		c.once('connect', () => {
+			c.destroy();
+			done(true);
+		});
+		c.once('error', () => done(false));
+	});
+}
+
+function connectable(path: string): Promise<boolean> {
+	return new Promise((done) => {
+		const c = connect({ path });
 		c.once('connect', () => {
 			c.destroy();
 			done(true);
@@ -119,13 +133,16 @@ beforeAll(async () => {
 			);
 		}
 	}
-	for (const port of [443, 2019]) {
-		if (await listening(port)) throw new Error(`port ${port} is taken; Caddy needs it here`);
-	}
+	if (await listening(443)) throw new Error('port 443 is taken; Caddy needs it here');
 	dir = await mkdtemp(join(tmpdir(), 'koi-local-it-'));
 	await mkdir(join(dir, 'home'));
 	await mkdir(join(dir, 'run'), { mode: 0o750 });
 	socket = join(dir, 'run', 'control.sock');
+	// As caddy.service's RuntimeDirectory, /run/caddy, and Caddy's own data.
+	await mkdir(join(dir, 'caddy'), { mode: 0o750 });
+	await mkdir(join(dir, 'caddy-data'));
+	await mkdir(join(dir, 'caddy-config'));
+	adminSocket = join(dir, 'caddy', 'admin.sock');
 
 	const confined = ['-o', 'com.docker.network.bridge.enable_icc=false'];
 	await must([
@@ -165,11 +182,11 @@ beforeAll(async () => {
 		'--bootstrap',
 	]);
 
-	// Caddy as provisioning leaves it before koid starts: its admin API on
-	// 127.0.0.1:2019 and nothing served (cloud-init.sh, outside AWS).
+	// Caddy as provisioning leaves it before koid starts: its admin API on a
+	// unix socket and nothing served (cloud-init.sh, outside AWS).
 	await writeFile(
 		join(dir, 'Caddyfile.first'),
-		'{\n\tauto_https disable_redirects\n\tadmin 127.0.0.1:2019\n}\n',
+		`{\n\tauto_https disable_redirects\n\tadmin unix/${adminSocket}|0660\n}\n`,
 	);
 	await must([
 		'docker',
@@ -179,8 +196,14 @@ beforeAll(async () => {
 		caddy,
 		'--network',
 		'host',
+		'--user',
+		`${process.getuid?.() ?? 0}:${process.getgid?.() ?? 0}`,
 		'-v',
-		`${caddy}:/data`,
+		`${join(dir, 'caddy')}:${join(dir, 'caddy')}`,
+		'-v',
+		`${join(dir, 'caddy-data')}:/data`,
+		'-v',
+		`${join(dir, 'caddy-config')}:/config`,
 		'-v',
 		`${join(dir, 'Caddyfile.first')}:/etc/caddy/Caddyfile:ro`,
 		CADDY_IMAGE,
@@ -191,7 +214,7 @@ beforeAll(async () => {
 		'--adapter',
 		'caddyfile',
 	]);
-	await until('Caddy listening on its admin port', () => listening(2019));
+	await until('Caddy listening on its admin socket', () => connectable(adminSocket));
 
 	const httpPort = await freePort();
 	const logPort = await freePort();
@@ -208,7 +231,7 @@ beforeAll(async () => {
 			KOI_STATE_DIR: join(dir, 'state'),
 			KOI_RECIPES_DIR: join(repo, 'recipes'),
 			KOI_CADDYFILE: join(dir, 'Caddyfile'),
-			KOI_CADDY_ADMIN: 'http://127.0.0.1:2019',
+			KOI_CADDY_ADMIN: `unix/${adminSocket}`,
 			KOI_PREVIEW_NETWORK: network,
 			KOI_BUILD_NETWORK: buildNetwork,
 			KOI_BUILDER: builder,
@@ -244,7 +267,6 @@ afterAll(async () => {
 		.filter((id) => id !== '');
 	if (left.length > 0) await sh(['docker', 'rm', '-f', ...left]);
 	await sh(['docker', 'rm', '-f', caddy]);
-	await sh(['docker', 'volume', 'rm', '-f', caddy]);
 	await sh(['docker', 'buildx', 'rm', '--force', builder]);
 	await sh(['docker', 'network', 'rm', network, buildNetwork]);
 	if (dir !== '') await rm(dir, { recursive: true, force: true });
@@ -327,6 +349,11 @@ test.skipIf(!enabled)(
 		expect(cert.stdout).toBe('0');
 		const caddyfile = await readFile(join(dir, 'Caddyfile'), 'utf8');
 		expect(caddyfile).toContain(`*.${DOMAIN} {\n\ttls internal\n`);
+		// koid loaded it through the socket, which stays mode 0660, and Caddy
+		// listens on no admin port.
+		expect(caddyfile).toContain(`\tadmin unix/${adminSocket}|0660\n`);
+		expect((await stat(adminSocket)).mode & 0o777).toBe(0o660);
+		expect(await listening(2019)).toBe(false);
 
 		// The same koid through a target in the config file.
 		await mkdir(join(dir, 'home', '.config', 'koi'), { recursive: true, mode: 0o700 });

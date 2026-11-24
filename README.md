@@ -317,7 +317,7 @@ uv run --with pytest pytest host/verifier      # the verifier's supervisor and r
 ```
 
 The local end-to-end test runs koid from source and Caddy in a container on the
-host's network, so it needs ports 443 and 2019 free and no `koi-previews0` or
+host's network, so it needs port 443 free and no `koi-previews0` or
 `koi-build0` bridge, as on a machine that is not itself a koi host.
 
 After changing the `--json` output schemas in `packages/shared/src/cli-output.ts`, run

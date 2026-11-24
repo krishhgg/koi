@@ -433,9 +433,15 @@ chmod 755 /usr/local/bin/caddy.new
 mv -f /usr/local/bin/caddy.new /usr/local/bin/caddy
 id caddy >/dev/null 2>&1 || useradd --system --home /var/lib/caddy --create-home --shell /usr/sbin/nologin caddy
 install -d -o caddy -g caddy /etc/caddy /var/lib/caddy /var/log/caddy
+# Outside AWS, Caddy's admin API is a unix socket only its group may open
+# (below), and koid reaches it as a member.
+[ "$KOI_TLS" = route53 ] || usermod -aG caddy koi
 
 # koid owns the Caddyfile and rewrites it whenever previews change, then loads
-# it through Caddy's admin API on 127.0.0.1:2019. It lives in its own
+# it through Caddy's admin API: on 127.0.0.1:2019 on the AWS box, which has no
+# account but its own; elsewhere on /run/caddy/admin.sock, mode 0660 in the
+# caddy group, since any account could use the port to change what Caddy
+# serves or have it answer with its environment. It lives in its own
 # directory: koi's home is 0750, which Caddy cannot enter. The directory is
 # koi:caddy with the setgid bit, so files koid writes there are readable by
 # Caddy and by nobody else. This first version, written only when there is
@@ -448,7 +454,7 @@ if [ ! -f /var/lib/koi-caddy/Caddyfile ] && [ "$KOI_TLS" != route53 ]; then
 # Written by provisioning; koid replaces it on start.
 {
 	auto_https disable_redirects
-	admin 127.0.0.1:2019
+	admin unix//run/caddy/admin.sock|0660
 }
 CADDY
 fi
@@ -483,13 +489,16 @@ rm -f /etc/caddy/Caddyfile
 # What Caddy's DNS module reads from its environment: on AWS the region, with
 # credentials from the box's role; elsewhere a provider's token, from a file
 # of root's, in a directory of root's, that host/install-vm.sh makes for the
-# operator to fill.
+# operator to fill. Elsewhere also /run/caddy, for the admin socket, which
+# only root and the caddy group may enter.
 if [ "$KOI_TLS" = route53 ]; then
-	caddy_env="Environment=AWS_REGION=$KOI_REGION"
+	caddy_unit="Environment=AWS_REGION=$KOI_REGION"
 else
-	caddy_env='EnvironmentFile=-/etc/koi/caddy/env'
+	caddy_unit='EnvironmentFile=-/etc/koi/caddy/env
+RuntimeDirectory=caddy
+RuntimeDirectoryMode=0750'
 fi
-# Unquoted, for that line; nothing else in the unit expands.
+# Unquoted, for those lines; nothing else in the unit expands.
 cat > /etc/systemd/system/caddy.service <<UNIT
 [Unit]
 Description=Caddy
@@ -499,7 +508,7 @@ Wants=network-online.target
 [Service]
 User=caddy
 Group=caddy
-$caddy_env
+$caddy_unit
 Environment=XDG_DATA_HOME=/var/lib
 Environment=XDG_CONFIG_HOME=/var/lib
 ExecStart=/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile

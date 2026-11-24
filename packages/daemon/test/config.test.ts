@@ -51,6 +51,16 @@ describe('loadConfig', () => {
 		expect(() => loadConfig({ ...SPOOL, KOI_TLS_DNS_FILE: '/srv/x}\n:80 {' })).toThrow();
 	});
 
+	test("takes Caddy's admin API as an http URL or a unix socket in Caddy's own form", () => {
+		expect(loadConfig({ ...SPOOL, KOI_CADDY_ADMIN: 'unix//run/caddy/admin.sock' }).caddyAdmin).toBe(
+			'unix//run/caddy/admin.sock',
+		);
+		// The path goes into the Caddyfile as one token.
+		for (const admin of ['unix/run/caddy/admin.sock', 'unix//run/a b.sock', 'unix//x}\n:80 {']) {
+			expect(() => loadConfig({ ...SPOOL, KOI_CADDY_ADMIN: admin })).toThrow();
+		}
+	});
+
 	test('reads every setting from the environment, ports as numbers', () => {
 		const config = loadConfig({
 			KOI_DOMAIN: 'example.test',

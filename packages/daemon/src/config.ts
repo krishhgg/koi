@@ -24,7 +24,11 @@ const ConfigSchema = z.object({
 	stateDir: z.string().startsWith('/'),
 	recipesDir: z.string().startsWith('/'),
 	caddyfile: z.string().startsWith('/'),
-	caddyAdmin: z.url(),
+	// Caddy's admin API: an http URL, as on the AWS box, or unix//PATH, Caddy's
+	// own way to write a unix socket, which host/install-vm.sh sets so that no
+	// other account on the host can change Caddy's config (caddy.ts). The path
+	// goes into the Caddyfile as one token.
+	caddyAdmin: z.union([z.url(), z.string().regex(/^unix\/\/[A-Za-z0-9._/-]+$/)]),
 	// How Caddy gets certificates (caddy.ts, CaddyTls): route53 on the AWS
 	// box, which sets nothing; host/install-vm.sh sets another for a host
 	// outside AWS. With acme-dns, the file that holds the provider's `dns`

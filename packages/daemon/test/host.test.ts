@@ -1273,12 +1273,12 @@ describe('host/cloud-init.sh', () => {
 				/cat > \/etc\/systemd\/system\/caddy\.service <<UNIT\n([\s\S]*?)\nUNIT\n/.exec(
 					script,
 				)?.[1] ?? '';
-			expect(caddy).toContain('\n$caddy_env\n');
+			expect(caddy).toContain('\n$caddy_unit\n');
 			expect(script).toContain(
-				'if [ "$KOI_TLS" = route53 ]; then\n\tcaddy_env="Environment=AWS_REGION=$KOI_REGION"\n',
+				'if [ "$KOI_TLS" = route53 ]; then\n\tcaddy_unit="Environment=AWS_REGION=$KOI_REGION"\n',
 			);
 			// The heredoc is unquoted for that line, so nothing else in it may expand.
-			expect(caddy.replace('$caddy_env', '')).not.toMatch(/[$`\\]/);
+			expect(caddy.replace('$caddy_unit', '')).not.toMatch(/[$`\\]/);
 			const box = readFileSync(
 				resolve(import.meta.dir, '../../../infra/modules/koi/box.tf'),
 				'utf8',
@@ -1567,6 +1567,7 @@ describe('host/cloud-init.sh outside AWS, run in bash', () => {
 				// them may reach this machine's.
 				'id() { :; }',
 				'useradd() { :; }',
+				'usermod() { echo "usermod $*" >> "$calls"; }',
 				'install() { :; }',
 				'chmod() { :; }',
 				'chown() { :; }',
@@ -1597,11 +1598,17 @@ describe('host/cloud-init.sh outside AWS, run in bash', () => {
 		expect(r.calls[0]).toBe(
 			`curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64&p=github.com/caddy-dns/route53 -o ${r.dir}/caddy.new`,
 		);
-		expect(await r.read('caddy.service')).toContain('\nEnvironment=AWS_REGION=eu-west-1\n');
+		expect(await r.read('caddy.service')).toContain(
+			'\nGroup=caddy\nEnvironment=AWS_REGION=eu-west-1\nEnvironment=XDG_DATA_HOME=/var/lib\n',
+		);
 		expect(await r.read('caddy.service')).not.toContain('EnvironmentFile');
+		expect(await r.read('caddy.service')).not.toContain('RuntimeDirectory');
 		const first = (await r.read('Caddyfile')) ?? '';
+		expect(first).toContain('\tadmin 127.0.0.1:2019\n');
 		expect(first).toContain('*.previews.example.com {\n\ttls {\n\t\t# Route 53');
 		expect(first).toContain('dns route53 {');
+		// The admin API stays on its port, and koi out of Caddy's group.
+		expect(r.calls.filter((c) => c.startsWith('usermod'))).toEqual([]);
 		expect(await r.read('koi-idle-check')).toContain('\nlimit=600\n');
 		expect(r.calls).toContain(
 			'systemctl enable --now koi-firewall.service caddy.service koi-idle.timer',
@@ -1624,12 +1631,19 @@ describe('host/cloud-init.sh outside AWS, run in bash', () => {
 				`curl -fsSL https://caddyserver.com/api/download?os=linux&arch=amd64${module} -o ${r.dir}/caddy.new`,
 			);
 			const unit = (await r.read('caddy.service')) ?? '';
-			expect(unit).toContain('\nEnvironmentFile=-/etc/koi/caddy/env\n');
-			expect(unit).not.toContain('AWS_REGION');
-			// Caddy serves nothing until koid writes its file with the mode's block.
-			expect(await r.read('Caddyfile')).toBe(
-				'# Written by provisioning; koid replaces it on start.\n{\n\tauto_https disable_redirects\n\tadmin 127.0.0.1:2019\n}\n',
+			// The token file, and /run/caddy for the admin socket, which only
+			// root and the caddy group may enter.
+			expect(unit).toContain(
+				'\nGroup=caddy\nEnvironmentFile=-/etc/koi/caddy/env\nRuntimeDirectory=caddy\nRuntimeDirectoryMode=0750\nEnvironment=XDG_DATA_HOME=/var/lib\n',
 			);
+			expect(unit).not.toContain('AWS_REGION');
+			// Caddy serves nothing until koid writes its file with the mode's
+			// block, and its admin API is the socket, mode 0660, from the start.
+			expect(await r.read('Caddyfile')).toBe(
+				'# Written by provisioning; koid replaces it on start.\n{\n\tauto_https disable_redirects\n\tadmin unix//run/caddy/admin.sock|0660\n}\n',
+			);
+			// koid opens the socket as a member of Caddy's group.
+			expect(r.calls.filter((c) => c.startsWith('usermod'))).toEqual(['usermod -aG caddy koi']);
 		}
 	});
 
