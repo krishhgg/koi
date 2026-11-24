@@ -18,6 +18,8 @@ export interface ExecOptions {
 	stdin?: string;
 	// The most stdout to accept, in bytes. Default 256 KiB.
 	maxBytes?: number;
+	// Variables to set for the program, on top of koi's own environment.
+	env?: Record<string, string>;
 }
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
@@ -52,7 +54,7 @@ export class SpawnError extends Error {
 
 export async function exec(cmd: string[], options: ExecOptions = {}): Promise<ExecResult> {
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
-	const proc = spawn(cmd, options.stdin);
+	const proc = spawn(cmd, options.stdin, options.env);
 	let timedOut = false;
 	let tooLarge = false;
 	const timer =
@@ -78,12 +80,13 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 	}
 }
 
-function spawn(cmd: string[], stdin: string | undefined) {
+function spawn(cmd: string[], stdin: string | undefined, env: Record<string, string> | undefined) {
 	try {
 		return Bun.spawn(cmd, {
 			stdin: stdin === undefined ? 'ignore' : new TextEncoder().encode(stdin),
 			stdout: 'pipe',
 			stderr: 'pipe',
+			...(env !== undefined ? { env: { ...process.env, ...env } } : {}),
 		});
 	} catch (err) {
 		throw new SpawnError(cmd[0] ?? '', err);

@@ -24,6 +24,15 @@ export interface Git {
 	// The branches on origin and the commit each is at now, by name, as
 	// asked of origin without fetching anything.
 	remoteBranchTips(): Promise<Map<string, string>>;
+	// Fetches a branch from origin without touching local branches, and
+	// returns the commit it is at. Throws when the fetch fails, a branch
+	// origin does not have included.
+	fetchBranch(branch: string): Promise<string>;
+	// Merges a pull request's head into a base commit, as GitHub makes
+	// refs/pull/N/merge, when the two merge cleanly: the commit, made as
+	// localMerge describes, or the files that conflict. Throws when git
+	// cannot merge them at all, as a git older than 2.38 cannot.
+	mergeCommit(base: string, head: string): Promise<{ commit: string } | { conflicts: string[] }>;
 	// An uncompressed tar of a commit's tree.
 	archive(commit: string, out: string): Promise<void>;
 	// Files changed on this branch: everything that differs from where it
@@ -161,6 +170,72 @@ export function cliGit(
 			}
 			return tips;
 		},
+		async fetchBranch(branch) {
+			// A name git does not take for a branch could read as a pattern or
+			// a second refspec. gh names real branches; this does not rely on it.
+			const ref = `refs/heads/${branch}`;
+			if ((await run(await at(['check-ref-format', ref]))).code !== 0) {
+				throw new Error(`${JSON.stringify(branch)} is not a branch name git accepts`);
+			}
+			const local = `refs/koi/branch-${randomSuffix()}`;
+			// --refmap= keeps git from also moving the clone's origin/<branch>,
+			// which it does for a branch named on the command line.
+			const args = ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+${ref}:${local}`];
+			try {
+				await ok(await at(args), { timeoutMs: FETCH_TIMEOUT_MS });
+				return (await git('rev-parse', '--verify', `${local}^{commit}`)).trim();
+			} finally {
+				await git('update-ref', '-d', local).catch(() => {});
+			}
+		},
+		async mergeCommit(base, head) {
+			// Rename handling pinned to git's defaults, so that a user's merge
+			// settings do not change the tree.
+			const mergeTree = await at([
+				'-c',
+				'merge.renames=true',
+				'-c',
+				'merge.directoryRenames=conflict',
+				'merge-tree',
+				'--write-tree',
+				'-z',
+				'--name-only',
+				'--no-messages',
+				base,
+				head,
+			]);
+			const merged = await run(mergeTree, { maxBytes: FULL_OUTPUT, timeoutMs: MERGE_TIMEOUT_MS });
+			if (merged.code === 129 && !merged.timedOut && /write-tree/.test(merged.stderr)) {
+				throw new Error(
+					`this git does not know git merge-tree --write-tree, which koi merges with; it needs git 2.38 or later (${(await git('version')).trim()})`,
+				);
+			}
+			// With -z and --name-only: the tree, then each conflicted path, each
+			// ended by a NUL. It exits 0 for a clean merge and 1 for one with
+			// conflicts, but also 1, printing no tree, for a commit it cannot
+			// find. Any other answer, as for histories with no commit in common,
+			// means no merge was made.
+			const [tree = '', ...paths] = merged.stdout.split('\0');
+			const conflicted = names(paths.join('\0'));
+			const clean = merged.code === 0 && conflicted.length === 0;
+			const conflicting = merged.code === 1 && conflicted.length > 0;
+			if (merged.timedOut || !/^[0-9a-f]{40}$/.test(tree) || !(clean || conflicting)) {
+				throw new ExecError(mergeTree, merged, MERGE_TIMEOUT_MS);
+			}
+			if (conflicting) return { conflicts: conflicted };
+			const made = localMerge(
+				tree,
+				base,
+				head,
+				(await git('show', '-s', '--format=%ct', base, head))
+					.split('\n')
+					.filter((t) => t !== '')
+					.map(Number),
+			);
+			return {
+				commit: (await ok(await at(made.args), { env: made.env })).stdout.trim(),
+			};
+		},
 		async archive(commit, out) {
 			await ok(await at(['archive', '--format=tar', `--output=${out}`, commit]), {
 				timeoutMs: 10 * 60_000,
@@ -211,6 +286,62 @@ export function cliGit(
 		async show(commit, path) {
 			const r = await run(await at(['show', `${commit}:${path}`]));
 			return r.code === 0 ? r.stdout : undefined;
+		},
+	};
+}
+
+// How long git may take to merge a pull request's head into its base.
+const MERGE_TIMEOUT_MS = 10 * 60_000;
+
+// Who koi's own merge commits name as author and committer. The address is
+// under .invalid, which no one can hold.
+const KOI_MERGE_IDENT = { name: 'koi', email: 'koi@koi.invalid' };
+
+// The git commit-tree command, and the variables to run it with, that make
+// koi's merge of a pull request from the tree git merge-tree wrote and the
+// two parents' committer times (seconds since the epoch). Everything that
+// goes into the commit is fixed by the parents, so anyone with them gets
+// the same commit:
+//
+//   tree       what git merge-tree --write-tree <base> <head> writes
+//   parents    the base, then the head, as GitHub orders its merge's
+//   message    "Merge <head> into <base>", GitHub's own for its merge
+//   author and committer
+//              koi <koi@koi.invalid>, at the later of the two parents'
+//              committer times, in UTC
+//
+// It is never signed, and its message is UTF-8 with no encoding header,
+// whatever the user's git config says.
+function localMerge(
+	tree: string,
+	base: string,
+	head: string,
+	parentTimes: number[],
+): { args: string[]; env: Record<string, string> } {
+	const latest = Math.max(...parentTimes);
+	if (!Number.isSafeInteger(latest)) throw new Error('git did not give the parents a commit time');
+	const when = `@${latest} +0000`;
+	return {
+		args: [
+			'-c',
+			'i18n.commitEncoding=UTF-8',
+			'commit-tree',
+			'--no-gpg-sign',
+			'-p',
+			base,
+			'-p',
+			head,
+			'-m',
+			`Merge ${head} into ${base}`,
+			tree,
+		],
+		env: {
+			GIT_AUTHOR_NAME: KOI_MERGE_IDENT.name,
+			GIT_AUTHOR_EMAIL: KOI_MERGE_IDENT.email,
+			GIT_AUTHOR_DATE: when,
+			GIT_COMMITTER_NAME: KOI_MERGE_IDENT.name,
+			GIT_COMMITTER_EMAIL: KOI_MERGE_IDENT.email,
+			GIT_COMMITTER_DATE: when,
 		},
 	};
 }

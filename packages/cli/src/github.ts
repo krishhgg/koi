@@ -21,6 +21,12 @@ export interface GitHub {
 	// now (at most 3,000: a list that long may be cut). Throws when gh cannot
 	// list them.
 	pullRequestFiles(pr: number): Promise<string[]>;
+	// Whether GitHub can merge the pull request into its base, as the REST
+	// API's GET of the pull request answers it: true or false, or null while
+	// GitHub works it out. Asking is what makes GitHub recompute its merge
+	// (refs/pull/N/merge) when the base has moved on; fetching the ref does
+	// not. Throws when gh cannot ask.
+	pullRequestMergeable(pr: number): Promise<boolean | null>;
 	// Creates the preview comment, or edits the one already there. Returns its URL.
 	upsertComment(pr: number, marker: string, body: string): Promise<string>;
 }
@@ -102,6 +108,16 @@ export function ghCli(
 				`repos/${ownerRepo}/pulls/${pr}/files`,
 			);
 			return r.stdout.split('\n').filter((f) => f !== '');
+		},
+		async pullRequestMergeable(pr) {
+			const r = await api('--jq', '.mergeable', `repos/${ownerRepo}/pulls/${pr}`);
+			const answer = r.stdout.trim();
+			if (answer === 'true') return true;
+			if (answer === 'false') return false;
+			if (answer === 'null') return null;
+			throw new Error(
+				`gh api repos/${ownerRepo}/pulls/${pr} answered ${JSON.stringify(answer.slice(0, 80))} for mergeable, not true, false or null`,
+			);
 		},
 		async upsertComment(pr, marker, body) {
 			// Only a comment this gh user wrote whose first line is the marker is

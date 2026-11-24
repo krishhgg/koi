@@ -17,7 +17,7 @@ import {
 } from '@koi/shared';
 import { type Box, BoxUnavailableError, type CtlResult, ctlErrorText } from './box.ts';
 import { ExecError } from './exec.ts';
-import { finishTarball, type Git, koiFiles, packWorkingTree } from './git.ts';
+import { finishTarball, type Git, koiFiles, type PullRequestRefs, packWorkingTree } from './git.ts';
 import {
 	commentBody,
 	commentMarker,
@@ -137,6 +137,8 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 	try {
 		let commit: string;
 		let merge: PullRequestMerge | undefined;
+		// Whether koi made the merge itself, GitHub's being out of date.
+		let madeByKoi = false;
 		let branch: string;
 		let dirty: boolean;
 		let read: (path: string) => Promise<string | undefined>;
@@ -158,28 +160,26 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 			if (options.head) {
 				commit = refs.head;
 			} else {
-				// GitHub's merge of the head into the base, which is what merging
-				// the pull request now would give, as long as both parents are
-				// current. GitHub remakes the merge after a push, but may keep it
-				// after the base alone moves on, so the head being current does
-				// not say the base is. Checking the base needs its branch's name,
+				// A merge of the head into the base, which is what merging the
+				// pull request now would give, as long as both parents are
+				// current: GitHub's, or koi's own when GitHub's stays out of date
+				// (see currentMerge). Checking the base needs its branch's name,
 				// which only gh can give.
 				if (refs.merge === undefined) throw new Error(noMerge(options.pr, gh.branches?.base));
 				const baseBranch = gh.branches?.base;
-				if (baseBranch === undefined) {
+				if (baseBranch === undefined || ownerRepo === undefined) {
 					throw new Error(needsGh(options.pr, ownerRepo ?? repo, gh.failed));
 				}
-				const [base, head, ...more] = refs.merge.parents;
-				if (base === undefined || head === undefined || more.length > 0) {
-					throw new Error(
-						`refs/pull/${options.pr}/merge on origin is ${refs.merge.commit}, which is not a merge of two commits`,
-					);
-				}
-				const tips = await git.remoteBranchTips();
-				const behind = mergeBehind({ base, head }, refs.head, options.pr, baseBranch, tips);
-				if (behind.length > 0) throw new Error(staleMerge(options.pr, baseBranch, behind));
-				commit = refs.merge.commit;
-				merge = { head, base, baseBranch };
+				const built = await currentMerge(
+					options.pr,
+					baseBranch,
+					refs,
+					deps.github(ownerRepo),
+					deps,
+				);
+				commit = built.commit;
+				merge = built.merge;
+				madeByKoi = built.madeByKoi;
 			}
 			dirty = false;
 			const at = commit;
@@ -220,7 +220,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 				}
 			}
 			await git.archive(commit, tar);
-			deps.progress(`building ${builtFrom({ commit, pr: options.pr, merge })}`);
+			deps.progress(`building ${builtFrom({ commit, pr: options.pr, merge, madeByKoi })}`);
 		} else {
 			if (options.comment) throw new Error('--comment needs --pr');
 			commit = await git.head();
@@ -306,7 +306,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 				commentBody({
 					label,
 					url,
-					built: builtFrom(result),
+					built: builtFrom({ ...result, madeByKoi }),
 					status: result.status,
 					error: result.error,
 					loginKey: result.loginKey,
@@ -322,19 +322,152 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 
 // What a build was made from, in plain words, for koi up's output and the
 // pull request comment: "#7 (abc1234) merged into develop (def5678), merge
-// commit 9abcdef" for a pull request built as GitHub's merge of it, the head
-// for one built with --head, and the commit alone for a working tree.
+// commit 9abcdef" for a pull request built as a merge of it, the head for
+// one built with --head, and the commit alone for a working tree. A merge
+// koi made itself says so, since GitHub does not have its commit.
 export function builtFrom(p: {
 	commit: string;
 	pr?: number | undefined;
 	merge?: PullRequestMerge | undefined;
+	madeByKoi?: boolean | undefined;
 }): string {
 	const short = (c: string) => c.slice(0, 7);
 	if (p.pr === undefined) return short(p.commit);
 	if (p.merge === undefined) {
 		return `#${p.pr} (${short(p.commit)}), its head as pushed, not merged into its base`;
 	}
-	return `#${p.pr} (${short(p.merge.head)}) merged into ${p.merge.baseBranch ?? 'its base branch'} (${short(p.merge.base)}), merge commit ${short(p.commit)}`;
+	const merged = `#${p.pr} (${short(p.merge.head)}) merged into ${p.merge.baseBranch ?? 'its base branch'} (${short(p.merge.base)}), merge commit ${short(p.commit)}`;
+	return p.madeByKoi === true
+		? `${merged}, which koi made because GitHub's was out of date`
+		: merged;
+}
+
+// How long koi up waits for GitHub to recompute a pull request's merge once
+// it has asked, and how often it fetches the merge again in that time.
+export const MERGE_WAIT_MS = 90_000;
+export const MERGE_POLL_MS = 15_000;
+
+// The merge a merge build builds, its parents, and whether koi made it.
+interface CurrentMerge {
+	commit: string;
+	merge: PullRequestMerge;
+	madeByKoi: boolean;
+}
+
+// A merge of the pull request's head now into its base branch's tip now.
+// GitHub's merge (refs/pull/N/merge) when it is current. GitHub remakes it
+// after a push, but may keep it for a long time after the base alone moves
+// on, and fetching it does not make GitHub remake it. Asking the REST API
+// whether the pull request can merge does. So koi asks, and fetches the
+// merge again every MERGE_POLL_MS for up to MERGE_WAIT_MS, checking it each
+// time as before. If it is still out of date after that, koi merges the head
+// into the base itself (see Git.mergeCommit), when the two merge cleanly,
+// and records that merge just as it would GitHub's. A pull request that
+// conflicts with its base has no merge to build, as on GitHub.
+//
+// Checking the base needs its branch's name, which only gh can give, so
+// the caller has it before calling.
+async function currentMerge(
+	pr: number,
+	baseBranch: string,
+	fetched: PullRequestRefs,
+	github: GitHub,
+	deps: UpDeps,
+): Promise<CurrentMerge> {
+	const { git } = deps;
+	let refs = fetched;
+	// Why GitHub's merge is out of date, as of the last check.
+	let behind: string[] = [];
+	// When koi first asked GitHub to recompute it, and why koi stopped
+	// waiting for GitHub, which is set whenever the loop breaks.
+	let asked: number | undefined;
+	let gaveUp = '';
+	for (;;) {
+		if (refs.head === undefined) throw new Error(noPullRequest(pr));
+		// GitHub may drop its merge while it recomputes, or once it finds a
+		// conflict; koi's own merge says which.
+		if (refs.merge === undefined) {
+			gaveUp = `GitHub dropped its merge of pull request ${pr} (refs/pull/${pr}/merge) while koi waited`;
+			break;
+		}
+		const [base, head, ...more] = refs.merge.parents;
+		if (base === undefined || head === undefined || more.length > 0) {
+			throw new Error(
+				`refs/pull/${pr}/merge on origin is ${refs.merge.commit}, which is not a merge of two commits`,
+			);
+		}
+		behind = mergeBehind({ base, head }, refs.head, pr, baseBranch, await git.remoteBranchTips());
+		if (behind.length === 0) {
+			if (asked !== undefined) deps.progress(`GitHub recomputed its merge of pull request ${pr}`);
+			return { commit: refs.merge.commit, merge: { head, base, baseBranch }, madeByKoi: false };
+		}
+		const now = deps.now().getTime();
+		if (asked === undefined) {
+			asked = now;
+			deps.progress(
+				`GitHub's merge of pull request ${pr} into ${baseBranch} is out of date. ${behind.join(' ')} Asking GitHub to recompute it, and waiting up to ${seconds(MERGE_WAIT_MS)} seconds`,
+			);
+		} else if (now - asked >= MERGE_WAIT_MS) {
+			gaveUp = `GitHub did not recompute its merge of pull request ${pr} within ${seconds(MERGE_WAIT_MS)} seconds`;
+			break;
+		}
+		const mergeable = await askMergeable(github, pr);
+		if (mergeable instanceof Error) {
+			gaveUp = `koi could not ask GitHub to recompute its merge of pull request ${pr} (${mergeable.message})`;
+			break;
+		}
+		if (mergeable === false) {
+			gaveUp = `GitHub says pull request ${pr} cannot be merged into ${baseBranch}`;
+			break;
+		}
+		await deps.sleep(MERGE_POLL_MS);
+		refs = await git.fetchPullRequest(pr);
+	}
+
+	const short = (c: string) => c.slice(0, 7);
+	const head = refs.head;
+	deps.progress(`${gaveUp}; koi merges its head ${short(head)} into ${baseBranch} itself`);
+	const base = await git.fetchBranch(baseBranch);
+	let made: Awaited<ReturnType<Git['mergeCommit']>>;
+	try {
+		made = await git.mergeCommit(base, head);
+	} catch (err) {
+		const why = err instanceof Error ? err.message : String(err);
+		throw new Error(
+			`GitHub's merge of pull request ${pr} into ${baseBranch} (refs/pull/${pr}/merge on origin) is out of date. ${behind.join(' ')} ${gaveUp}, and koi could not merge the pull request itself: ${why}. Try again in a minute, or build the head as pushed with koi up --pr ${pr} --head.`,
+		);
+	}
+	if ('conflicts' in made) {
+		throw new Error(conflicts(pr, baseBranch, { head, base }, made.conflicts));
+	}
+	deps.progress(
+		`koi merged pull request ${pr} (${short(head)}) into ${baseBranch} (${short(base)}) itself, merge commit ${short(made.commit)}, since GitHub's merge is out of date`,
+	);
+	return { commit: made.commit, merge: { head, base, baseBranch }, madeByKoi: true };
+}
+
+// What GitHub answers when asked whether the pull request can merge, or
+// why it could not be asked.
+async function askMergeable(github: GitHub, pr: number): Promise<boolean | null | Error> {
+	try {
+		return await github.pullRequestMergeable(pr);
+	} catch (err) {
+		return err instanceof Error ? err : new Error(String(err));
+	}
+}
+
+// Why a merge build stops when the pull request's head conflicts with its
+// base branch's tip: there is no merge to build, as GitHub would have none.
+function conflicts(
+	pr: number,
+	baseBranch: string,
+	at: { head: string; base: string },
+	files: string[],
+): string {
+	const short = (c: string) => c.slice(0, 7);
+	const named = files.slice(0, 10).join(', ');
+	const more = files.length > 10 ? ` and ${files.length - 10} more` : '';
+	return `pull request ${pr} (${short(at.head)}) conflicts with ${baseBranch} (${short(at.base)}) in ${named}${more}, so there is no merge of it to build, and GitHub's merge (refs/pull/${pr}/merge on origin) is of an earlier head or base. Rebase onto ${baseBranch} or merge it in and push. To build the head as pushed instead, without ${baseBranch}'s later changes, run koi up --pr ${pr} --head.`;
 }
 
 // Why koi up --pr stops when the fetch found no head: a pull request that
@@ -382,13 +515,6 @@ function mergeBehind(
 		behind.push(`Its base ${short(merge.base)} is behind ${baseBranch}, now at ${short(tip)}.`);
 	}
 	return behind;
-}
-
-// Why koi up --pr stops when GitHub's merge lags the pull request or its
-// base: building it would preview code the author or the base branch has
-// since replaced.
-function staleMerge(pr: number, base: string, behind: string[]): string {
-	return `GitHub's merge of pull request ${pr} into ${base} (refs/pull/${pr}/merge on origin) is out of date. ${behind.join(' ')} GitHub has not recomputed the merge yet. Try again in a minute, or build the head as pushed with koi up --pr ${pr} --head.`;
 }
 
 // Why a merge build stops when gh could not name the pull request's base

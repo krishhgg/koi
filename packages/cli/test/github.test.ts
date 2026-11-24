@@ -216,6 +216,44 @@ describe('pullRequestBranches', () => {
 	});
 });
 
+describe('pullRequestMergeable', () => {
+	// gh api printing `stdout` and exiting with `code`.
+	function api(code: number, stdout: string) {
+		const calls: string[][] = [];
+		const run = async (cmd: string[]): Promise<ExecResult> => {
+			calls.push(cmd);
+			return {
+				code,
+				stdout,
+				stderr: code === 0 ? '' : 'gh: Not Found (HTTP 404)',
+				timedOut: false,
+			};
+		};
+		return { run, calls };
+	}
+
+	test("asks the REST API for the pull request, which is what makes GitHub recompute its merge, and gives GitHub's answer", async () => {
+		for (const [printed, answer] of [
+			['true\n', true],
+			['false\n', false],
+			['null\n', null],
+		] as const) {
+			const f = api(0, printed);
+			expect(await ghCli('acme/hello', f.run).pullRequestMergeable(7)).toBe(answer);
+			expect(f.calls).toEqual([['gh', 'api', '--jq', '.mergeable', 'repos/acme/hello/pulls/7']]);
+		}
+	});
+
+	test('throws when gh fails, or answers something else', async () => {
+		await expect(ghCli('acme/hello', api(1, '').run).pullRequestMergeable(7)).rejects.toThrow(
+			'gh api exited 1: gh: Not Found (HTTP 404)',
+		);
+		await expect(ghCli('acme/hello', api(0, 'yes\n').run).pullRequestMergeable(7)).rejects.toThrow(
+			'gh api repos/acme/hello/pulls/7 answered "yes" for mergeable, not true, false or null',
+		);
+	});
+});
+
 describe('without gh installed', () => {
 	// The real exec, on a machine where gh is not there.
 	const noGh = (cmd: string[], options?: ExecOptions) =>

@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { exec } from '../src/exec.ts';
+import { type ExecOptions, type ExecResult, exec } from '../src/exec.ts';
 import { cliGit, FETCH_TIMEOUT_MS, finishTarball, koiFiles, packWorkingTree } from '../src/git.ts';
 import { pullRequestOrigin, shallowCheckout } from './pulls.ts';
 
@@ -246,6 +246,84 @@ describe('mergeFiles', () => {
 		// Tidied: no ref of koi's left behind.
 		const refs = await exec(['git', '-C', shallow, 'for-each-ref', 'refs/koi/']);
 		expect(refs.stdout).toBe('');
+	});
+});
+
+describe('fetchBranch', () => {
+	test('fetches the commit a branch on origin is at, leaving no ref behind', async () => {
+		const o = await pullRequestOrigin();
+		await o.author('checkout', '-q', '--detach', o.base);
+		await o.author('commit', '-q', '--allow-empty', '-m', 'main moved on');
+		const moved = await o.author('rev-parse', 'HEAD');
+		await o.author('push', '-q', o.origin, `${moved}:refs/heads/main`);
+		expect(await cliGit(o.user).fetchBranch('main')).toBe(moved);
+		expect((await exec(['git', '-C', o.user, 'cat-file', '-e', moved])).code).toBe(0);
+		expect((await exec(['git', '-C', o.user, 'for-each-ref', 'refs/koi/'])).stdout).toBe('');
+		// The clone's own view of origin is left as it was.
+		expect(await o.userGit('rev-parse', 'refs/remotes/origin/main')).toBe(o.base);
+	});
+
+	test('refuses a name git does not take for a branch, and fails for one origin lacks', async () => {
+		const o = await pullRequestOrigin();
+		await expect(cliGit(o.user).fetchBranch('main:refs/heads/x')).rejects.toThrow(
+			'"main:refs/heads/x" is not a branch name git accepts',
+		);
+		await expect(cliGit(o.user).fetchBranch('ma*')).rejects.toThrow(
+			'"ma*" is not a branch name git accepts',
+		);
+		await expect(cliGit(o.user).fetchBranch('develop')).rejects.toThrow(/^git fetch exited 128/);
+	});
+});
+
+describe('mergeCommit', () => {
+	test('merges cleanly into a commit with the base, then the head, as parents', async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/7/head');
+		const made = await cliGit(o.user).mergeCommit(o.base, o.head7);
+		if (!('commit' in made)) throw new Error(`conflicts in ${made.conflicts}`);
+		const object = await o.userGit('cat-file', '-p', made.commit);
+		expect(object.split('\n').filter((l) => l.startsWith('parent '))).toEqual([
+			`parent ${o.base}`,
+			`parent ${o.head7}`,
+		]);
+		// The same tree as the merge in the fixture, which git merge made.
+		expect(await o.userGit('rev-parse', `${made.commit}^{tree}`)).toBe(
+			await o.author('rev-parse', `${o.merge7}^{tree}`),
+		);
+	});
+
+	test('lists the conflicting files of a merge that does not go cleanly', async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/8/head');
+		expect(await cliGit(o.user).mergeCommit(o.base, o.head8)).toEqual({ conflicts: ['base.txt'] });
+	});
+
+	test('throws, rather than finding no conflicts, for a commit the repository lacks', async () => {
+		const o = await pullRequestOrigin();
+		// Pull request 8 was never fetched. git merge-tree exits 1 for this
+		// too, as it does for a conflict, but prints no tree.
+		await expect(cliGit(o.user).mergeCommit(o.base, o.head8)).rejects.toThrow(
+			`git merge-tree exited 1: merge-tree: ${o.head8} - not something we can merge`,
+		);
+	});
+
+	test('says it needs git 2.38 when git merge-tree does not know --write-tree', async () => {
+		const o = await pullRequestOrigin();
+		await o.userGit('fetch', '-q', 'origin', 'refs/pull/7/head');
+		// The answer of a git before 2.38.
+		const old = (cmd: string[], options?: ExecOptions): Promise<ExecResult> =>
+			cmd.includes('merge-tree')
+				? Promise.resolve({
+						code: 129,
+						stdout: '',
+						stderr:
+							"error: unknown option `write-tree'\nusage: git merge-tree <base-tree> <branch1> <branch2>\n",
+						timedOut: false,
+					})
+				: exec(cmd, options);
+		await expect(cliGit(o.user, old).mergeCommit(o.base, o.head7)).rejects.toThrow(
+			/^this git does not know git merge-tree --write-tree, which koi merges with; it needs git 2\.38 or later \(git version /,
+		);
 	});
 });
 

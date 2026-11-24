@@ -46,11 +46,27 @@ names the preview `storefront-pr-2518`. The output and the PR comment say what w
 built, "Built from #2518 (abc1234) merged into develop (def5678)", and the preview
 record keeps the merge commit and both its parents. koi checks that the merge is
 current before uploading: its head must be the PR's head now, and its base the base
-branch's tip now (asked of origin with `git ls-remote`), since GitHub may keep an old
-merge after the base alone moves on. The base branch's name comes from gh, so a merge
-build needs gh signed in and stops without it. A PR that conflicts with its base has
-no merge ref. In either case koi stops before uploading and says to rebase or merge the
-base, or to try again in a minute if GitHub has not computed the merge yet. `--head`
+branch's tip now (asked of origin with `git ls-remote`). The base branch's name comes
+from gh, so a merge build needs gh signed in and stops without it.
+
+GitHub may keep an old merge after the base alone moves on, through any number of
+fetches of the ref: only a request for the PR's mergeability (`GET
+/repos/{owner}/{repo}/pulls/{n}`, whose `mergeable` is null while GitHub works it out)
+makes it recompute the merge. So when the merge is out of date koi asks, fetches the
+merge again every 15 seconds for up to 90, and checks it each time. When it stays out
+of date (or GitHub says the PR cannot merge, or gh cannot ask), koi fetches the base
+branch and merges the PR's head into its tip itself, with `git merge-tree
+--write-tree` (git 2.38 or later), as GitHub would. koi commits that merge with `git
+commit-tree`: parents the base then the head, message `Merge <head> into <base>`,
+author and committer `koi <koi@koi.invalid>` at the later parent's commit time in UTC,
+unsigned. So the commit follows from its two parents, and anyone can make it again.
+koi records it exactly as it records GitHub's merge (the commit, and `merge.head`,
+`merge.base`, `merge.baseBranch`), so deployment and lease checks, which compare those
+fields, hold as they would for GitHub's. The output and the comment add that koi made
+the merge, since GitHub does not have its commit. A PR whose head conflicts with its
+base's tip has no merge, from GitHub or koi, and koi stops before uploading, names the
+conflicting files and says to rebase or merge the base. A PR with no merge ref at all
+stops the same way, as one GitHub found to conflict or has not checked yet. `--head`
 builds the head as pushed and needs no gh. Both work from a shallow checkout such as
 actions/checkout makes. The list of changed files a recipe may read comes from the PR's
 own changes either way, not from everything the merge holds. `--comment` posts or

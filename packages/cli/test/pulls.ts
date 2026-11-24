@@ -14,7 +14,10 @@ import { type ExecOptions, type ExecResult, exec, execOk } from '../src/exec.ts'
 //   #90       refs/pull/90/head only, so that a fetch of #9 must not take it
 //
 // The clone has main only. Fetching a pull request brings its commits over
-// the file:// transport, as from a real remote.
+// the file:// transport, as from a real remote. `author` runs git in the
+// repository the fixture was made in (`authorDir`), and `commit` commits a
+// file there on whatever is checked out, as GitHub's side of a test moves
+// a branch or remakes a merge.
 export async function pullRequestOrigin() {
 	const author = await mkdtemp(join(tmpdir(), 'koi-author-'));
 	const git = async (...args: string[]) =>
@@ -78,7 +81,20 @@ export async function pullRequestOrigin() {
 				...args,
 			])
 		).stdout.trim();
-	return { author: git, origin, user, userGit, init, base, head7, merge7, head8, head90 };
+	return {
+		author: git,
+		authorDir: author,
+		commit,
+		origin,
+		user,
+		userGit,
+		init,
+		base,
+		head7,
+		merge7,
+		head8,
+		head90,
+	};
 }
 
 // A checkout of one ref of `origin` as actions/checkout makes one by default:
