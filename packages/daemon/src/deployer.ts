@@ -327,7 +327,7 @@ export class Deployer {
 	private readonly builds = new Semaphore(1);
 	private readonly lifecycle = new KeyedLock();
 	private readonly admitting = new Mutex();
-	private readonly starting = new Map<string, Promise<void>>();
+	private readonly starting = new Map<string, { task: Promise<void>; skipFailed: boolean }>();
 	private readonly routing = new Mutex();
 	private nextSync: Promise<void> | undefined;
 	private readonly publishing = new Mutex();
@@ -1001,11 +1001,21 @@ export class Deployer {
 	// that failed just before still leaves it for the next visit.
 	ensureRunning(label: string, skipFailed = false): Promise<void> {
 		const inFlight = this.starting.get(label);
-		if (inFlight !== undefined) return inFlight;
+		if (inFlight !== undefined) {
+			// A visit that finds restore's start in progress waits for it, then
+			// starts the preview itself: restore's start may have left it
+			// stopped after a failed start, which a visit tries again. When
+			// restore did start it, the visit's start finds it running.
+			if (inFlight.skipFailed && !skipFailed) {
+				const retry = () => this.ensureRunning(label);
+				return inFlight.task.then(retry, retry);
+			}
+			return inFlight.task;
+		}
 		const task = this.lifecycle
 			.run(label, () => this.start(label, skipFailed))
 			.finally(() => this.starting.delete(label));
-		this.starting.set(label, task);
+		this.starting.set(label, { task, skipFailed });
 		return task;
 	}
 

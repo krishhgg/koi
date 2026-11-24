@@ -2539,6 +2539,24 @@ describe('restore', () => {
 		expect(await t.deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
 	});
 
+	test("a visit that joins restore's start still retries a preview whose last start failed", async () => {
+		const t = await setup();
+		await t.up(request());
+		const container = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		t.docker.stopAll();
+		await t.deployer.sync();
+		t.setHealthy(() => false);
+		await t.deployer.ensureRunning('hello-pr-7');
+		t.setHealthy(undefined);
+		const starts = t.docker.starts.length;
+		// restore's start is in progress when the visit asks.
+		const restoring = t.deployer.ensureRunning('hello-pr-7', true);
+		const visit = t.deployer.ensureRunning('hello-pr-7');
+		await Promise.all([restoring, visit]);
+		expect(t.docker.starts.slice(starts)).toEqual([container]);
+		expect(await t.deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
+	});
+
 	test('a Docker error reading the containers before a start is a failed start, not a routing one', async () => {
 		const t = await setup();
 		await t.up(request());
