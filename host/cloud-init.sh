@@ -153,13 +153,13 @@ restart_docker_if_pending
 # often while a build runs, and needrestart then restarts every service that
 # loaded an upgraded library: koid, Docker and containerd among them, which
 # kills the build in flight ("the daemon restarted before this build
-# finished"). These services keep running on the old libraries instead. The
-# box stops when idle, and its next start loads the new ones.
+# finished"). needrestart now leaves these services running on the old
+# libraries. The box stops when idle, and its next start loads the new ones.
 install -d -m 0755 /etc/needrestart/conf.d
 cat > /etc/needrestart/conf.d/50-koi.conf <<'CONF'
-# Written by koi's host/cloud-init.sh: an unattended upgrade never restarts
-# the services builds and previews run on. The next start of the box loads
-# the upgraded libraries.
+# Written by koi's host/cloud-init.sh: needrestart skips its automatic
+# restart of the services builds and previews run on. The next start of the
+# box loads the upgraded libraries.
 $nrconf{override_rc}{qr(^(koid|koi-egress|koi-firewall|caddy|docker|containerd)\.service$)} = 0;
 CONF
 
