@@ -222,11 +222,11 @@ export function localTransport(
 					}
 					const size = (await stat(tarball)).size;
 					const sha256 = await digestFile(tarball, abortSignal);
+					await checkPath();
 					abortSignal?.throwIfAborted();
 					if (now() >= deadline) {
 						throw new InterruptedError('the deadline passed before the upload started');
 					}
-					await checkPath();
 					const relay = await socketRelay(target.socket, abortSignal);
 					try {
 						await uploadSequence(
@@ -458,6 +458,11 @@ async function socketRelay(
 		conn.once('connect', resolve);
 		conn.once('error', reject);
 	});
+	// A signal that fired while connecting, before the listener below.
+	if (signal?.aborted) {
+		conn.destroy();
+		signal.throwIfAborted();
+	}
 	let done = false;
 	const readable = new ReadableStream<Uint8Array>({
 		start(c) {

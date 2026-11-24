@@ -345,18 +345,27 @@ describe('localTransport upload', () => {
 		await t.upload(request(), src.path);
 	});
 
-	test('checks the path again before each upload, not only when the transport starts', async () => {
-		const k = await koid();
-		const src = await tarball(await scratch());
-		const t = transport(k.socket);
-		await t.upload(request(), src.path);
-		// A directory on the way that anyone may now write to, as one made
-		// again by another account after it was removed would be.
-		await chmod(k.home, 0o777);
-		const err = await t.upload(request(), src.path).catch((e: unknown) => e);
-		expect(String(err)).toContain(
-			`koi does not trust the control socket of target dev: ${k.home} is writable by any account`,
+	test('checks the path again right before the upload connects, after koid answered', async () => {
+		const dir = await scratch();
+		// The directory turns open to every account while koid answers the
+		// describe that ensureAwake asks after its own check of the path.
+		const k = await koid(
+			{
+				describe: async () => {
+					await chmod(dir, 0o777);
+					return hostInfoFor(DOMAIN);
+				},
+			},
+			dir,
 		);
+		const src = await tarball(await scratch());
+		const err = await transport(k.socket)
+			.upload(request(), src.path)
+			.catch((e: unknown) => e);
+		expect(String(err)).toContain(
+			`koi does not trust the control socket of target dev: ${dir} is writable by any account`,
+		);
+		expect(await readdir(join(k.spool, 'ready'))).toEqual([]);
 	});
 
 	test('a host that serves another domain gets none of the source', async () => {
