@@ -3,6 +3,12 @@
 #
 #   AWS_PROFILE=<admin> scripts/deploy-host.sh
 #
+# The deployment comes from KOI_INSTANCE_ID, KOI_BUCKET, KOI_PREVIEWS_PARAM and
+# KOI_DOMAIN where they are set, and from `tofu output` of infra/ (the personal
+# root) where they are not; a deployment made by another root sets all four
+# from that root's module outputs. AWS_PROFILE picks the credentials and
+# AWS_REGION the region, else the profile's region, else us-east-1.
+#
 # Builds koid and the SSH gateway, uploads them with a recipes tarball, the
 # egress proxy bundle, the verification helper bundle and the SSH bundle to the
 # uploads bucket under host/, and runs an SSM command that downloads them through
@@ -13,18 +19,20 @@
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)
-region=${AWS_REGION:-us-east-1}
-out() { tofu -chdir="$repo/infra" output -raw "$1"; }
-instance=$(out box_instance_id)
-bucket=$(out uploads_bucket)
-param=$(out previews_parameter)
-domain=$(out domain)
-# The domain goes into a shell heredoc on the box, so check it is a bare
-# hostname here too, not only where Terraform validated it.
-if ! [[ $domain =~ ^[a-z0-9.-]+$ ]]; then
-	echo "the domain output '$domain' is not a bare hostname; check var.domain in infra/koi.auto.tfvars" >&2
-	exit 1
-fi
+. "$repo/scripts/host-settings.sh"
+region=$(koi_region)
+instance=$(koi_setting KOI_INSTANCE_ID box_instance_id)
+bucket=$(koi_setting KOI_BUCKET uploads_bucket)
+param=$(koi_setting KOI_PREVIEWS_PARAM previews_parameter)
+domain=$(koi_setting KOI_DOMAIN domain)
+# Each value goes into a shell heredoc on the box, so check its shape here,
+# not only where the module validated it: a value from the environment never
+# went through the module.
+koi_check "$region" '^[a-z]{2}(-[a-z]+)+-[0-9]+$' 'The region from AWS_REGION or the profile' 'an AWS region name'
+koi_check "$instance" '^i-[0-9a-f]{8,17}$' 'KOI_INSTANCE_ID or the box_instance_id output' 'an EC2 instance id'
+koi_check "$bucket" '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' 'KOI_BUCKET or the uploads_bucket output' 'an S3 bucket name'
+koi_check "$param" '^/[A-Za-z0-9_./-]+$' 'KOI_PREVIEWS_PARAM or the previews_parameter output' 'an SSM parameter name starting with /'
+koi_check "$domain" '^[a-z0-9.-]+$' 'KOI_DOMAIN or the domain output' 'a bare hostname'
 version=$(date -u +%Y%m%dT%H%M%SZ)-$(git -C "$repo" rev-parse --short HEAD)
 
 work=$(mktemp -d)
@@ -74,7 +82,7 @@ done
 [ "$online" = "Online" ] || { echo "the box's SSM agent never came online" >&2; exit 1; }
 
 # Everything interpolated below is either a hex digest, a presigned URL
-# (URL-safe characters only, single-quoted) or a value from tofu outputs.
+# (URL-safe characters only, single-quoted) or a value checked above.
 script=$(cat <<SCRIPT
 set -euo pipefail
 cd /tmp

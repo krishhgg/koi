@@ -1267,6 +1267,27 @@ describe('host/cloud-init.sh', () => {
 			expect(variables).toContain('with its host bits clear: 10.213.0.0/20, not 10.213.0.1/20');
 		});
 
+		test("gives Caddy the deployment's region, which infra and provisioning pass like the domain", () => {
+			expect(script).toMatch(/^KOI_REGION=\$\{KOI_REGION:-us-east-1\}$/m);
+			const caddy =
+				/cat > \/etc\/systemd\/system\/caddy\.service <<UNIT\n([\s\S]*?)\nUNIT\n/.exec(
+					script,
+				)?.[1] ?? '';
+			expect(caddy).toContain('Environment=AWS_REGION=$KOI_REGION\n');
+			// The heredoc is unquoted for the region, so nothing else in it may expand.
+			expect(caddy.replace('$KOI_REGION', '')).not.toMatch(/[$`\\]/);
+			const box = readFileSync(
+				resolve(import.meta.dir, '../../../infra/modules/koi/box.tf'),
+				'utf8',
+			);
+			expect(box).toContain(['"KOI_REGION=$', '{local.region}",'].join(''));
+			const provision = readFileSync(
+				resolve(import.meta.dir, '../../../scripts/provision-host.sh'),
+				'utf8',
+			);
+			expect(provision).toContain('KOI_REGION=%s');
+		});
+
 		test('loads br_netfilter and keeps the bridge sysctls on across boots', () => {
 			expect(script).toContain("printf 'br_netfilter\\n' > /etc/modules-load.d/koi-verify.conf");
 			expect(script).toContain('net.bridge.bridge-nf-call-iptables = 1');
@@ -1331,6 +1352,132 @@ describe('host/cloud-init.sh', () => {
 			expect(install).toContain(`TARGET=${helper}`);
 			expect(install).toContain('install -o root -g root -m 0755');
 		});
+	});
+});
+
+// scripts/host-settings.sh as deploy-host.sh and provision-host.sh source it,
+// with tofu and aws replaced by scripts that log their calls. The fake tofu
+// has two of the personal root's outputs; the fake aws knows a profile region
+// only when PROFILE_REGION is set.
+describe('scripts/host-settings.sh, run in bash', () => {
+	const repo = resolve(import.meta.dir, '../../..');
+
+	async function run(body: string, env: Record<string, string> = {}) {
+		const dir = await mkdtemp(join(tmpdir(), 'koi-host-settings-'));
+		const calls = join(dir, 'calls');
+		await writeFile(calls, '');
+		await writeFile(
+			join(dir, 'tofu'),
+			[
+				'#!/bin/bash',
+				`echo "tofu $*" >> '${calls}'`,
+				'case "$4" in',
+				'box_instance_id) printf i-0123456789abcdef0 ;;',
+				'domain) printf previews.example.com ;;',
+				'*) echo "Output $4 not found" >&2; exit 1 ;;',
+				'esac',
+			].join('\n'),
+			{ mode: 0o755 },
+		);
+		await writeFile(
+			join(dir, 'aws'),
+			[
+				'#!/bin/bash',
+				`echo "aws $*" >> '${calls}'`,
+				`[ -n "\${PROFILE_REGION:-}" ] && printf '%s\\n' "$PROFILE_REGION"`,
+				'exit 0',
+			].join('\n'),
+			{ mode: 0o755 },
+		);
+		const file = join(dir, 'run.sh');
+		await writeFile(
+			file,
+			['set -euo pipefail', `repo='${repo}'`, '. "$repo/scripts/host-settings.sh"', body].join(
+				'\n',
+			),
+		);
+		const vars = Object.entries(env).map(([k, v]) => `${k}=${v}`);
+		const r = await exec(['env', '-i', `PATH=${dir}:/usr/bin:/bin`, ...vars, 'bash', file], {
+			timeoutMs: 30_000,
+		});
+		const lines = (await readFile(calls, 'utf8')).split('\n').filter((l) => l !== '');
+		return { code: r.code, stdout: r.stdout, stderr: r.stderr, calls: lines };
+	}
+
+	test('takes each value from its variable and runs no tofu when it is set', async () => {
+		const r = await run(
+			'koi_setting KOI_INSTANCE_ID box_instance_id\nkoi_setting KOI_DOMAIN domain',
+			{
+				KOI_INSTANCE_ID: 'i-0fedcba9876543210',
+				KOI_DOMAIN: 'previews.example.org',
+			},
+		);
+		expect(r.code).toBe(0);
+		expect(r.stdout).toBe('i-0fedcba9876543210\npreviews.example.org\n');
+		expect(r.calls).toEqual([]);
+	});
+
+	test('reads an unset value from the tofu output of infra/', async () => {
+		const r = await run(
+			'instance=$(koi_setting KOI_INSTANCE_ID box_instance_id)\necho "$instance"',
+		);
+		expect(r.code).toBe(0);
+		expect(r.stdout).toBe('i-0123456789abcdef0\n');
+		expect(r.calls).toEqual([`tofu -chdir=${repo}/infra output -raw box_instance_id`]);
+	});
+
+	test('stops on an empty variable, and on an output infra/ does not have', async () => {
+		const empty = await run('x=$(koi_setting KOI_BUCKET uploads_bucket)\necho "went on"', {
+			KOI_BUCKET: '',
+		});
+		expect(empty.code).not.toBe(0);
+		expect(empty.stdout).toBe('');
+		expect(empty.stderr).toContain('KOI_BUCKET is set but empty');
+		expect(empty.calls).toEqual([]);
+		const missing = await run('x=$(koi_setting KOI_BUCKET uploads_bucket)\necho "went on"');
+		expect(missing.code).not.toBe(0);
+		expect(missing.stdout).toBe('');
+		expect(missing.stderr).toContain(
+			'KOI_BUCKET is not set, and infra/ has no uploads_bucket output',
+		);
+	});
+
+	test("takes the region from AWS_REGION, else the profile's, else us-east-1", async () => {
+		const env = await run('koi_region', { AWS_REGION: 'eu-west-1', PROFILE_REGION: 'us-west-2' });
+		expect(env.stdout).toBe('eu-west-1\n');
+		expect(env.calls).toEqual([]);
+		const profile = await run('koi_region', {
+			AWS_PROFILE: 'koi-sso',
+			PROFILE_REGION: 'us-west-2',
+		});
+		expect(profile.stdout).toBe('us-west-2\n');
+		expect(profile.calls).toEqual(['aws configure get region']);
+		const none = await run('koi_region');
+		expect(none.stdout).toBe('us-east-1\n');
+	});
+
+	test('stops on a value that is not the shape it goes to the box as', async () => {
+		const bad = await run(
+			`koi_check 'x$(reboot)' '^[a-z0-9.-]+$' 'KOI_DOMAIN or the domain output' 'a bare hostname'\necho "went on"`,
+		);
+		expect(bad.code).toBe(1);
+		expect(bad.stdout).toBe('');
+		expect(bad.stderr).toBe(
+			"KOI_DOMAIN or the domain output is 'x$(reboot)', which is not a bare hostname\n",
+		);
+		const ok = await run(`koi_check i-0123456789abcdef0 '^i-[0-9a-f]{8,17}$' x y\necho "went on"`);
+		expect(ok.stdout).toBe('went on\n');
+	});
+
+	test('both scripts read the deployment through it and check every value they send', () => {
+		for (const name of ['deploy-host.sh', 'provision-host.sh']) {
+			const text = readFileSync(join(repo, 'scripts', name), 'utf8');
+			expect(text).toContain('. "$repo/scripts/host-settings.sh"');
+			expect(text).not.toContain('output -raw');
+			const read = [...text.matchAll(/^(\w+)=\$\(koi_(?:setting|region)\b/gm)].map((m) => m[1]);
+			expect(read.length).toBeGreaterThan(2);
+			for (const v of read) expect(text).toContain(`koi_check "$${v}"`);
+		}
 	});
 });
 

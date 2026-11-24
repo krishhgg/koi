@@ -96,7 +96,7 @@ const DEFAULT_SPOOL_BUDGET_BYTES = 10 * 1024 ** 3;
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
 	if (env.KOI_DOMAIN === undefined || env.KOI_DOMAIN === '') {
 		throw new Error(
-			'KOI_DOMAIN is not set. koid serves previews at <label>.<domain> and needs that domain. On the box, scripts/deploy-host.sh writes it to /etc/koi/env from the domain output of infra/ (var.domain, set in infra/koi.auto.tfvars); elsewhere, set KOI_DOMAIN in the environment.',
+			'KOI_DOMAIN is not set. koid serves previews at <label>.<domain> and needs that domain. On the box, scripts/deploy-host.sh writes it to /etc/koi/env from KOI_DOMAIN or the domain output of infra/ (var.domain, set in infra/koi.auto.tfvars); elsewhere, set KOI_DOMAIN in the environment.',
 		);
 	}
 	const stateDir = env.KOI_STATE_DIR ?? '/var/lib/koi';

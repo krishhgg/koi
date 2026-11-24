@@ -9,11 +9,12 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 # The base domain previews live under: var.domain in infra, which has no
-# default. infra/box.tf puts a KOI_DOMAIN= line in front of this script for
-# first boot and scripts/provision-host.sh does the same for a re-run, both
-# from the domain output. To run the script by hand, set KOI_DOMAIN yourself.
+# default. infra/modules/koi/box.tf puts a KOI_DOMAIN= line in front of this
+# script for first boot and scripts/provision-host.sh does the same for a
+# re-run, both from the domain output or KOI_DOMAIN. To run the script by
+# hand, set KOI_DOMAIN yourself.
 if [ -z "${KOI_DOMAIN:-}" ]; then
-	echo "koi: KOI_DOMAIN is not set. It must be the preview domain (var.domain in infra/koi.auto.tfvars); run scripts/provision-host.sh, which sets it, or set it before running this script." >&2
+	echo "koi: KOI_DOMAIN is not set. It must be the preview domain (var.domain of the koi module, in infra/koi.auto.tfvars for the personal root); run scripts/provision-host.sh, which sets it, or set it before running this script." >&2
 	exit 1
 fi
 if ! [[ $KOI_DOMAIN =~ ^[a-z0-9.-]+$ ]]; then
@@ -23,12 +24,21 @@ fi
 DOMAIN=$KOI_DOMAIN
 IDLE_MINUTES=10
 
+# The AWS region the box runs in, which Caddy's Route 53 client is given.
+# infra/modules/koi/box.tf and scripts/provision-host.sh pass it as KOI_REGION
+# the way they pass the domain. It goes into a unit file, so it is checked.
+KOI_REGION=${KOI_REGION:-us-east-1}
+if ! [[ $KOI_REGION =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
+	echo "koi: KOI_REGION '$KOI_REGION' is not an AWS region name" >&2
+	exit 1
+fi
+
 # The addresses verification run networks are carved from, a /28 each
-# (docs/verify.md, "Run network"): var.verify_pool in infra, which infra/box.tf
-# and scripts/provision-host.sh pass as KOI_VERIFY_POOL the way they pass the
-# domain. The default sits outside Docker's own pools (172.17.0.0/12 and
-# 192.168.0.0/16, where koi-previews and koi-build get their subnets) and the
-# default VPC (172.31.0.0/16). koid reads it from /etc/koi/verify/env, and so
+# (docs/verify.md, "Run network"): var.verify_pool in infra, which
+# infra/modules/koi/box.tf and scripts/provision-host.sh pass as
+# KOI_VERIFY_POOL the way they pass the domain. The default sits outside
+# Docker's own pools (172.17.0.0/12 and 192.168.0.0/16, where koi-previews and
+# koi-build get their subnets) and the default VPC (172.31.0.0/16). koid reads it from /etc/koi/verify/env, and so
 # does the helper that installs a run's firewall permits.
 KOI_VERIFY_POOL=${KOI_VERIFY_POOL:-10.213.0.0/20}
 if ! [[ $KOI_VERIFY_POOL =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/(1[6-9]|2[0-8])$ ]]; then
@@ -430,7 +440,8 @@ chmod 0640 /var/lib/koi-caddy/Caddyfile
 rm -f /var/lib/koi/Caddyfile
 rm -f /etc/caddy/Caddyfile
 
-cat > /etc/systemd/system/caddy.service <<'UNIT'
+# Unquoted, for the region; nothing else in the unit expands.
+cat > /etc/systemd/system/caddy.service <<UNIT
 [Unit]
 Description=Caddy
 After=network-online.target
@@ -439,7 +450,7 @@ Wants=network-online.target
 [Service]
 User=caddy
 Group=caddy
-Environment=AWS_REGION=us-east-1
+Environment=AWS_REGION=$KOI_REGION
 Environment=XDG_DATA_HOME=/var/lib
 Environment=XDG_CONFIG_HOME=/var/lib
 ExecStart=/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile
@@ -478,6 +489,8 @@ RuntimeDirectoryMode=0750
 ExecStartPre=+/bin/sh -c 'chgrp koi-control /run/koi && chmod 2750 /run/koi'
 Environment=KOID_PORT=7777
 Environment=KOID_LOG_PORT=7778
+# /etc/koi/env, which scripts/deploy-host.sh writes, sets the deployment's
+# region over this.
 Environment=AWS_REGION=us-east-1
 EnvironmentFile=-/etc/koi/env
 # KOI_VERIFY_POOL, written by provisioning (above).
