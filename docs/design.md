@@ -73,21 +73,38 @@ That needs git 2.43 or later: older releases lack `git --attr-source`, or abort 
 `git merge-tree` reads attributes through it, and koi refuses to merge with them.
 
 koi makes that merge in a temporary bare repository that shares only the checkout's
-objects, with no system or global git config, no work tree, index or
-`info/attributes`, and the merge settings pinned to git's defaults (no renormalizing,
-renames on, a rename limit of 7,000). Attributes come from the `.gitattributes` files in
-the base's tree and nowhere else (`git --attr-source=<base>`), as `git merge` reads them
-with the base checked out in a fresh clone, and no merge driver runs. So the same two
-parents give the same tree on any machine. git merges from the newest commits the two
-parents share, and in a shallow checkout a boundary can hide the newest one while an
-older one stays in reach, which can turn a clean merge into a conflict. So in a shallow
-checkout koi first walks both histories in the temporary repository, which has no list
-of shallow commits and so fails on any parent the checkout lacks. When one is missing,
-koi fetches both histories whole (`git fetch --unshallow origin <base> <head>`) and
-walks them again, for up to 10 minutes in all, and refuses a history that is still not
-whole. GitHub merges with the same algorithm, but
-may read attributes from elsewhere, and LFS or union settings can make its tree differ
-from koi's; koi does not promise the same tree as GitHub's.
+objects, with no system or global git config, no work tree, index or `info/attributes`,
+and the merge settings pinned to git's defaults (no renormalizing, renames on, a rename
+limit of 7,000). Attributes come from the `.gitattributes` files in the base's tree and
+nowhere else (`git --attr-source=<base>`), as `git merge` reads them with the base
+checked out in a fresh clone, and no merge driver runs. git merges from the newest
+commits the two parents share, and in a shallow checkout a boundary can hide the newest
+one while an older one stays in reach, which can turn a clean merge into a conflict. So
+in a shallow checkout koi first walks both histories in the temporary repository, which
+has no list of shallow commits and so fails on any parent the checkout lacks. When one
+is missing, koi fetches both histories whole (`git fetch --unshallow origin <base>
+<head>`) and walks them again, for up to 10 minutes in all, and refuses a history that
+is still not whole.
+
+koi's merge depends on these inputs and no others:
+
+- the base commit, the tip on origin of the base branch GitHub's API named just before;
+- the head commit, `refs/pull/N/head` on origin, which must be the head GitHub named;
+- the whole history of both, back to their roots;
+- the `.gitattributes` files in the base's tree;
+- the git that runs it (2.43 or later), with git's default merge settings.
+
+Nothing else in the checkout or on the machine counts: not the work tree, index, config,
+`info/attributes` or hooks, not the user's global or system git config or attributes,
+and no merge driver. The same parents give the same tree in any checkout with the same
+git release.
+
+koi does not promise that its tree matches GitHub's. GitHub merges with the same
+algorithm (ort), but it may run another git release, read attributes from elsewhere, or
+apply LFS or other settings of its own, any of which can give another tree. koi's
+output and comment say koi made the merge, its commit names koi as author, and what the
+commit-match rule checks is the commit and its parents, not that GitHub would have made
+the same tree.
 
 koi commits that merge with `git commit-tree`: parents the base then the head, message
 `Merge <head> into <base>`, author and committer `koi <koi@koi.invalid>` at the later

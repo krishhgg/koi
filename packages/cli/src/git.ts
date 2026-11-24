@@ -395,7 +395,8 @@ interface MergeIn {
 
 // koi's merge of a pull request, made in a temporary bare repository that
 // shares only the checkout's objects. The same two parents give the same
-// tree and commit in any checkout, on any machine with git 2.43 or later.
+// tree and commit in any checkout with the same git release (2.43 or
+// later).
 //
 // The repository has no config but what git init writes, no work tree, no
 // index and no info/attributes, and git runs with isolatedEnv, so none of
@@ -423,11 +424,12 @@ interface MergeIn {
 // attributes name one merges as text, and only git's own union and binary
 // apply.
 //
-// GitHub merges with the same algorithm (ort), but it may read attributes
-// from elsewhere, and LFS or union settings can make its tree differ from
-// koi's. The record says koi made the merge, and what the commit-match rule
-// checks is the commit and its parents, not that GitHub would have made
-// the same tree.
+// GitHub merges with the same algorithm (ort), but it may run another git
+// release, read attributes from elsewhere, or apply LFS or union settings
+// of its own, so its tree can differ from koi's. koi's output and comment
+// say koi made the merge, its commit names koi as author, and what the
+// commit-match rule checks is the commit and its parents, not that GitHub
+// would have made the same tree.
 async function mergeIsolated(
 	m: MergeIn,
 	base: string,
