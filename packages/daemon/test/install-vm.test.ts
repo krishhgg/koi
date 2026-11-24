@@ -245,6 +245,7 @@ describe('host/install-vm.sh, run whole', () => {
 			`ssh install ${b.bundle}/koi-ssh-gateway`,
 			'usermod -aG koi-control alice',
 			'systemctl daemon-reload',
+			'systemctl restart caddy.service',
 			'systemctl enable koid.service',
 			'systemctl restart koid.service',
 			'curl -fsS http://127.0.0.1:7777/__koi/health',
@@ -297,6 +298,7 @@ describe('host/install-vm.sh, run whole', () => {
 			['KOI_DNS_API_TOKEN=x\nKOI_DNS_API_TOKEN=', 2],
 			['KOI_DNS_API_TOKEN=\nKOI_DNS_API_TOKEN="x"', 0],
 			["KOI_DNS_API_TOKEN='x'", 0],
+			['KOI_DNS_API_TOKEN=  x', 0],
 		] as const) {
 			const b = await box();
 			await mkdir(join(b.dir, 'etc/koi/caddy'));

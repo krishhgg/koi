@@ -230,7 +230,7 @@ check_dns_env() {
 	grep -qF '{env.KOI_DNS_API_TOKEN}' "$DNS_FILE" || return 0
 	# systemd takes the last assignment, quoted or not.
 	grep -E '^[[:space:]]*KOI_DNS_API_TOKEN=' "$CADDY_ENV" | tail -n 1 |
-		grep -Eq "=[\"']?[^\"'[:space:]]" && return 0
+		grep -Eq "=[[:space:]]*[\"']?[^\"'[:space:]]" && return 0
 	{
 		echo "koi: the DNS provider's API token is not set. Caddy refuses koid's config without"
 		echo '  it, so koid was not started. Put the token in'
@@ -280,6 +280,10 @@ add_users() {
 # large images, as scripts/deploy-host.sh waits for it.
 start_koid() {
 	systemctl daemon-reload
+	# Caddy starts again, with the environment file as it is now: a reload,
+	# as cloud-init.sh does, keeps the environment Caddy started with, which
+	# on a first install with a DNS provider had no token.
+	systemctl restart caddy.service
 	systemctl enable koid.service
 	systemctl restart koid.service
 	local _
