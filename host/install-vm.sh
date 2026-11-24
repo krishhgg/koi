@@ -113,11 +113,21 @@ check_platform() {
 	[ "$(uname -m)" = x86_64 ] || die "this host is $(uname -m); koi's host binaries are built for x86_64"
 }
 
-# Every file is the one scripts/host-bundle.sh built, whole.
+# Every file is the one scripts/host-bundle.sh built, whole. sha256sum -c
+# checks only the files SHA256SUMS lists, so each file this script reads must
+# have its line there, and a line it cannot read fails the check.
 check_bundle() {
 	[ -f "$BUNDLE/SHA256SUMS" ] ||
 		die "$BUNDLE has no SHA256SUMS; build the bundle with scripts/host-bundle.sh and copy the whole directory"
-	(cd "$BUNDLE" && sha256sum --quiet -c SHA256SUMS) ||
+	local name listed
+	local needed=(cloud-init.sh koid recipes.tar.gz egress.tar.gz verify.tar.gz)
+	[ "$LOCAL" = true ] || needed+=(ssh.tar.gz koi-ssh-gateway)
+	listed=$(cut -d ' ' -f 3- "$BUNDLE/SHA256SUMS")
+	for name in "${needed[@]}"; do
+		grep -qxF -- "$name" <<<"$listed" ||
+			die "the SHA256SUMS in $BUNDLE has no line for $name; build the bundle again with scripts/host-bundle.sh"
+	done
+	(cd "$BUNDLE" && sha256sum --strict --quiet -c SHA256SUMS) ||
 		die "the bundle in $BUNDLE does not match its SHA256SUMS; copy it again"
 }
 

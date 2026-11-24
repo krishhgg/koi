@@ -167,6 +167,38 @@ describe('host/install-vm.sh checks', () => {
 			'has no SHA256SUMS; build the bundle with scripts/host-bundle.sh',
 		);
 	});
+
+	test('takes no SHA256SUMS that lost the line of a file it reads, or has a line it cannot read', async () => {
+		const b = await box();
+		const sums = join(b.bundle, 'SHA256SUMS');
+		const whole = await readFile(sums, 'utf8');
+		const without = (name: string) =>
+			whole
+				.split('\n')
+				.filter((line) => !line.endsWith(`  ${name}`))
+				.join('\n');
+		for (const name of [
+			'cloud-init.sh',
+			'koid',
+			'recipes.tar.gz',
+			'egress.tar.gz',
+			'verify.tar.gz',
+			'ssh.tar.gz',
+			'koi-ssh-gateway',
+		]) {
+			await writeFile(sums, without(name));
+			const r = await run(b, 'check_bundle && echo went on');
+			expect([name, r.code, r.stdout]).toEqual([name, 1, '']);
+			expect(r.stderr).toContain(`the SHA256SUMS in ${b.bundle} has no line for ${name};`);
+		}
+		// --local reads neither of the SSH gateway's files.
+		await writeFile(sums, without('ssh.tar.gz').replace(/^.* {2}koi-ssh-gateway\n/m, ''));
+		expect((await run(b, 'LOCAL=true\ncheck_bundle && echo ok')).stdout).toBe('ok\n');
+		await writeFile(sums, `${whole}not a line of sha256sum\n`);
+		const bad = await run(b, 'check_bundle && echo went on');
+		expect(bad.code).toBe(1);
+		expect(bad.stderr).toContain('does not match its SHA256SUMS; copy it again');
+	});
 });
 
 describe('host/install-vm.sh, run whole', () => {
