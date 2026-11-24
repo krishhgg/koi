@@ -279,6 +279,16 @@ const INTERRUPTED =
 // accepted again after that.
 class Superseded extends Error {}
 
+// Caddy or the egress proxy did not take the routes a container start
+// needs (startFresh). It says nothing about the preview, so start() does
+// not record it as a failed start, which restore would skip at every later
+// boot.
+class RoutingFailed extends Error {}
+
+function routingFailed(err: unknown): never {
+	throw new RoutingFailed(message(err), { cause: err });
+}
+
 // Locks, outermost first:
 // - buildQueue (per label) runs one build of a label at a time, in the order
 //   the requests were accepted. It is held for the whole build, so it never
@@ -317,7 +327,7 @@ export class Deployer {
 	private readonly builds = new Semaphore(1);
 	private readonly lifecycle = new KeyedLock();
 	private readonly admitting = new Mutex();
-	private readonly starting = new Map<string, Promise<void>>();
+	private readonly starting = new Map<string, { task: Promise<void>; skipFailed: boolean }>();
 	private readonly routing = new Mutex();
 	private nextSync: Promise<void> | undefined;
 	private readonly publishing = new Mutex();
@@ -338,6 +348,8 @@ export class Deployer {
 	// it may be one koid stopped for disk use before a restart, whose record
 	// could not say so.
 	private diskChecked = false;
+	// Settles when diskChecked becomes true. restore waits for it.
+	private readonly diskMeasured = Promise.withResolvers<void>();
 	// Running containers koid found outside the slice and has not managed to
 	// stop yet. Nothing routes or wakes them, and the watchdog's timer tries
 	// the stop again (stopMisplaced).
@@ -981,24 +993,38 @@ export class Deployer {
 	}
 
 	// Starts a stopped preview's container. Called when someone visits a
-	// preview that is not routed, which is every preview after the box wakes.
-	// Runs under the label's lifecycle lock, and visitors who ask while a start
-	// is in progress share it. A preview past its ttl is expired instead.
-	ensureRunning(label: string): Promise<void> {
+	// preview that is not routed, and by restore when koid starts. Runs under
+	// the label's lifecycle lock, and visitors who ask while a start is in
+	// progress share it. A preview past its ttl is expired instead. With
+	// `skipFailed` (restore), a preview whose last start failed is left
+	// stopped, judged under the lock from the record as it is then: a visit
+	// that failed just before still leaves it for the next visit.
+	ensureRunning(label: string, skipFailed = false): Promise<void> {
 		const inFlight = this.starting.get(label);
-		if (inFlight !== undefined) return inFlight;
+		if (inFlight !== undefined) {
+			// A visit that finds restore's start in progress waits for it, then
+			// starts the preview itself: restore's start may have left it
+			// stopped after a failed start, which a visit tries again. When
+			// restore did start it, the visit's start finds it running.
+			if (inFlight.skipFailed && !skipFailed) {
+				const retry = () => this.ensureRunning(label);
+				return inFlight.task.then(retry, retry);
+			}
+			return inFlight.task;
+		}
 		const task = this.lifecycle
-			.run(label, () => this.start(label))
+			.run(label, () => this.start(label, skipFailed))
 			.finally(() => this.starting.delete(label));
-		this.starting.set(label, task);
+		this.starting.set(label, { task, skipFailed });
 		return task;
 	}
 
 	// Caller holds the label's lifecycle lock.
-	private async start(label: string): Promise<void> {
+	private async start(label: string, skipFailed = false): Promise<void> {
 		const { deps } = this;
 		const record = await deps.store.get(label);
 		if (record === undefined || record.status === 'expired') return;
+		if (skipFailed && record.error?.startsWith(WAKE_FAILED)) return;
 		const now = deps.now().getTime();
 		if (overdue(record, now)) {
 			// A visit counted in time and not yet written renews it.
@@ -1041,15 +1067,22 @@ export class Deployer {
 			} catch (err) {
 				const reason = redact(`${WAKE_FAILED}${message(err)}`).slice(0, 2000);
 				deps.log(`starting ${label}: ${message(err)}`);
-				// A record that cannot be written (a full disk, say) must not
-				// keep the container running, unrouted, below.
-				await deps.store
-					.update(label, (r) =>
-						r.deployment?.container === d.container
-							? { ...r, error: reason, updatedAt: this.iso() }
-							: r,
-					)
-					.catch((e: unknown) => deps.log(`recording that ${label} did not start: ${message(e)}`));
+				// Recorded only when Docker or the health check failed: restore
+				// skips a preview whose start failed, and a routing failure
+				// passes once Caddy or the egress proxy recovers. A record that
+				// cannot be written (a full disk, say) must not keep the
+				// container running, unrouted, below.
+				if (!(err instanceof RoutingFailed)) {
+					await deps.store
+						.update(label, (r) =>
+							r.deployment?.container === d.container
+								? { ...r, error: reason, updatedAt: this.iso() }
+								: r,
+						)
+						.catch((e: unknown) =>
+							deps.log(`recording that ${label} did not start: ${message(e)}`),
+						);
+				}
 				// Stopped rather than left running unrouted, once routes without
 				// it are applied: Docker may give a stopped container's address
 				// to another preview. No retry here: the next visit tries again.
@@ -1078,6 +1111,60 @@ export class Deployer {
 			});
 		}
 		await this.sync();
+	}
+
+	// Starts every preview that serves and is not routed, each as a visit
+	// would (ensureRunning), and resolves once every start has ended.
+	// Returns the labels routed after their start. koid calls it at startup
+	// without waiting: preview containers run with --restart no (docker.ts,
+	// runArgs), so the box stopping leaves every one stopped, and without
+	// this a preview started again only once a request reached koid.
+	//
+	// One start at a time, health check included: each container may use
+	// the memory in CONTAINER_LIMITS (docker.ts), and several at their
+	// start-up peak together can exceed the slice's memory ceiling, which
+	// kills one that would have started alone. A visit does not wait its
+	// preview's turn: it starts the preview at once, or shares a start
+	// already in progress. Each preview's record is read again just before
+	// its turn, so one that a visit started or failed to start meanwhile is
+	// skipped.
+	//
+	// The record's own deployment starts, from its container or, if that is
+	// gone, from its image with the recorded environment, so the URL, the
+	// deployment a lease holds and the login key stay what they were. Each
+	// container is routed only once it answers its health check, as on any
+	// wake. Not started: a deployment halted for disk use, a preview whose
+	// container did not start or answer last time (koid stopped it on
+	// purpose; a visit still tries again), and a preview past its ttl, which
+	// expire() at startup has already retired and start() would retire
+	// rather than start. Call it after expire(). It first waits for a disk
+	// watchdog run to measure the containers, the one at startup or, if that
+	// failed, a later one on the timer: until one has, start() starts no
+	// stopped container.
+	async restore(): Promise<string[]> {
+		await this.diskMeasured.promise;
+		const restored: string[] = [];
+		for (const { label } of await this.records()) {
+			try {
+				const r = await this.deps.store.get(label);
+				const d = r?.deployment;
+				if (
+					r === undefined ||
+					d === undefined ||
+					d.halted !== undefined ||
+					this.ready.has(d.container) ||
+					r.error?.startsWith(WAKE_FAILED) ||
+					this.lapsed(r, this.deps.now().getTime())
+				) {
+					continue;
+				}
+				await this.ensureRunning(label, true);
+				if (this.ready.has(d.container)) restored.push(label);
+			} catch (err) {
+				this.deps.log(`starting ${label}: ${message(err)}`);
+			}
+		}
+		return restored.sort();
 	}
 
 	async view(label: string): Promise<PreviewView> {
@@ -1140,9 +1227,15 @@ export class Deployer {
 
 	// Caller holds `routing`.
 	private async syncNow(): Promise<void> {
+		await this.applyRoutes(await this.currentRoutes());
+	}
+
+	// The routes the records call for, from Docker's view of the containers.
+	// Caller holds `routing`.
+	private async currentRoutes(): Promise<Route[]> {
 		const records = await this.records();
 		this.live = new Set(records.filter((r) => r.status !== 'expired').map((r) => r.label));
-		await this.applyRoutes(await this.routesFor(records));
+		return this.routesFor(records);
 	}
 
 	// Tells the egress proxy the address of every routed container and its
@@ -1184,13 +1277,19 @@ export class Deployer {
 	// sync first takes dead containers out of the routes and the proxy's map,
 	// and the proxy confirms, before the start. If the new container's
 	// address is one the confirmed map still names, its holder died between
-	// the two, and the map goes to the proxy again at once.
+	// the two, and the map goes to the proxy again at once. When the proxy or
+	// Caddy does not take the routes, this throws RoutingFailed; a Docker
+	// error, reading the containers or starting this one, is thrown as it is.
 	private async startFresh(container: string, start: () => Promise<void>): Promise<void> {
 		await this.routing.run(async () => {
-			await this.syncNow();
+			const before = await this.currentRoutes();
+			await this.applyRoutes(before).catch(routingFailed);
 			await start();
 			const { ip } = await this.deps.docker.inspect(container, this.deps.network);
-			if (ip !== undefined && this.told[ip] !== undefined) await this.syncNow();
+			if (ip !== undefined && this.told[ip] !== undefined) {
+				const after = await this.currentRoutes();
+				await this.applyRoutes(after).catch(routingFailed);
+			}
 		});
 	}
 
@@ -1561,6 +1660,7 @@ export class Deployer {
 		const over = (await deps.docker.diskUsage()).filter((c) => c.bytes > limitBytes);
 		for (const c of over) this.halted.add(c.name);
 		this.diskChecked = true;
+		this.diskMeasured.resolve();
 		const stopped: string[] = [];
 		for (const c of over) {
 			const reason = `stopped for disk use: its writable layer and volumes reached ${gib(c.bytes)} GiB, over the ${gib(limitBytes)} GiB limit`;
@@ -1670,7 +1770,8 @@ export class Deployer {
 	// attempts failed, check the containers that are still running, clear
 	// build directories, route the ones that answered, and once Caddy has
 	// taken those routes remove containers and images no record points at,
-	// and stop the containers that run outside the slice.
+	// and stop the containers that run outside the slice. Starting the
+	// stopped ones is restore()'s, later in startup.
 	async reconcile(): Promise<void> {
 		const { deps } = this;
 		for (const r of await this.records()) {
@@ -1685,10 +1786,10 @@ export class Deployer {
 			r.deployment === undefined ? [] : [r.deployment],
 		);
 		// Containers still running from before koid started serve again once
-		// they answer; the rest wait for a visit to start and check them. One
-		// that runs outside the slice kept running through a Docker restart
+		// they answer; restore() starts and checks the rest. One that runs
+		// outside the slice kept running through a Docker restart
 		// (live-restore) where it was before; it is stopped below, and its
-		// next visit starts it in the slice.
+		// next start, by restore() or a visit, puts it in the slice.
 		const outside: string[] = [];
 		for (const d of deployments) {
 			if (d.halted !== undefined) continue;
