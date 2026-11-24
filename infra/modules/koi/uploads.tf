@@ -7,7 +7,13 @@ resource "aws_s3_bucket" "uploads" {
   #checkov:skip=CKV2_AWS_62:Nothing subscribes: the CLI tells koid about each upload through SSM.
   #checkov:skip=CKV_AWS_21:Each object is written once under a fresh key and expires after a day, so there is nothing to version.
   bucket = local.uploads_name
-  tags   = var.tags
+  # Everything here is a one-day upload (the lifecycle rule below), so a
+  # destroy removes what is left rather than stopping on BucketNotEmpty, which
+  # it otherwise does after the first deploy-host.sh or koi up. The provider reads
+  # this from state when it deletes, so a state applied without it needs one
+  # apply first.
+  force_destroy = true
+  tags          = var.tags
 }
 
 resource "aws_s3_bucket_public_access_block" "uploads" {
