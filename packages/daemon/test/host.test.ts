@@ -1357,8 +1357,9 @@ describe('host/cloud-init.sh', () => {
 
 // scripts/host-settings.sh as deploy-host.sh and provision-host.sh source it,
 // with tofu and aws replaced by scripts that log their calls. The fake tofu
-// has two of the personal root's outputs; the fake aws knows a profile region
-// only when PROFILE_REGION is set.
+// has two of the personal root's outputs, and the region output only when
+// STATE_REGION is set, as in state applied before that output existed; the
+// fake aws knows a profile region only when PROFILE_REGION is set.
 describe('scripts/host-settings.sh, run in bash', () => {
 	const repo = resolve(import.meta.dir, '../../..');
 
@@ -1374,6 +1375,7 @@ describe('scripts/host-settings.sh, run in bash', () => {
 				'case "$4" in',
 				'box_instance_id) printf i-0123456789abcdef0 ;;',
 				'domain) printf previews.example.com ;;',
+				`region) if [ -n "\${STATE_REGION:-}" ]; then printf %s "$STATE_REGION"; else echo "Output region not found" >&2; exit 1; fi ;;`,
 				'*) echo "Output $4 not found" >&2; exit 1 ;;',
 				'esac',
 			].join('\n'),
@@ -1442,18 +1444,49 @@ describe('scripts/host-settings.sh, run in bash', () => {
 		);
 	});
 
-	test("takes the region from AWS_REGION, else the profile's, else us-east-1", async () => {
+	test('takes the region from AWS_REGION, else from where the deployment comes from', async () => {
 		const env = await run('koi_region', { AWS_REGION: 'eu-west-1', PROFILE_REGION: 'us-west-2' });
 		expect(env.stdout).toBe('eu-west-1\n');
 		expect(env.calls).toEqual([]);
+		// The deployment from infra/'s state is where that state put it,
+		// whatever region the profile names.
+		const state = await run('koi_region', {
+			STATE_REGION: 'eu-central-1',
+			PROFILE_REGION: 'us-west-2',
+		});
+		expect(state.stdout).toBe('eu-central-1\n');
+		expect(state.calls).toEqual([`tofu -chdir=${repo}/infra output -raw region`]);
+		const old = await run('koi_region', { PROFILE_REGION: 'us-west-2' });
+		expect(old.stdout).toBe('us-east-1\n');
+		// One from another root names its instance, and is in the profile's.
 		const profile = await run('koi_region', {
+			KOI_INSTANCE_ID: 'i-0fedcba9876543210',
 			AWS_PROFILE: 'koi-sso',
 			PROFILE_REGION: 'us-west-2',
 		});
 		expect(profile.stdout).toBe('us-west-2\n');
 		expect(profile.calls).toEqual(['aws configure get region']);
-		const none = await run('koi_region');
+		const none = await run('koi_region', { KOI_INSTANCE_ID: 'i-0fedcba9876543210' });
 		expect(none.stdout).toBe('us-east-1\n');
+	});
+
+	test('takes a verification pool only as a network address koid accepts', async () => {
+		for (const pool of ['10.213.0.0/20', '10.213.16.0/20', '192.168.0.16/28']) {
+			const r = await run(`koi_check_pool ${pool} KOI_VERIFY_POOL\necho "went on"`);
+			expect({ pool, stdout: r.stdout }).toEqual({ pool, stdout: 'went on\n' });
+		}
+		for (const [pool, problem] of [
+			['10.213.0.1/20', 'names a host'],
+			['10.213.8.0/20', 'names a host'],
+			['10.256.0.0/16', '256 is over 255'],
+			['010.213.0.0/20', 'not an IPv4 network between /16 and /28'],
+			['10.213.0.0/29', 'not an IPv4 network between /16 and /28'],
+		]) {
+			const r = await run(`koi_check_pool ${pool} KOI_VERIFY_POOL\necho "went on"`);
+			expect({ pool, code: r.code, stdout: r.stdout }).toEqual({ pool, code: 1, stdout: '' });
+			expect(r.stderr).toContain(`KOI_VERIFY_POOL is '${pool}', which`);
+			expect(r.stderr).toContain(problem as string);
+		}
 	});
 
 	test('stops on a value that is not the shape it goes to the box as', async () => {
@@ -1476,7 +1509,7 @@ describe('scripts/host-settings.sh, run in bash', () => {
 			expect(text).not.toContain('output -raw');
 			const read = [...text.matchAll(/^(\w+)=\$\(koi_(?:setting|region)\b/gm)].map((m) => m[1]);
 			expect(read.length).toBeGreaterThan(2);
-			for (const v of read) expect(text).toContain(`koi_check "$${v}"`);
+			for (const v of read) expect(text).toMatch(new RegExp(`koi_check(_pool)? "\\$${v}"`));
 		}
 	});
 });

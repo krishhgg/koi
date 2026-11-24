@@ -6,8 +6,10 @@
 # The deployment comes from KOI_INSTANCE_ID, KOI_BUCKET, KOI_PREVIEWS_PARAM and
 # KOI_DOMAIN where they are set, and from `tofu output` of infra/ (the personal
 # root) where they are not; a deployment made by another root sets all four
-# from that root's module outputs. AWS_PROFILE picks the credentials and
-# AWS_REGION the region, else the profile's region, else us-east-1.
+# from that root's module outputs. AWS_PROFILE picks the credentials.
+# AWS_REGION picks the region, else the region output of infra/ when the
+# deployment comes from there, else the profile's region
+# (scripts/host-settings.sh, koi_region).
 #
 # Builds koid and the SSH gateway, uploads them with a recipes tarball, the
 # egress proxy bundle, the verification helper bundle and the SSH bundle to the
@@ -28,7 +30,7 @@ domain=$(koi_setting KOI_DOMAIN domain)
 # Each value goes into a shell heredoc on the box, so check its shape here,
 # not only where the module validated it: a value from the environment never
 # went through the module.
-koi_check "$region" '^[a-z]{2}(-[a-z]+)+-[0-9]+$' 'The region from AWS_REGION or the profile' 'an AWS region name'
+koi_check "$region" '^[a-z]{2}(-[a-z]+)+-[0-9]+$' 'The region from AWS_REGION, the region output or the profile' 'an AWS region name'
 koi_check "$instance" '^i-[0-9a-f]{8,17}$' 'KOI_INSTANCE_ID or the box_instance_id output' 'an EC2 instance id'
 koi_check "$bucket" '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$' 'KOI_BUCKET or the uploads_bucket output' 'an S3 bucket name'
 koi_check "$param" '^/[A-Za-z0-9_./-]+$' 'KOI_PREVIEWS_PARAM or the previews_parameter output' 'an SSM parameter name starting with /'

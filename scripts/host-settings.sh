@@ -25,12 +25,18 @@ koi_setting() {
 	fi
 }
 
-# koi_region prints AWS_REGION, else AWS_DEFAULT_REGION, else the region of
-# the AWS profile (AWS_PROFILE), else us-east-1.
+# koi_region prints AWS_REGION, else AWS_DEFAULT_REGION. Without either, a
+# deployment read from infra/ (KOI_INSTANCE_ID unset) is in the region output
+# there, or in us-east-1 for state applied before that output existed; one
+# made by another root is in the AWS profile's region, else us-east-1.
 koi_region() {
 	local region=${AWS_REGION:-${AWS_DEFAULT_REGION:-}}
 	if [ -z "$region" ]; then
-		region=$(aws configure get region 2>/dev/null || true)
+		if [ -z "${KOI_INSTANCE_ID+set}" ]; then
+			region=$(tofu -chdir="$repo/infra" output -raw region 2>/dev/null || true)
+		else
+			region=$(aws configure get region 2>/dev/null || true)
+		fi
 	fi
 	printf '%s\n' "${region:-us-east-1}"
 }
@@ -41,6 +47,27 @@ koi_region() {
 koi_check() {
 	if ! [[ $1 =~ $2 ]]; then
 		echo "$3 is '$1', which is not $4" >&2
+		exit 1
+	fi
+}
+
+# koi_check_pool VALUE SOURCE stops the script unless VALUE is an IPv4 network
+# between a /16 and a /28, written as its network address, as koid and the
+# firewall helper take it: 10.213.0.1/20 names a host, and the box would turn
+# verification off.
+koi_check_pool() {
+	koi_check "$1" '^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}/(1[6-9]|2[0-8])$' "$2" 'an IPv4 network between /16 and /28'
+	local octets octet address=0 bits=${1#*/}
+	IFS=. read -r -a octets <<<"${1%/*}"
+	for octet in "${octets[@]}"; do
+		if ((10#$octet > 255)); then
+			echo "$2 is '$1', which is not an IPv4 network: $octet is over 255" >&2
+			exit 1
+		fi
+		address=$((address * 256 + 10#$octet))
+	done
+	if ((address & ((1 << (32 - bits)) - 1))); then
+		echo "$2 is '$1', which names a host; give the network's own address" >&2
 		exit 1
 	fi
 }

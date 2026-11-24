@@ -7,8 +7,9 @@
 #
 # The deployment comes from KOI_INSTANCE_ID, KOI_DOMAIN and KOI_VERIFY_POOL
 # where they are set, and from `tofu output` of infra/ (the personal root)
-# where they are not. AWS_PROFILE picks the credentials and AWS_REGION the
-# region, else the profile's region, else us-east-1.
+# where they are not. AWS_PROFILE picks the credentials. AWS_REGION picks the
+# region, else the region output of infra/ when the deployment comes from
+# there, else the profile's region (scripts/host-settings.sh, koi_region).
 #
 # The script travels inside the SSM command as base64, which is shell-safe, so
 # the box needs no AWS CLI and nothing is interpolated into a shell. The values
@@ -24,10 +25,10 @@ domain=$(koi_setting KOI_DOMAIN domain)
 # The pool verification run networks come from (var.verify_pool).
 verify_pool=$(koi_setting KOI_VERIFY_POOL verify_pool)
 # Checked here as cloud-init.sh checks them, before they go into shell lines.
-koi_check "$region" '^[a-z]{2}(-[a-z]+)+-[0-9]+$' 'The region from AWS_REGION or the profile' 'an AWS region name'
+koi_check "$region" '^[a-z]{2}(-[a-z]+)+-[0-9]+$' 'The region from AWS_REGION, the region output or the profile' 'an AWS region name'
 koi_check "$instance" '^i-[0-9a-f]{8,17}$' 'KOI_INSTANCE_ID or the box_instance_id output' 'an EC2 instance id'
 koi_check "$domain" '^[a-z0-9.-]+$' 'KOI_DOMAIN or the domain output' 'a bare hostname'
-koi_check "$verify_pool" '^[0-9]{1,3}(\.[0-9]{1,3}){3}/(1[6-9]|2[0-8])$' 'KOI_VERIFY_POOL or the verify_pool output' 'an IPv4 network between /16 and /28'
+koi_check_pool "$verify_pool" 'KOI_VERIFY_POOL or the verify_pool output'
 
 # cloud-init.sh reads the domain from KOI_DOMAIN, the pool from
 # KOI_VERIFY_POOL and the region from KOI_REGION. Lines in front of the script
