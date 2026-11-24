@@ -17,6 +17,7 @@ import { BUILTIN_RECIPES } from './builtins.ts';
 import type { Env, TargetFlags } from './config.ts';
 import { configCommand } from './config-command.ts';
 import { refuseAutoloadedCheckout } from './environ.ts';
+import { killRunning } from './exec.ts';
 import { cliGit, type Git } from './git.ts';
 import { type GitHub, ghCli, ownerRepoFor } from './github.ts';
 import { openHost } from './host.ts';
@@ -442,10 +443,13 @@ function message(err: unknown): string {
 // SIGINT and SIGTERM end the command at once, as they did when nothing
 // handled them, but the host the command opened is closed first: an SSH
 // master connection would otherwise stay up for ten minutes with its
-// temporary directory. The exit status is the shell's for a signal.
+// temporary directory. The programs exec is running are killed too, since
+// each runs in a process group of its own that the signal did not reach.
+// The exit status is the shell's for a signal.
 export async function main(argv: string[], runtime: Runtime = realRuntime): Promise<void> {
 	let open: Box | undefined;
 	const onSignal = (signal: NodeJS.Signals) => {
+		killRunning();
 		const code = 128 + (signal === 'SIGINT' ? 2 : 15);
 		const closed = open === undefined ? Promise.resolve() : closeHost(open).catch(() => {});
 		void closed.then(() => process.exit(code));

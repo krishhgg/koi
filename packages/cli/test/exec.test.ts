@@ -5,9 +5,25 @@ import {
 	exec,
 	execOk,
 	FULL_OUTPUT,
+	killRunning,
 	OutputTooLargeError,
+	PIPE_GRACE_MS,
 	SpawnError,
 } from '../src/exec.ts';
+
+// Whether a process is still running, waiting up to two seconds for one
+// that was just killed to be reaped.
+async function running(pid: number): Promise<boolean> {
+	for (let i = 0; i < 20; i++) {
+		try {
+			process.kill(pid, 0);
+		} catch {
+			return false;
+		}
+		await Bun.sleep(100);
+	}
+	return true;
+}
 
 // `seq 1 100000` writes 588,895 bytes, more than the default 256 KiB.
 const BIG = ['seq', '1', '100000'];
@@ -62,4 +78,47 @@ describe('exec', () => {
 		expect(err).toBeInstanceOf(ExecError);
 		expect((err as Error).message).toContain('no-such-command');
 	});
+
+	test('kills what a program started along with it when it runs out of time', async () => {
+		// sh starts a sleep that keeps sh's stdout and stderr open, and
+		// prints its pid. Killing sh alone would leave exec waiting on them.
+		const started = performance.now();
+		const r = await exec(['sh', '-c', 'sleep 600 & echo $!; wait'], { timeoutMs: 300 });
+		expect(r.timedOut).toBe(true);
+		expect(performance.now() - started).toBeLessThan(PIPE_GRACE_MS);
+		const pid = Number(r.stdout.trim());
+		expect(pid).toBeGreaterThan(0);
+		expect(await running(pid)).toBe(false);
+	}, 10_000);
+
+	test.skipIf(Bun.which('setsid') === null)(
+		'stops waiting for output a process outside the group holds open, after a grace',
+		async () => {
+			// The sleep left sh's process group, so killing the group misses it,
+			// and it holds the pipes open until it ends.
+			const escaped = "setsid sh -c 'echo $$; exec sleep 600' & sleep 600";
+			const started = performance.now();
+			const r = await exec(['sh', '-c', escaped], { timeoutMs: 300 });
+			const waited = performance.now() - started;
+			const pid = Number(r.stdout.trim());
+			try {
+				expect(r.timedOut).toBe(true);
+				expect(waited).toBeGreaterThanOrEqual(300 + PIPE_GRACE_MS - 50);
+				expect(waited).toBeLessThan(300 + PIPE_GRACE_MS + 3_000);
+				expect(pid).toBeGreaterThan(0);
+			} finally {
+				if (pid > 0) process.kill(pid, 'SIGKILL');
+			}
+		},
+		10_000,
+	);
+
+	test('killRunning ends the programs exec is running', async () => {
+		const pending = exec(['sh', '-c', 'sleep 600 & echo $!; wait']);
+		await Bun.sleep(200);
+		killRunning();
+		const r = await pending;
+		expect(r.code).not.toBe(0);
+		expect(await running(Number(r.stdout.trim()))).toBe(false);
+	}, 10_000);
 });

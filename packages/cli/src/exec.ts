@@ -1,6 +1,15 @@
 // Runs a program with an argument array (never a shell string), with an
 // optional time limit and a callback per output line.
 //
+// Each program runs in a session and process group of its own. A program
+// that runs out of time, or writes too much, is killed with everything it
+// started that stayed in its group (git fetch's ssh, a credential helper),
+// and exec waits at most PIPE_GRACE_MS more for its output to end: a process
+// that left the group can hold the pipes open for as long as it runs. With
+// no terminal of their own, the programs cannot prompt on koi's: a git or
+// ssh that needs a password fails rather than asks. killRunning ends them
+// all when koi itself is interrupted.
+//
 // Stdout is kept whole up to `maxBytes`. A program that writes more is killed
 // and exec throws OutputTooLargeError: callers parse stdout (file lists, JSON),
 // and a list cut at an arbitrary byte can turn "src/.env" into ".env". Stderr
@@ -53,31 +62,68 @@ export class SpawnError extends Error {
 	}
 }
 
+// How long exec waits for a killed program's output to end.
+export const PIPE_GRACE_MS = 2_000;
+
+// The programs exec is running, by process id, which is also the id of
+// each one's process group.
+const running = new Set<number>();
+
 export async function exec(cmd: string[], options: ExecOptions = {}): Promise<ExecResult> {
 	const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
 	const proc = spawn(cmd, options.stdin, options.env);
+	running.add(proc.pid);
+	const out = proc.stdout.getReader();
+	const err = proc.stderr.getReader();
 	let timedOut = false;
 	let tooLarge = false;
+	let grace: ReturnType<typeof setTimeout> | undefined;
+	// Kills the program's group, and after PIPE_GRACE_MS stops reading
+	// whatever output is still open, which ends both collectors.
+	const kill = () => {
+		killGroup(proc.pid);
+		grace ??= setTimeout(() => {
+			out.cancel().catch(() => {});
+			err.cancel().catch(() => {});
+		}, PIPE_GRACE_MS);
+	};
 	const timer =
 		options.timeoutMs === undefined
 			? undefined
 			: setTimeout(() => {
 					timedOut = true;
-					proc.kill('SIGKILL');
+					kill();
 				}, options.timeoutMs);
 	try {
 		const [stdout, stderr] = await Promise.all([
-			collectAll(proc.stdout, options.onLine, maxBytes, () => {
+			collectAll(out, options.onLine, maxBytes, () => {
 				tooLarge = true;
-				proc.kill('SIGKILL');
+				kill();
 			}),
-			collectTail(proc.stderr, options.onLine),
+			collectTail(err, options.onLine),
 		]);
 		const code = await proc.exited;
 		if (tooLarge) throw new OutputTooLargeError(cmd, maxBytes);
 		return { code, stdout, stderr, timedOut };
 	} finally {
 		if (timer !== undefined) clearTimeout(timer);
+		if (grace !== undefined) clearTimeout(grace);
+		running.delete(proc.pid);
+	}
+}
+
+// Kills every program exec is running, with what each started, for koi
+// interrupted (see main): they are in groups of their own, so the signal
+// that reached koi did not reach them.
+export function killRunning(): void {
+	for (const pid of running) killGroup(pid);
+}
+
+function killGroup(pid: number): void {
+	try {
+		process.kill(-pid, 'SIGKILL');
+	} catch {
+		// The group has ended.
 	}
 }
 
@@ -91,6 +137,7 @@ function spawn(
 			stdin: stdin === undefined ? 'ignore' : new TextEncoder().encode(stdin),
 			stdout: 'pipe',
 			stderr: 'pipe',
+			detached: true,
 			...(env !== undefined ? { env: withEnv(env) } : {}),
 		});
 	} catch (err) {
@@ -125,9 +172,17 @@ function lineSplitter(onLine: ((line: string) => void) | undefined) {
 	};
 }
 
+// What the collectors need of a reader of a program's output.
+interface Reader {
+	read(): Promise<
+		{ done: true; value?: Uint8Array | undefined } | { done: false; value: Uint8Array }
+	>;
+	cancel(): Promise<void>;
+}
+
 // The whole stream, or '' after calling onOverflow once it passes maxBytes.
 async function collectAll(
-	stream: ReadableStream<Uint8Array>,
+	reader: Reader,
 	onLine: ((line: string) => void) | undefined,
 	maxBytes: number,
 	onOverflow: () => void,
@@ -136,13 +191,16 @@ async function collectAll(
 	const lines = lineSplitter(onLine);
 	const chunks: string[] = [];
 	let bytes = 0;
-	for await (const chunk of stream) {
-		bytes += chunk.byteLength;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		bytes += value.byteLength;
 		if (bytes > maxBytes) {
 			onOverflow();
+			await reader.cancel().catch(() => {});
 			return '';
 		}
-		const text = decoder.decode(chunk, { stream: true });
+		const text = decoder.decode(value, { stream: true });
 		chunks.push(text);
 		lines.push(text);
 	}
@@ -154,14 +212,16 @@ async function collectAll(
 
 // The last STDERR_KEEP characters of the stream, which is where errors are.
 async function collectTail(
-	stream: ReadableStream<Uint8Array>,
+	reader: Reader,
 	onLine: ((line: string) => void) | undefined,
 ): Promise<string> {
 	const decoder = new TextDecoder();
 	const lines = lineSplitter(onLine);
 	let kept = '';
-	for await (const chunk of stream) {
-		const text = decoder.decode(chunk, { stream: true });
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		const text = decoder.decode(value, { stream: true });
 		kept = (kept + text).slice(-STDERR_KEEP);
 		lines.push(text);
 	}

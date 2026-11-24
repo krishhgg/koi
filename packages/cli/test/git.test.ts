@@ -175,10 +175,64 @@ describe('cliGit', () => {
 			return exec(['sleep', '600'], { ...options, timeoutMs: 200 });
 		});
 		const err = await g.fetchPullRequest(7).catch((e: unknown) => e);
-		expect(limits).toEqual([FETCH_TIMEOUT_MS]);
+		expect(limits.length).toBe(1);
+		expect(limits[0]).toBeLessThanOrEqual(FETCH_TIMEOUT_MS);
+		expect(limits[0]).toBeGreaterThan(FETCH_TIMEOUT_MS - 1000);
 		expect(FETCH_TIMEOUT_MS).toBe(5 * 60_000);
 		expect((err as Error).message).toBe('git fetch did not finish within 5 minutes');
 	});
+
+	// exec, except that the first git command whose arguments include `stall`
+	// never exits on its own, and every command's time limit is recorded.
+	function stalling(stall: string) {
+		const limits: Array<[string, number | undefined]> = [];
+		let stalled = false;
+		const run = (cmd: string[], options?: ExecOptions): Promise<ExecResult> => {
+			limits.push([cmd[3] ?? '', options?.timeoutMs]);
+			if (stalled || !cmd.includes(stall)) return exec(cmd, options);
+			stalled = true;
+			return exec(['sleep', '600'], options);
+		};
+		return { run, limits };
+	}
+
+	test('reads what it fetched within the same time limit as the fetch', async () => {
+		const o = await pullRequestOrigin();
+		const s = stalling('for-each-ref');
+		const g = cliGit(o.user, s.run);
+		await g.root();
+		s.limits.length = 0;
+		const started = performance.now();
+		const err = await g.fetchPullRequest(7, { timeoutMs: 1500 }).catch((e: unknown) => e);
+		expect(performance.now() - started).toBeLessThan(1500 + 1000);
+		expect((err as Error).message).toBe('git for-each-ref did not finish within 1.5 seconds');
+		expect(s.limits.map(([command]) => command)).toEqual(['fetch', 'for-each-ref']);
+		for (const [, limit] of s.limits) expect(limit).toBeLessThanOrEqual(1500);
+	}, 10_000);
+
+	test('tidies its refs only in the time the fetch has left, and still returns them', async () => {
+		const o = await pullRequestOrigin();
+		const s = stalling('update-ref');
+		const g = cliGit(o.user, s.run);
+		await g.root();
+		s.limits.length = 0;
+		const started = performance.now();
+		const refs = await g.fetchPullRequest(7, { timeoutMs: 1500 });
+		expect(performance.now() - started).toBeLessThan(1500 + 1000);
+		expect(refs).toEqual({
+			head: o.head7,
+			merge: { commit: o.merge7, parents: [o.base, o.head7] },
+		});
+		expect(s.limits.map(([command]) => command)).toEqual([
+			'fetch',
+			'for-each-ref',
+			'rev-parse',
+			'rev-parse',
+			'cat-file',
+			'update-ref',
+		]);
+		for (const [, limit] of s.limits) expect(limit).toBeLessThanOrEqual(1500);
+	}, 10_000);
 
 	test('show reads a file at a commit, or nothing', async () => {
 		const { dir } = await repo();

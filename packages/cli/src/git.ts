@@ -21,7 +21,8 @@ export interface Git {
 	// Fetches a pull request's refs from origin without touching local
 	// branches. A ref origin does not have comes back undefined; a fetch that
 	// fails (network, sign-in, a remote that is not there) throws, as does one
-	// that takes longer than `timeoutMs` (at most FETCH_TIMEOUT_MS).
+	// that, with reading what it fetched, takes longer than `timeoutMs` (at
+	// most FETCH_TIMEOUT_MS).
 	fetchPullRequest(pr: number, options?: { timeoutMs?: number }): Promise<PullRequestRefs>;
 	// The branches on origin and the commit each is at now, by name, as
 	// asked of origin without fetching anything. Throws when origin does not
@@ -60,6 +61,10 @@ export interface Git {
 	show(commit: string, path: string): Promise<string | undefined>;
 }
 
+// git run with a time limit shared by the commands of one operation: the
+// arguments after git -C <root>, and what the command printed.
+type Timed = (args: string[], options?: ExecOptions) => Promise<string>;
+
 // A pull request's refs on origin, as one fetch found them.
 export interface PullRequestRefs {
 	// refs/pull/N/head: the pull request's head commit. Undefined when origin
@@ -97,14 +102,39 @@ export function cliGit(
 	// For output that is used whole, however long: an error rather than a cut list.
 	const gitAll = async (...args: string[]) =>
 		(await ok(await at(args), { maxBytes: FULL_OUTPUT })).stdout;
+	// git, for the commands of one operation that must end within `limitMs`
+	// of starting it, as a fetch and the reads after it. They share one
+	// deadline on a clock that only moves forward: each is given the time
+	// left, none starts once it has passed, and an error names `limitMs`.
+	const within = (limitMs: number): Timed => {
+		const deadline = performance.now() + limitMs;
+		return async (args, options = {}) => {
+			const cmd = await at(args);
+			const left = Math.floor(deadline - performance.now());
+			const result =
+				left > 0
+					? await run(cmd, { ...options, timeoutMs: left })
+					: { code: -1, stdout: '', stderr: '', timedOut: true };
+			if (result.code !== 0 || result.timedOut) throw new ExecError(cmd, result, limitMs);
+			return result.stdout;
+		};
+	};
+	// Deletes refs of koi's own, in one command, within what `timed` has
+	// left. Tidying only: a ref left behind keeps its commits, and nothing
+	// reads it.
+	const deleteRefs = async (refs: string[], timed: Timed) => {
+		if (refs.length === 0) return;
+		const stdin = refs.map((ref) => `delete ${ref}\n`).join('');
+		await timed(['update-ref', '--stdin'], { stdin }).catch(() => {});
+	};
 	// A commit's parents as its object names them, from the raw object rather
 	// than rev-list or log. In a shallow checkout (actions/checkout fetches
 	// the pull request's merge at depth one) a commit at the shallow boundary
 	// has its parents hidden from the history walkers, but the object still
 	// lists them. The headers end at the first blank line; a signature's
 	// continuation lines start with a space, so none matches.
-	const parentsOf = async (commit: string) => {
-		const headers = (await git('cat-file', '-p', commit)).split('\n\n', 1)[0] ?? '';
+	const parentsOf = async (commit: string, timed: Timed) => {
+		const headers = (await timed(['cat-file', '-p', commit])).split('\n\n', 1)[0] ?? '';
 		return headers.split('\n').flatMap((line) => {
 			const parent = /^parent ([0-9a-f]{40})$/.exec(line)?.[1];
 			return parent !== undefined ? [parent] : [];
@@ -142,24 +172,26 @@ export function cliGit(
 			// failure, but a pattern that matches nothing is no error. So a failed
 			// fetch here always means git could not fetch, and a ref origin lacks
 			// is just missing afterwards.
+			//
+			// The fetch, the reads after it and the tidying all end within the
+			// one time limit.
+			const timed = within(fetchTimeout(options.timeoutMs));
 			const prefix = `refs/koi/pr-${pr}-${randomSuffix()}`;
-			const args = ['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${pr}/*:${prefix}/*`];
-			await ok(await at(args), { timeoutMs: fetchTimeout(options.timeoutMs) });
-			const fetched = (await git('for-each-ref', '--format=%(refname)', `${prefix}/`))
+			await timed(['fetch', '--quiet', '--no-tags', 'origin', `+refs/pull/${pr}/*:${prefix}/*`]);
+			const fetched = (await timed(['for-each-ref', '--format=%(refname)', `${prefix}/`]))
 				.split('\n')
 				.filter((r) => r !== '');
 			try {
 				const commitAt = async (name: string) =>
 					fetched.includes(`${prefix}/${name}`)
-						? (await git('rev-parse', '--verify', `${prefix}/${name}^{commit}`)).trim()
+						? (await timed(['rev-parse', '--verify', `${prefix}/${name}^{commit}`])).trim()
 						: undefined;
 				const head = await commitAt('head');
 				const merge = await commitAt('merge');
 				if (merge === undefined) return { head, merge: undefined };
-				return { head, merge: { commit: merge, parents: await parentsOf(merge) } };
+				return { head, merge: { commit: merge, parents: await parentsOf(merge, timed) } };
 			} finally {
-				// Tidying only: a ref left behind keeps its commits, and nothing reads it.
-				for (const ref of fetched) await git('update-ref', '-d', ref).catch(() => {});
+				await deleteRefs(fetched, timed);
 			}
 		},
 		async remoteBranchTips(options = {}) {
@@ -188,11 +220,12 @@ export function cliGit(
 			// --refmap= keeps git from also moving the clone's origin/<branch>,
 			// which it does for a branch named on the command line.
 			const args = ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+${ref}:${local}`];
+			const timed = within(FETCH_TIMEOUT_MS);
 			try {
-				await ok(await at(args), { timeoutMs: FETCH_TIMEOUT_MS });
-				return (await git('rev-parse', '--verify', `${local}^{commit}`)).trim();
+				await timed(args);
+				return (await timed(['rev-parse', '--verify', `${local}^{commit}`])).trim();
 			} finally {
-				await git('update-ref', '-d', local).catch(() => {});
+				await deleteRefs([local], timed);
 			}
 		},
 		async mergeCommit(base, head) {
@@ -270,10 +303,11 @@ export function cliGit(
 					'origin',
 					`+refs/pull/${pr}/merge:${ref}`,
 				];
+				const timed = within(FETCH_TIMEOUT_MS);
 				try {
-					await ok(await at(args), { timeoutMs: FETCH_TIMEOUT_MS });
+					await timed(args);
 				} finally {
-					await git('update-ref', '-d', ref).catch(() => {});
+					await deleteRefs([ref], timed);
 				}
 				r = await diff();
 				if (r.code !== 0)

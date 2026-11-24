@@ -48,7 +48,9 @@ drivers of yours, only the `.gitattributes` in the base's tree. A pull request t
 conflicts with its base has no merge, and koi stops before uploading and says to rebase
 or merge the base. Checking the merge against the base needs the base branch's name,
 which koi asks gh for, so a merge build needs gh installed and signed in. `--head`
-builds the head as pushed instead, and needs no gh.
+builds the head as pushed instead, and needs no gh. koi runs git and gh without a
+terminal, so neither can ask you for a password or passphrase: fetching from origin
+needs an SSH agent or a git credential helper that answers on its own.
 
 `koi up` prints the preview URL and, for projects with a login, the
 preview's login key, and the preview's keys page, `https://keys.previews.example.com/?for=<label>`.
