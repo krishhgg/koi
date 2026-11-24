@@ -63,6 +63,27 @@ describe('exec', () => {
 		expect(Date.now() - started).toBeLessThan(5_000);
 	});
 
+	test('lets an aborted process finish stopping past its time limit', async () => {
+		const stop = new AbortController();
+		const result = await exec(
+			[
+				'bash',
+				'-c',
+				"trap 'sleep 0.5; echo stopped; exit 3' TERM; echo up; while :; do sleep 0.1; done",
+			],
+			{
+				signal: stop.signal,
+				timeoutMs: 2_000,
+				onLine: (line) => {
+					if (line === 'up') setTimeout(() => stop.abort(), 1_800);
+				},
+			},
+		);
+		expect(result.timedOut).toBe(false);
+		expect(result.code).toBe(3);
+		expect(result.stdout).toBe('up\nstopped\n');
+	});
+
 	test('kills an aborted process that ignores SIGTERM once the grace ends', async () => {
 		const stop = new AbortController();
 		const started = Date.now();

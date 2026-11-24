@@ -56,6 +56,9 @@ export async function exec(cmd: string[], options: ExecOptions = {}): Promise<Ex
 				}, options.timeoutMs);
 	let killer: ReturnType<typeof setTimeout> | undefined;
 	const abort = () => {
+		// The grace below replaces the time limit: its SIGKILL could cut
+		// the shutdown short.
+		if (timer !== undefined) clearTimeout(timer);
 		proc.kill('SIGTERM');
 		killer = setTimeout(() => proc.kill('SIGKILL'), options.abortGraceMs ?? ABORT_GRACE_MS);
 	};
