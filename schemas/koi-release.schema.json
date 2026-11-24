@@ -1,0 +1,33 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://github.com/krishhgg/koi/schemas/v1/koi-release.schema.json",
+	"title": "koi release --json",
+	"description": "What koi release NAME LEASE --json prints once koid has ended the lease.",
+	"type": "object",
+	"properties": {
+		"schemaVersion": {
+			"type": "number",
+			"const": 1,
+			"description": "Changes only when koi removes a field or changes what one means. Adding an optional field keeps it."
+		},
+		"label": {
+			"type": "string",
+			"pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+		},
+		"leaseId": {
+			"type": "string",
+			"pattern": "^[a-z0-9]{16,40}$"
+		},
+		"released": {
+			"type": "boolean",
+			"const": true
+		}
+	},
+	"required": [
+		"schemaVersion",
+		"label",
+		"leaseId",
+		"released"
+	],
+	"additionalProperties": false
+}

@@ -68,7 +68,8 @@ while the previous deployment serves. For a live check, request `/__koi/health` 
 preview, which answers 200 only while the container runs and Caddy routes to it, or run
 `koi lease`, which refuses a preview that is not running. A verification run binds to
 `deployment` ([docs/verify.md](verify.md)). `koi list --json` carries the same two fields
-for each preview.
+for each preview. The JSON of `koi up`, `koi lease` and `koi release` also carries
+`schemaVersion`, and has a JSON Schema in `schemas/` (see the README).
 Running `up` again for the same name replaces the preview and keeps its URL.
 `koi list`, `koi logs NAME` and `koi down NAME` complete the set. `koi lease NAME
 --minutes N` holds a preview so no build replaces it: `koi up` for that name is refused

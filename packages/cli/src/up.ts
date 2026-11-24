@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
 	CTL_EXIT,
-	type DeploymentIdentity,
 	NO_SUCH_PREVIEW,
 	type PullRequestMerge,
 	previewHostLabel,
@@ -14,6 +13,7 @@ import {
 	UpAcceptedSchema,
 	type UpRequest,
 	UpRequestSchema,
+	type UpResult,
 } from '@koi/shared';
 import { type Box, BoxUnavailableError, type CtlResult, ctlErrorText } from './box.ts';
 import { ExecError } from './exec.ts';
@@ -47,27 +47,6 @@ export interface UpDeps {
 	randomId: () => string;
 	now: () => Date;
 	sleep: (ms: number) => Promise<void>;
-}
-
-export interface UpResult {
-	label: string;
-	url: string;
-	status: 'running' | 'failed';
-	// What koi built: for a pull request, GitHub's merge of it into its base,
-	// with the merge's parents in `merge`, or with --head the head as pushed.
-	commit: string;
-	pr?: number;
-	merge?: PullRequestMerge;
-	// The deployment serving the preview as koi up ended, absent while
-	// nothing serves. After a failed build it is the previous one, so a
-	// caller compares its commit with the one it asked for.
-	deployment?: DeploymentIdentity;
-	// For apps with a sign-in: the key the reviewer types to get in.
-	loginKey?: string;
-	// The preview's keys page (keysPageUrl).
-	keysUrl: string;
-	error?: string;
-	comment?: string;
 }
 
 // How long koi up waits for koid to start building a request queued behind
@@ -295,6 +274,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 			limits.buildTimeoutMinutes * 60_000 + limits.healthTimeoutSeconds * 1000 + BUILD_MARGIN_MS;
 		const { record, deployment } = await follow(label, request.id, buildMs, deps);
 		const result: UpResult = {
+			schemaVersion: 1,
 			label,
 			url,
 			status: record.status === 'running' ? 'running' : 'failed',

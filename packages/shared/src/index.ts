@@ -1,4 +1,14 @@
 export {
+	CLI_OUTPUT_SCHEMAS,
+	cliOutputSchemaFiles,
+	type LeaseResult,
+	LeaseResultSchema,
+	type ReleaseResult,
+	ReleaseResultSchema,
+	type UpResult,
+	UpResultSchema,
+} from './cli-output.ts';
+export {
 	type BuildLogPage,
 	BuildLogPageSchema,
 	CTL_EXIT,
