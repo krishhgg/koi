@@ -230,7 +230,7 @@ describe('run', () => {
 			runtime,
 		);
 		expect(json.code).toBe(0);
-		expect(JSON.parse(json.stdout)).toEqual(leaseReply);
+		expect(JSON.parse(json.stdout)).toEqual({ schemaVersion: 1, ...leaseReply });
 	});
 
 	test('lease names the local user and host as the holder when none is given', async () => {
@@ -251,7 +251,7 @@ describe('run', () => {
 		);
 		const r = await capture(['lease', 'hello-pr-7', '--minutes', '30', '--json'], runtime);
 		expect(r.code).toBe(0);
-		expect(JSON.parse(r.stdout)).toEqual(leaseReply);
+		expect(JSON.parse(r.stdout)).toEqual({ schemaVersion: 1, ...leaseReply });
 		// The visit goes to koid's health check for the preview, which starts
 		// a stopped one, until it answers 200; only then is the lease asked
 		// for. The wait is said on stderr.
@@ -324,7 +324,12 @@ describe('run', () => {
 		expect(plain).toEqual({ code: 0, stdout: `released ${id} on hello-pr-7\n`, stderr: '' });
 		expect(runtime.calls.at(-1)).toEqual(['release', 'hello-pr-7', id]);
 		const json = await capture(['release', 'hello-pr-7', id, '--json'], runtime);
-		expect(JSON.parse(json.stdout)).toEqual({ label: 'hello-pr-7', leaseId: id, released: true });
+		expect(JSON.parse(json.stdout)).toEqual({
+			schemaVersion: 1,
+			label: 'hello-pr-7',
+			leaseId: id,
+			released: true,
+		});
 		const gone = fakeRuntime({
 			release: { code: 1, stdout: '', stderr: '{"error":"no such lease"}' },
 		});
@@ -656,6 +661,7 @@ describe('run against koid through SSM', () => {
 		});
 		expect(r.code).toBe(0);
 		expect(JSON.parse(r.stdout)).toEqual({
+			schemaVersion: 1,
 			label: request?.label,
 			url: `https://${request?.label}.example.dev`,
 			status: 'running',
@@ -722,6 +728,7 @@ describe('run against koid through SSM', () => {
 		const j = await capture(['up', '--pr', '7', '--json'], runtime);
 		expect(j.code).toBe(0);
 		expect(JSON.parse(j.stdout)).toMatchObject({
+			schemaVersion: 1,
 			label: 'hello-pr-7',
 			commit: o.merge7,
 			pr: 7,

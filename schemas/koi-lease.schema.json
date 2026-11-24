@@ -1,0 +1,110 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://github.com/krishhgg/koi/schemas/v1/koi-lease.schema.json",
+	"title": "koi lease --json",
+	"description": "What koi lease NAME --minutes N --json prints: the lease koid took on the preview and the deployment it holds.",
+	"type": "object",
+	"properties": {
+		"schemaVersion": {
+			"type": "number",
+			"const": 1,
+			"description": "Changes only when koi removes a field or changes what one means. Adding an optional field keeps it."
+		},
+		"lease": {
+			"type": "object",
+			"properties": {
+				"leaseId": {
+					"type": "string",
+					"pattern": "^[a-z0-9]{16,40}$"
+				},
+				"deploymentId": {
+					"type": "string",
+					"pattern": "^[a-z0-9]{16,40}$"
+				},
+				"holder": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 200
+				},
+				"acquiredAt": {
+					"type": "string",
+					"format": "date-time",
+					"pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+				},
+				"expiresAt": {
+					"type": "string",
+					"format": "date-time",
+					"pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+				}
+			},
+			"required": [
+				"leaseId",
+				"deploymentId",
+				"holder",
+				"acquiredAt",
+				"expiresAt"
+			],
+			"additionalProperties": false,
+			"description": "The lease koid took. While it lasts koid refuses a build of the preview, and koi down needs --force."
+		},
+		"deployment": {
+			"type": "object",
+			"properties": {
+				"label": {
+					"type": "string",
+					"pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+				},
+				"deploymentId": {
+					"type": "string",
+					"pattern": "^[a-z0-9]{16,40}$"
+				},
+				"imageDigest": {
+					"type": "string",
+					"pattern": "^sha256:[0-9a-f]{64}$"
+				},
+				"commit": {
+					"type": "string",
+					"pattern": "^[0-9a-f]{40}$"
+				},
+				"merge": {
+					"type": "object",
+					"properties": {
+						"head": {
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"base": {
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"baseBranch": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 255
+						}
+					},
+					"required": [
+						"head",
+						"base",
+						"baseBranch"
+					],
+					"additionalProperties": false
+				}
+			},
+			"required": [
+				"label",
+				"deploymentId",
+				"imageDigest",
+				"commit"
+			],
+			"additionalProperties": false,
+			"description": "The deployment the lease holds. A caller stops when it is not the one koi up returned."
+		}
+	},
+	"required": [
+		"schemaVersion",
+		"lease",
+		"deployment"
+	],
+	"additionalProperties": false
+}

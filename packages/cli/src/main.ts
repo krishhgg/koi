@@ -3,10 +3,12 @@ import { hostname, userInfo } from 'node:os';
 import {
 	escapeControls,
 	LeaseReplySchema,
+	type LeaseResult,
 	LOG_TEXT_MAX,
 	logCutNote,
 	PreviewListPageSchema,
 	type PreviewSummary,
+	type ReleaseResult,
 	randomId,
 } from '@koi/shared';
 import { parseCli, USAGE } from './args.ts';
@@ -224,7 +226,8 @@ export async function run(
 					JSON.parse(await ctlOk(box, ['lease', label, '--holder', holder, '--ttl-seconds', ttl])),
 				);
 				if (cli.json) {
-					io.stdout(`${JSON.stringify(reply)}\n`);
+					const result: LeaseResult = { schemaVersion: 1, ...reply };
+					io.stdout(`${JSON.stringify(result)}\n`);
 				} else {
 					const { lease, deployment } = reply;
 					io.stdout(
@@ -244,11 +247,8 @@ export async function run(
 				const label = cli.label as string;
 				const leaseId = cli.leaseId as string;
 				await ctlOk(box, ['release', label, leaseId]);
-				io.stdout(
-					cli.json
-						? `${JSON.stringify({ label, leaseId, released: true })}\n`
-						: `released ${leaseId} on ${label}\n`,
-				);
+				const result: ReleaseResult = { schemaVersion: 1, label, leaseId, released: true };
+				io.stdout(cli.json ? `${JSON.stringify(result)}\n` : `released ${leaseId} on ${label}\n`);
 				return 0;
 			}
 			case 'down': {

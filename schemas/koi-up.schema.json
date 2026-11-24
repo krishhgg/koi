@@ -1,0 +1,147 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://github.com/krishhgg/koi/schemas/v1/koi-up.schema.json",
+	"title": "koi up --json",
+	"description": "What koi up --json prints once the build has finished. koi exits 0 when status is running and 1 when it is failed.",
+	"type": "object",
+	"properties": {
+		"schemaVersion": {
+			"type": "number",
+			"const": 1,
+			"description": "Changes only when koi removes a field or changes what one means. Adding an optional field keeps it."
+		},
+		"label": {
+			"type": "string",
+			"pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+			"description": "The preview's name, the first label of its hostname."
+		},
+		"url": {
+			"type": "string",
+			"pattern": "^https:\\/\\/",
+			"description": "The preview's address."
+		},
+		"status": {
+			"type": "string",
+			"enum": [
+				"running",
+				"failed"
+			],
+			"description": "How the build koi up asked for ended: running once it deployed, failed when it did not. It does not say whether the container is up now."
+		},
+		"commit": {
+			"type": "string",
+			"pattern": "^[0-9a-f]{40}$",
+			"description": "What koi built: for a pull request, GitHub's merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit."
+		},
+		"pr": {
+			"description": "The pull request built, with --pr.",
+			"type": "integer",
+			"exclusiveMinimum": 0,
+			"maximum": 9007199254740991
+		},
+		"merge": {
+			"description": "The parents of the merge in commit, when koi built GitHub's merge of a pull request. Absent for a working tree and with --head.",
+			"type": "object",
+			"properties": {
+				"head": {
+					"type": "string",
+					"pattern": "^[0-9a-f]{40}$"
+				},
+				"base": {
+					"type": "string",
+					"pattern": "^[0-9a-f]{40}$"
+				},
+				"baseBranch": {
+					"type": "string",
+					"minLength": 1,
+					"maxLength": 255
+				}
+			},
+			"required": [
+				"head",
+				"base"
+			],
+			"additionalProperties": false
+		},
+		"deployment": {
+			"description": "The deployment serving the preview as koi up ended, absent while nothing serves. After a failed build it is the previous one, so a caller compares deployment.commit with commit.",
+			"type": "object",
+			"properties": {
+				"label": {
+					"type": "string",
+					"pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+				},
+				"deploymentId": {
+					"type": "string",
+					"pattern": "^[a-z0-9]{16,40}$"
+				},
+				"imageDigest": {
+					"type": "string",
+					"pattern": "^sha256:[0-9a-f]{64}$"
+				},
+				"commit": {
+					"type": "string",
+					"pattern": "^[0-9a-f]{40}$"
+				},
+				"merge": {
+					"type": "object",
+					"properties": {
+						"head": {
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"base": {
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"baseBranch": {
+							"type": "string",
+							"minLength": 1,
+							"maxLength": 255
+						}
+					},
+					"required": [
+						"head",
+						"base",
+						"baseBranch"
+					],
+					"additionalProperties": false
+				}
+			},
+			"required": [
+				"label",
+				"deploymentId",
+				"imageDigest",
+				"commit"
+			],
+			"additionalProperties": false
+		},
+		"loginKey": {
+			"description": "For apps with a sign-in, the key a reviewer types to get in. A secret: never copy it into evidence or logs.",
+			"type": "string",
+			"pattern": "^koi-[a-z0-9]{24}$"
+		},
+		"keysUrl": {
+			"type": "string",
+			"pattern": "^https:\\/\\/",
+			"description": "The preview's keys page, where a reviewer registers provider keys and gets koi tokens that work only in this preview."
+		},
+		"error": {
+			"description": "Why the build failed, when status is failed.",
+			"type": "string"
+		},
+		"comment": {
+			"description": "With --comment, the address of the pull request comment koi posted or updated.",
+			"type": "string"
+		}
+	},
+	"required": [
+		"schemaVersion",
+		"label",
+		"url",
+		"status",
+		"commit",
+		"keysUrl"
+	],
+	"additionalProperties": false
+}

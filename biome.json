@@ -11,7 +11,8 @@
 			"**",
 			"!!**/fixtures",
 			"!!host/recorder/package-lock.json",
-			"!!host/recorder/seccomp.json"
+			"!!host/recorder/seccomp.json",
+			"!!schemas"
 		]
 	},
 	"formatter": {

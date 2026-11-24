@@ -2,14 +2,14 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { deploymentIdentity, type PreviewRecord, type UpRequest } from '@koi/shared';
+import { deploymentIdentity, type PreviewRecord, type UpRequest, type UpResult } from '@koi/shared';
 import { type BuildLog, BuildLogs } from '../../daemon/src/buildlog.ts';
 import { awsBox, type Box, BoxUnavailableError, type CtlResult } from '../src/box.ts';
 import { exec, OutputTooLargeError } from '../src/exec.ts';
 import { cliGit, type Git } from '../src/git.ts';
 import type { GitHub } from '../src/github.ts';
 import { ghCli, ownerRepoFor } from '../src/github.ts';
-import { builtFrom, type UpDeps, type UpResult, up } from '../src/up.ts';
+import { builtFrom, type UpDeps, up } from '../src/up.ts';
 import { koidClients, koidDeps, previewRecord, s3Stub, settings } from './koid.ts';
 import { asGitHub, pullRequestOrigin, shallowCheckout } from './pulls.ts';
 
@@ -272,6 +272,7 @@ describe('up from the working tree', () => {
 		]);
 		expect(lines).toEqual(['a', 'b', 'c', 'ready']);
 		expect(result).toEqual({
+			schemaVersion: 1,
 			label: request?.label ?? '',
 			url: `https://${request?.label}.previews.example.net`,
 			status: 'running',
