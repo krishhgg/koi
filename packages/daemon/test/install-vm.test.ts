@@ -314,6 +314,8 @@ describe('host/install-vm.sh, run whole', () => {
 			['KOI_DNS_API_TOKEN=\nKOI_DNS_API_TOKEN="x"', 0],
 			["KOI_DNS_API_TOKEN='x'", 0],
 			['KOI_DNS_API_TOKEN=  x', 0],
+			['KOI_DNS_API_TOKEN =x', 0],
+			['KOI_DNS_API_TOKEN=x\nKOI_DNS_API_TOKEN =', 2],
 		] as const) {
 			const b = await box();
 			await mkdir(join(b.dir, 'etc/koi/caddy'));
@@ -391,6 +393,15 @@ describe('host/install-vm.sh, run whole', () => {
 				caddyUnit(
 					'/usr/bin/caddy run --config /etc/caddy/Caddyfile --watch # --config /var/lib/koi-caddy/Caddyfile',
 				),
+				'caddy.service runs another Caddy or config',
+			],
+			[
+				// A masked unit, or a systemd that does not answer.
+				'systemctl() { case "$*" in \'show -P LoadState caddy.service\') echo masked ;; show*) ;; *) echo "systemctl $*" >> "$calls" ;; esac; }',
+				'caddy.service runs another Caddy or config',
+			],
+			[
+				'systemctl() { case $1 in show) return 1 ;; *) echo "systemctl $*" >> "$calls" ;; esac; }',
 				'caddy.service runs another Caddy or config',
 			],
 		] as const) {

@@ -153,8 +153,10 @@ check_caddy() {
 		*) found='the caddy package is installed' ;;
 		esac
 	fi
-	# The unit systemd runs, wherever its file is and with any drop-in.
-	if [ -z "$found" ] && [ "$(systemctl show -P LoadState caddy.service 2>/dev/null)" = loaded ] &&
+	# The unit systemd runs, wherever its file is and with any drop-in. Only
+	# none at all, or koi's, goes on; a masked or broken unit, or no answer
+	# from systemd, stops here.
+	if [ -z "$found" ] && [ "$(systemctl show -P LoadState caddy.service 2>/dev/null)" != not-found ] &&
 		[[ $(systemctl show -P ExecStart caddy.service 2>/dev/null) != *" $KOI_CADDY_START "* ]]; then
 		found='caddy.service runs another Caddy or config'
 	fi
@@ -231,7 +233,7 @@ check_dns_env() {
 	case $TLS in acme-dns:*) ;; *) return 0 ;; esac
 	grep -qF '{env.KOI_DNS_API_TOKEN}' "$DNS_FILE" || return 0
 	# systemd takes the last assignment, quoted or not.
-	grep -E '^[[:space:]]*KOI_DNS_API_TOKEN=' "$CADDY_ENV" | tail -n 1 |
+	grep -E '^[[:space:]]*KOI_DNS_API_TOKEN[[:space:]]*=' "$CADDY_ENV" | tail -n 1 |
 		grep -Eq "=[[:space:]]*[\"']?[^\"'[:space:]]" && return 0
 	{
 		echo "koi: the DNS provider's API token is not set. Caddy refuses koid's config without"
