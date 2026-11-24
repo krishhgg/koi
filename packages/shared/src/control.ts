@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { LeaseSchema, PreviewLabelSchema, PreviewRecordSchema } from './preview.ts';
+import { DeploymentSliceSchema } from './recipe.ts';
 import { DeploymentIdentitySchema } from './verify.ts';
 
 // What `koid ctl` prints on stdout as JSON, for the CLI to parse. The CLI
@@ -95,11 +96,16 @@ export type BuildLogPage = z.infer<typeof BuildLogPageSchema>;
 // `koid ctl status <label> [attempt [offset]]`: the label's record and, with
 // an attempt, lines of that attempt's build log. The record leaves out the deployment,
 // whose environment can be large; `deployment` is the identity of the one
-// serving (deploymentIdentity), absent while nothing serves.
+// serving (deploymentIdentity), absent while nothing serves. `slice` is what
+// that deployment's build kept (DeploymentSliceSchema), when its recipe
+// reports one. It comes only in a reply with no log lines for a record no
+// longer queued or building, where it has room under SSM's limit: koi up's
+// last read, once the log has been read to its end, is one.
 export const StatusReplySchema = z.object({
 	record: PreviewRecordSchema.omit({ deployment: true }),
 	log: BuildLogPageSchema,
 	deployment: DeploymentIdentitySchema.optional(),
+	slice: DeploymentSliceSchema.optional(),
 });
 
 export type StatusReply = z.infer<typeof StatusReplySchema>;

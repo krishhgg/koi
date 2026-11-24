@@ -464,6 +464,44 @@ A recipe may keep data of its own for its build scripts under `slice` in
 checks only that the field is a JSON object of at most 64 KiB (`RecipeSliceSchema` in
 `packages/shared/src/recipe.ts`). The recipe's own tests check the shape.
 
+A built-in recipe that cuts the build down can report what it kept. `sliceFile` in its
+`recipe.json` names an absolute path in the image, where the build writes a JSON object
+of the recipe's own shape. Once the image is built, and before the container starts,
+koid creates a container from the image without starting it, reads the file through
+`docker cp CONTAINER:PATH -`, and removes the container. That prints a tar archive,
+which koid stops reading past 72 KiB and parses in memory; nothing from the image is
+written to the box's disk. koid takes only an archive of one regular file, with valid
+header checksums and octal sizes, and a PAX header before it only when no record sets
+the size or makes the file sparse. It refuses a symlink, a directory or any other
+entry, a file over 64 KiB, text that is not UTF-8, and anything but a JSON object of at
+most 16 KiB (`DeploymentSliceSchema`). Each of those fails the build, as a missing
+file does. If the container will not go, koid logs it and the build goes on; reconcile
+removes it with the other leftovers when koid next starts. koid
+keeps the object on the deployment, and `koi up --json` returns it as `slice`, beside
+the `deployment` it describes. koi never reads inside it. The build that wrote it ran
+the pull request's code, so it is what the recipe's scripts said, not something koi
+checked.
+
+The `slice` reaches the CLI in `koid ctl status`. It comes only in a reply with no log
+lines, for a record no longer queued or building, so a reply never carries both a page
+of log and a slice, and polls during a build carry neither the old nor the new one. The
+largest such reply, with a 16 KiB slice, a 2,000-character error and the longest
+branch, lease holder and base branch, is about 21,400 characters, under SSM's 24,000.
+
+`koi up --keep NAME` (repeatable, at most 32) asks such a recipe to keep NAME whatever
+the change touched. koi gives the name no meaning; the recipe decides what it names,
+such as a node. Each name is 1 to 64 letters, digits, dots, dashes and underscores,
+starting with a letter or digit (`KeepSchema` in `packages/shared/src/request.ts`).
+The CLI checks them, and koid checks the request again. koid passes them to the build
+as one build argument, `KOI_KEEP`, the names joined by single spaces, given to `docker
+buildx` as an argument and never through a shell. A recipe without a `sliceFile` does
+not take `--keep`: the CLI refuses it before uploading, and koid refuses the request,
+because only a slice can show the caller what was kept. A koid older than the CLI drops
+`keep` from the request and returns no `slice`. No reply of koid's gives its version
+before the upload, so koi up finds out after the build: with `--keep` and no `slice`,
+it reports `failed`, with an error saying koid did not apply `--keep`, and exits 1.
+Without `--keep`, an older koid works as before.
+
 A recipe's Dockerfile runs pull request code, so no cache is shared between pull
 requests: one pull request's code could poison it for the next. A test checks every
 built-in recipe's Dockerfile for a writable `--mount=type=cache` and for writable bind

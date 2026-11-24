@@ -33,6 +33,21 @@ describe('parseCli', () => {
 		expect(() => parseCli(['up', '--head'])).toThrow(/--head needs --pr/);
 	});
 
+	test('--keep takes names for up, each once, at most 32', () => {
+		expect(parseCli(['up', '--keep', 'llm_openai', '--keep', 'agent.v2-x']).keep).toEqual([
+			'llm_openai',
+			'agent.v2-x',
+		]);
+		expect(parseCli(['up']).keep).toBeUndefined();
+		for (const bad of ['', '-x', '.x', 'a b', 'a;b', '$(x)', 'a/b', 'x'.repeat(65)]) {
+			expect(() => parseCli(['up', `--keep=${bad}`])).toThrow(/--keep expects a name/);
+		}
+		expect(() => parseCli(['up', '--keep', 'a', '--keep', 'a'])).toThrow(/each once/);
+		const many = Array.from({ length: 33 }, (_, i) => ['--keep', `n${i}`]).flat();
+		expect(() => parseCli(['up', ...many])).toThrow(/at most 32 names/);
+		expect(() => parseCli(['list', '--keep', 'a'])).toThrow(/--keep goes with up/);
+	});
+
 	test('--tail takes 1 to 5000 lines, the most koid gives', () => {
 		expect(parseCli(['logs', 'a', '--tail', '50']).tail).toBe(50);
 		expect(parseCli(['logs', 'a']).tail).toBe(200);

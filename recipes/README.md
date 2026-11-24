@@ -25,5 +25,17 @@ such as what a preview keeps of the project. koi never reads it and checks only 
 is a JSON object of at most 64 KiB. The Dockerfile gets the file with
 `COPY --from=recipe recipe.json`.
 
+A recipe that cuts the build down can report what it kept: `sliceFile` in `recipe.json`
+names an absolute path in the image, such as `/opt/app/koi-slice.json`, where the build
+writes a JSON object of at most 16 KiB, in a shape the recipe defines. koid reads it
+from the built image before the container starts, fails the build when it is missing
+or not such an object, and `koi up --json` returns it as `slice`. Such a recipe also
+takes `koi up --keep NAME`: the build gets the names as the build argument `KOI_KEEP`,
+joined by single spaces. Declare it with `ARG KOI_KEEP` in the stage that reads it, and
+read it from the environment (a RUN step sees it as `$KOI_KEEP`); the names hold only
+letters, digits, dots, dashes and underscores. The recipe decides what a name means,
+and should fail the build on one it does not know. See Recipes in
+[docs/design.md](../docs/design.md).
+
 Everything in a recipe's directory goes to the box and into the `recipe` build context,
 so keep its tests and fixtures out of it, under `packages/<package>/test/<name>/`.

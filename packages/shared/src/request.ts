@@ -25,6 +25,29 @@ export const RepoIdSchema = z
 
 export const CommitSchema = z.string().regex(/^[0-9a-f]{40}$/);
 
+// A name koi up --keep passes to the recipe: something its slice keeps
+// whatever the pull request changed, which the recipe alone gives a meaning
+// (a node, say). Letters, digits, dots, dashes and underscores, starting
+// with a letter or digit, so a recipe's build may put it on a command line
+// or in a file without quoting.
+export const KEEP_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+export const MAX_KEEP = 32;
+
+export const KeepNameSchema = z
+	.string()
+	.regex(
+		KEEP_NAME,
+		'1 to 64 letters, digits, dots, dashes and underscores, from a letter or digit',
+	);
+
+// The names, each once. koid hands them to the build as the build argument
+// KOI_KEEP, joined by single spaces.
+export const KeepSchema = z
+	.array(KeepNameSchema)
+	.min(1)
+	.max(MAX_KEEP)
+	.refine((names) => new Set(names).size === names.length, 'each name once');
+
 export const UpRequestSchema = z.object({
 	version: z.literal(1),
 	id: RequestIdSchema,
@@ -39,6 +62,9 @@ export const UpRequestSchema = z.object({
 	merge: PullRequestMergeSchema.optional(),
 	// The working tree had changes not in `commit`.
 	dirty: z.boolean(),
+	// koi up --keep: names the recipe's slice keeps (KeepSchema). Only for a
+	// built-in recipe with a sliceFile, whose slice says what it kept.
+	keep: KeepSchema.optional(),
 	recipe: z.discriminatedUnion('kind', [
 		z.object({ kind: z.literal('builtin'), name: ProjectNameSchema }),
 		z.object({ kind: z.literal('repo'), recipe: RepoRecipeSchema }),

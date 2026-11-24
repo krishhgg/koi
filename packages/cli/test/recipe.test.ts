@@ -27,7 +27,16 @@ describe('resolveRecipe', () => {
 			project: 'storefront',
 			recipe: { kind: 'builtin', name: 'storefront' },
 			limits: { buildTimeoutMinutes: 45, healthTimeoutSeconds: 180 },
+			reportsSlice: false,
 		});
+		// One with a sliceFile reports its slice, and so takes --keep.
+		const reporting = RecipeSchema.parse({ ...builtin, sliceFile: '/app/koi-slice.json' });
+		const withSlice = await resolveRecipe(
+			'github.com/storefront-org/storefront-server',
+			[reporting],
+			files({}),
+		);
+		expect(withSlice.reportsSlice).toBe(true);
 	});
 
 	test('a built-in recipe also wins for a fork, by a * owner in its match list', async () => {

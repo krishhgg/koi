@@ -945,6 +945,32 @@ describe('--json output matches the JSON Schemas in schemas/', () => {
 		);
 	});
 
+	test("up, with the slice the deployment's recipe reported, through koid ctl and the control API", async () => {
+		const slice = {
+			schemaVersion: 1,
+			nodes: { core: ['core'], llm_openai: ['changed'], parse: ['dependency'] },
+			neededBy: { parse: ['autopipe'] },
+			apps: ['rocketride.pipeBuilder'],
+		};
+		const r = await upThroughKoid((request) =>
+			previewRecord({
+				label: request.label,
+				requestId: request.id,
+				commit: request.commit,
+				status: 'running',
+				deployment: deployment({ requestId: request.id, commit: request.commit, slice }),
+			}),
+		);
+		expect(r.code).toBe(0);
+		const out = JSON.parse(r.stdout);
+		expect(schemaErrors('koi-up', out)).toEqual([]);
+		expect(out.slice).toEqual(slice);
+		// Anything but a JSON object there does not match.
+		expect(schemaErrors('koi-up', { ...out, slice: ['core'] })).toContainEqual(
+			expect.objectContaining({ instancePath: '/slice', keyword: 'type' }),
+		);
+	});
+
 	test('up, for a failed build while the previous deployment serves', async () => {
 		const previous = 'b'.repeat(40);
 		const r = await upThroughKoid((request) =>

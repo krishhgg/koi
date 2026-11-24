@@ -8,6 +8,9 @@ import {
 	PreviewRecordSchema,
 } from '../src/preview.ts';
 import {
+	DeploymentSliceSchema,
+	ImagePathSchema,
+	MAX_DEPLOYMENT_SLICE_BYTES,
 	MAX_PROJECT_NAME,
 	MAX_RECIPE_SLICE_BYTES,
 	parsedJsonBytes,
@@ -230,6 +233,73 @@ describe('RecipeSchema', () => {
 		expect(withRepos(['github.com/*/storefront-*'])).toBe(false);
 		expect(withRepos(['github.com/Acme/App'])).toBe(false);
 		expect(withRepos([''])).toBe(false);
+	});
+});
+
+describe('sliceFile and the slice it reports', () => {
+	test('a built-in recipe may name an absolute path in its image; a koi.yaml may not', () => {
+		const recipe = RecipeSchema.parse({
+			name: 'storefront',
+			build: { kind: 'dockerfile', from: 'recipe' },
+			port: 8080,
+			sliceFile: '/opt/rocketride/koi-slice.json',
+		});
+		expect(recipe.sliceFile).toBe('/opt/rocketride/koi-slice.json');
+		const repo = RepoRecipeSchema.parse({
+			build: { kind: 'dockerfile' },
+			port: 8080,
+			sliceFile: '/opt/app/koi-slice.json',
+		});
+		expect('sliceFile' in repo).toBe(false);
+	});
+
+	test('the path is absolute, plain and has no . or .. segment', () => {
+		for (const good of ['/koi-slice.json', '/opt/app_1/koi-slice.v1.json']) {
+			expect(ImagePathSchema.safeParse(good).success).toBe(true);
+		}
+		for (const bad of [
+			'koi-slice.json',
+			'/opt/../etc/passwd',
+			'/opt/./x',
+			'/opt//x',
+			'/opt/x/',
+			'/opt/a b',
+			'/opt/x;rm',
+			'/opt/$(x)',
+			'/opt/x:y',
+			`/${'x'.repeat(255)}`,
+		]) {
+			expect(ImagePathSchema.safeParse(bad).success).toBe(false);
+		}
+	});
+
+	test('the slice is a JSON object of at most 16 KiB, kept as given', () => {
+		const slice = JSON.parse('{"nodes":{"core":["core"]},"__proto__":{"x":1}}');
+		const parsed = DeploymentSliceSchema.parse(slice);
+		expect(parsed).toBe(slice);
+		expect(Object.hasOwn(parsed, '__proto__')).toBe(true);
+		const room = MAX_DEPLOYMENT_SLICE_BYTES - '{"k":""}'.length;
+		expect(DeploymentSliceSchema.safeParse({ k: 'x'.repeat(room) }).success).toBe(true);
+		expect(DeploymentSliceSchema.safeParse({ k: 'x'.repeat(room + 1) }).success).toBe(false);
+		for (const bad of [[], 'core', 1, null, { n: Number.NaN }, { f: () => 1 }]) {
+			expect(DeploymentSliceSchema.safeParse(bad).success).toBe(false);
+		}
+		// A deployment keeps it; one without it still parses.
+		const deployment = {
+			requestId: 'a'.repeat(16),
+			commit: 'c'.repeat(40),
+			image: 'koi-preview/hello:a',
+			container: 'koi-hello-a',
+			port: 8080,
+			healthPath: '/',
+			healthTimeoutSeconds: 60,
+			user: '65534:65534',
+			env: {},
+			deployedAt: '2026-10-06T00:00:00.000Z',
+		};
+		expect(DeploymentSchema.parse({ ...deployment, slice: { a: 1 } }).slice).toEqual({ a: 1 });
+		expect(DeploymentSchema.parse(deployment).slice).toBeUndefined();
+		expect(DeploymentSchema.safeParse({ ...deployment, slice: ['a'] }).success).toBe(false);
 	});
 });
 

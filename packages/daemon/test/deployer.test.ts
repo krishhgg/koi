@@ -3491,3 +3491,105 @@ describe('login keys and the secret registry', () => {
 		expect((await t.store.get(r.label))?.loginKey).toBe(record?.loginKey ?? '');
 	});
 });
+
+describe('a recipe that reports its slice', () => {
+	const sliceFile = '/opt/app/koi-slice.json';
+	const kept = { nodes: { core: ['core'], llm_openai: ['keep'] }, apps: ['home'] };
+
+	test('keeps what its build wrote to the sliceFile on the deployment, read before the container starts', async () => {
+		const t = await setup({ builtin: builtinRecipe({ sliceFile }) });
+		t.docker.imageFiles.set(sliceFile, `${JSON.stringify(kept, null, 2)}\n`);
+		await t.up(request({ recipe: { kind: 'builtin', name: 'storefront' } }));
+		const record = await t.store.get('hello-pr-7');
+		expect(record?.status).toBe('running');
+		expect(record?.deployment?.slice).toEqual(kept);
+		const read = t.docker.imageFileReads[0];
+		expect(read).toMatchObject({
+			image: 'koi-preview/hello-pr-7:aaaaaaaaaaaaaaaa1',
+			path: sliceFile,
+			name: 'koi-hello-pr-7-aaaaaaaaaaaaaaaa1.reader',
+			labels: { 'koi.preview': 'hello-pr-7', 'koi.request': 'aaaaaaaaaaaaaaaa1' },
+		});
+		expect(t.docker.runs).toHaveLength(1);
+		expect(await readFile(logPath(t.stateDir, record), 'utf8')).toContain(
+			`read the slice from ${sliceFile}`,
+		);
+		// No --keep: the build gets no build arguments.
+		expect(t.docker.builds[0]?.buildArgs).toBeUndefined();
+	});
+
+	test('fails the build, before any container starts, when the file is missing or not a small JSON object', async () => {
+		for (const [text, why] of [
+			[undefined, 'no such file'],
+			['not json', 'is not JSON'],
+			['["core"]', 'is not a JSON object of at most 16384 bytes'],
+			[JSON.stringify({ big: 'x'.repeat(17 * 1024) }), 'at most 16384 bytes as JSON'],
+		] as const) {
+			const t = await setup({ builtin: builtinRecipe({ sliceFile }) });
+			if (text !== undefined) t.docker.imageFiles.set(sliceFile, text);
+			await t.up(request({ recipe: { kind: 'builtin', name: 'storefront' } }));
+			const record = await t.store.get('hello-pr-7');
+			expect(record?.status).toBe('failed');
+			expect(record?.error).toContain(`the recipe's sliceFile ${sliceFile}`);
+			expect(record?.error).toContain(why);
+			expect(record?.deployment).toBeUndefined();
+			expect(t.docker.runs).toHaveLength(0);
+			expect(t.docker.images.size).toBe(0);
+		}
+	});
+
+	test('logs a reader docker would not remove, and reconcile removes it when koid next starts', async () => {
+		const t = await setup({ builtin: builtinRecipe({ sliceFile }) });
+		t.docker.imageFiles.set(sliceFile, JSON.stringify(kept));
+		await t.up(request({ recipe: { kind: 'builtin', name: 'storefront' } }));
+		const read = t.docker.imageFileReads[0];
+		const preview = t.docker.runs[0];
+		if (read === undefined || preview === undefined) throw new Error('no read or no run');
+		read.log(`removing ${read.name}: docker rm exited 1: device or resource busy`);
+		expect(t.logs).toContain(`removing ${read.name}: docker rm exited 1: device or resource busy`);
+		// The reader as docker create left it: labelled as the preview's.
+		await t.docker.run({ ...preview, name: read.name, labels: read.labels });
+		await t.restart().reconcile();
+		expect(t.docker.containers.has(read.name)).toBe(false);
+		expect(t.docker.containers.has(preview.name)).toBe(true);
+	});
+
+	test('a recipe without one reads nothing from the image', async () => {
+		const t = await setup({ builtin: builtinRecipe() });
+		await t.up(request({ recipe: { kind: 'builtin', name: 'storefront' } }));
+		const record = await t.store.get('hello-pr-7');
+		expect(record?.status).toBe('running');
+		expect(record?.deployment?.slice).toBeUndefined();
+		expect(t.docker.imageFileReads).toEqual([]);
+	});
+
+	test('hands the --keep names to the build as KOI_KEEP, joined by spaces', async () => {
+		const t = await setup({ builtin: builtinRecipe({ sliceFile }) });
+		t.docker.imageFiles.set(sliceFile, JSON.stringify(kept));
+		await t.up(
+			request({
+				recipe: { kind: 'builtin', name: 'storefront' },
+				keep: ['llm_openai', 'agent_rocketride'],
+			}),
+		);
+		expect((await t.store.get('hello-pr-7'))?.status).toBe('running');
+		expect(t.docker.builds[0]?.buildArgs).toEqual({ KOI_KEEP: 'llm_openai agent_rocketride' });
+	});
+
+	test('refuses --keep for a recipe that does not report its slice, before recording anything', async () => {
+		const { UnsupportedRequestError } = await import('../src/deployer.ts');
+		for (const [builtin, recipe] of [
+			[builtinRecipe(), { kind: 'builtin', name: 'storefront' }],
+			[undefined, undefined],
+		] as const) {
+			const t = await setup(builtin === undefined ? {} : { builtin });
+			const r = request({ keep: ['llm_openai'], ...(recipe !== undefined ? { recipe } : {}) });
+			const refused = await t.up(r).catch((err: unknown) => err);
+			expect(refused).toBeInstanceOf(UnsupportedRequestError);
+			expect(String(refused)).toContain('koi up --keep needs a recipe that reports its slice');
+			expect(await t.store.get('hello-pr-7')).toBeUndefined();
+			expect(t.docker.builds).toEqual([]);
+			expect(t.uploadEvents).toEqual([]);
+		}
+	});
+});

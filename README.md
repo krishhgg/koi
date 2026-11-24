@@ -16,6 +16,7 @@ koi up                    # build this working tree (uncommitted changes include
 koi up --pr 2518          # build pull request 2518 merged into its base branch
 koi up --pr 2518 --head   # ...the head as pushed instead, not merged
 koi up --pr 2518 --comment   # ...and post or update the preview link on the PR
+koi up --pr 2518 --keep llm_openai   # ...and have the recipe's slice keep llm_openai too
 koi list                  # previews on the box
 koi logs NAME [--build]   # container log, or the last build's log
 koi lease NAME --minutes N   # hold a preview so no build replaces it, for N minutes
@@ -27,7 +28,11 @@ Add `--json` to any command for machine-readable output on stdout; progress goes
 stderr. Exit codes: 0 success, 1 failure, 2 bad usage.
 
 The JSON that `koi up`, `koi lease` and `koi release` print carries `schemaVersion`, now
-1 for each command. [schemas/](schemas/) holds a JSON Schema (draft 2020-12) of each,
+1 for each command. For a recipe that reports what its slice kept, `koi up` also prints
+`slice`: the JSON object the recipe's build wrote, whose shape the recipe defines. It
+describes `deployment`, which after a failed rebuild is the previous build. `--keep NAME`,
+repeatable, asks such a recipe to keep NAME whatever the change touched; see Recipes in
+[docs/design.md](docs/design.md). [schemas/](schemas/) holds a JSON Schema (draft 2020-12) of each,
 generated from the zod schemas the CLI's types come from. A command's `schemaVersion`
 changes only when koi removes a field or changes what one means. Adding an optional field
 keeps the version, so a program that reads the fields it knows keeps working. The schemas

@@ -26,7 +26,7 @@
 				"running",
 				"failed"
 			],
-			"description": "How the build koi up asked for ended: running once it deployed, failed when it did not. It does not say whether the container is up now."
+			"description": "How the build koi up asked for ended: running once it deployed, failed when it did not. With --keep it is also failed when koid returned no slice, as a koid older than --keep does, since that build ran without the names. It does not say whether the container is up now."
 		},
 		"commit": {
 			"type": "string",
@@ -125,6 +125,14 @@
 			"type": "string",
 			"pattern": "^https:\\/\\/",
 			"description": "The preview's keys page, where a reviewer registers provider keys and gets koi tokens that work only in this preview."
+		},
+		"slice": {
+			"description": "What the build of deployment kept of the project, as its recipe's build reported it, for a recipe that reports one: a JSON object of at most 16384 bytes whose shape the recipe defines. koi reads it from the built image and never interprets it. It describes deployment, which after a failed rebuild is the previous build, not commit. The build ran the pull request's code, so it is the recipe's account, not koi's.",
+			"type": "object",
+			"propertyNames": {
+				"type": "string"
+			},
+			"additionalProperties": {}
 		},
 		"error": {
 			"description": "Why the build failed, when status is failed.",
