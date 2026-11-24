@@ -80,9 +80,9 @@ variable "tags" {
 }
 
 variable "wake_reserved_concurrency" {
-  description = "Concurrent executions reserved for the wake function, which also caps them. null leaves it unreserved, which an account still on the new-account Lambda quota of 10 needs: Lambda keeps that whole quota unreserved."
+  description = "Concurrent executions reserved for the wake function, which also caps them. null (the default) leaves it unreserved. Lambda keeps 100 of an account's concurrency unreserved in each region, so a reservation fails where other functions already hold all but 100 + this many, and in an account still on the new-account quota of 10."
   type        = number
-  default     = 10
+  default     = null
 }
 
 # The addresses verification run networks are carved from, a /28 each
