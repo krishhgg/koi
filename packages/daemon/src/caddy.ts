@@ -51,11 +51,12 @@ const UPSTREAM = /^(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}$/;
 // answers 502 and CloudFront shows the wake page.
 //
 // The keys page limits registrations by the viewer's address (keys.ts,
-// viewerSource). Caddy trusts no proxy, so it replaces X-Forwarded-For with
-// its peer's address, a CloudFront server's. The X-Forwarded-For CloudFront
-// sent, with the viewer's address appended last, goes to koid as
-// X-Koi-Forwarded-For instead; Caddy sets it, empty if there was none, so a
-// client cannot supply its own.
+// viewerSource), which koid reads from X-Koi-Forwarded-For; Caddy sets it, so
+// a client cannot supply its own. On the AWS box Caddy's peer is a CloudFront
+// server, so the header is the X-Forwarded-For CloudFront sent, with the
+// viewer's address appended last, or empty if there was none. Elsewhere
+// nothing stands in front of Caddy and a client could write X-Forwarded-For
+// itself, so the header is Caddy's peer's address.
 //
 // Every route change loads the whole file again, and by default a reload
 // closes proxied streams such as an app's WebSocket. stream_close_delay
@@ -79,6 +80,8 @@ export function renderCaddyfile(options: CaddyfileOptions): string {
 `;
 	});
 	const tls = options.tls ?? { kind: 'route53' };
+	const viewer =
+		tls.kind === 'route53' ? '{http.request.header.X-Forwarded-For}' : '{http.request.remote.host}';
 	// On demand, Caddy asks koid directly, never through itself. With its own
 	// CA, Caddy would try to add the CA's root to the system's trust store
 	// at start, through sudo as the caddy account; the operator does that
@@ -113,7 +116,7 @@ ${tlsBlock(tls)}	log {
 ${blocks.join('\n')}
 	handle {
 		reverse_proxy ${koid} {
-			header_up X-Koi-Forwarded-For {http.request.header.X-Forwarded-For}
+			header_up X-Koi-Forwarded-For ${viewer}
 		}
 	}
 

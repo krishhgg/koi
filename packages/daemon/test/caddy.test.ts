@@ -45,6 +45,23 @@ describe('renderCaddyfile', () => {
 		);
 	});
 
+	test("off AWS, with no CloudFront in front, gives koid's pages Caddy's peer's address", () => {
+		for (const tls of [
+			{ kind: 'internal' },
+			{ kind: 'acme-http' },
+			{ kind: 'acme-dns', file: '/etc/koi/caddy/dns.caddy' },
+		] as const) {
+			const text = renderCaddyfile({ ...base, routes: [], tls });
+			expect([tls.kind, text]).toEqual([
+				tls.kind,
+				expect.stringContaining(
+					'\thandle {\n\t\treverse_proxy 127.0.0.1:7777 {\n\t\t\theader_up X-Koi-Forwarded-For {http.request.remote.host}\n\t\t}\n\t}',
+				),
+			]);
+			expect(text).not.toContain('X-Forwarded-For}');
+		}
+	});
+
 	test('is stable for the same routes in any order', () => {
 		const a = { label: 'a', upstream: '172.19.0.2:80' };
 		const b = { label: 'b', upstream: '172.19.0.3:80' };
@@ -66,9 +83,14 @@ describe('renderCaddyfile', () => {
 		const route53 = renderCaddyfile({ ...base, routes });
 		const block = /\ttls \{\n\t\tdns route53[\s\S]*?\n\t\}\n/.exec(route53)?.[0] ?? '';
 		expect(block).not.toBe('');
+		// Off AWS the client's address is Caddy's peer's, not CloudFront's header.
+		const offAws = route53.replace(
+			'X-Koi-Forwarded-For {http.request.header.X-Forwarded-For}',
+			'X-Koi-Forwarded-For {http.request.remote.host}',
+		);
 		const internal = renderCaddyfile({ ...base, routes, tls: { kind: 'internal' } });
 		expect(internal).toBe(
-			route53
+			offAws
 				.replace(block, '\ttls internal\n')
 				.replace('\tadmin 127.0.0.1:2019\n}', '\tadmin 127.0.0.1:2019\n\tskip_install_trust\n}'),
 		);
@@ -77,11 +99,11 @@ describe('renderCaddyfile', () => {
 			routes,
 			tls: { kind: 'acme-dns', file: '/etc/caddy/koi-dns.caddy' },
 		});
-		expect(dns).toBe(route53.replace(block, '\ttls {\n\t\timport /etc/caddy/koi-dns.caddy\n\t}\n'));
+		expect(dns).toBe(offAws.replace(block, '\ttls {\n\t\timport /etc/caddy/koi-dns.caddy\n\t}\n'));
 		// On demand, with koid's answer to which names are previews'.
 		const http = renderCaddyfile({ ...base, routes, tls: { kind: 'acme-http' } });
 		expect(http).toBe(
-			route53
+			offAws
 				.replace(block, '\ttls {\n\t\ton_demand\n\t}\n')
 				.replace(
 					'\tadmin 127.0.0.1:2019\n}',
