@@ -2518,6 +2518,52 @@ describe('restore', () => {
 		expect(await deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
 	});
 
+	test("restore's start judges a failed start under the lock, and a visit still retries it", async () => {
+		const t = await setup();
+		await t.up(request());
+		const container = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		t.docker.stopAll();
+		await t.deployer.sync();
+		// A visit's start fails after restore read the record and before its
+		// turn: the start restore asks for sees the failure under the lock.
+		t.setHealthy(() => false);
+		await t.deployer.ensureRunning('hello-pr-7');
+		expect((await t.store.get('hello-pr-7'))?.error).toContain('the preview did not start');
+		t.setHealthy(undefined);
+		const starts = t.docker.starts.length;
+		await t.deployer.ensureRunning('hello-pr-7', true);
+		expect(t.docker.starts).toHaveLength(starts);
+		expect(t.lastRoutes()).toEqual([]);
+		await t.deployer.ensureRunning('hello-pr-7');
+		expect(t.docker.starts.slice(starts)).toEqual([container]);
+		expect(await t.deployer.view('hello-pr-7')).toEqual({ kind: 'running' });
+	});
+
+	test('a Docker error reading the containers before a start is a failed start, not a routing one', async () => {
+		const t = await setup();
+		await t.up(request());
+		await t.up(request({ id: 'bbbbbbbbbbbbbbbb2', label: 'other', pr: 8 }));
+		// hello-pr-7 stopped and its route gone; other runs and is routed, so
+		// the sync before the start inspects it.
+		const stopped = (await t.store.get('hello-pr-7'))?.deployment?.container ?? '';
+		await t.docker.stop(stopped);
+		await t.deployer.sync();
+		const before = t.docker.onInspect;
+		let inspections = 0;
+		// The first inspection is start()'s own; the second is the sync's,
+		// which reads other's container before the start.
+		t.docker.onInspect = async () => {
+			inspections += 1;
+			if (inspections === 2) throw new Error('docker inspect: the daemon is not answering');
+		};
+		await t.deployer.ensureRunning('hello-pr-7').catch(() => {});
+		t.docker.onInspect = before;
+		expect((await t.store.get('hello-pr-7'))?.error).toContain(
+			'the preview did not start: docker inspect: the daemon is not answering',
+		);
+		expect(t.docker.starts).toEqual([]);
+	});
+
 	test.each([
 		['Caddy', (t: Awaited<ReturnType<typeof setup>>) => t.rejectNextApply('connection refused')],
 		['the egress proxy', (t: Awaited<ReturnType<typeof setup>>) => t.rejectMaps(3)],

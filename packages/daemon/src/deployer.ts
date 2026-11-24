@@ -995,22 +995,26 @@ export class Deployer {
 	// Starts a stopped preview's container. Called when someone visits a
 	// preview that is not routed, and by restore when koid starts. Runs under
 	// the label's lifecycle lock, and visitors who ask while a start is in
-	// progress share it. A preview past its ttl is expired instead.
-	ensureRunning(label: string): Promise<void> {
+	// progress share it. A preview past its ttl is expired instead. With
+	// `skipFailed` (restore), a preview whose last start failed is left
+	// stopped, judged under the lock from the record as it is then: a visit
+	// that failed just before still leaves it for the next visit.
+	ensureRunning(label: string, skipFailed = false): Promise<void> {
 		const inFlight = this.starting.get(label);
 		if (inFlight !== undefined) return inFlight;
 		const task = this.lifecycle
-			.run(label, () => this.start(label))
+			.run(label, () => this.start(label, skipFailed))
 			.finally(() => this.starting.delete(label));
 		this.starting.set(label, task);
 		return task;
 	}
 
 	// Caller holds the label's lifecycle lock.
-	private async start(label: string): Promise<void> {
+	private async start(label: string, skipFailed = false): Promise<void> {
 		const { deps } = this;
 		const record = await deps.store.get(label);
 		if (record === undefined || record.status === 'expired') return;
+		if (skipFailed && record.error?.startsWith(WAKE_FAILED)) return;
 		const now = deps.now().getTime();
 		if (overdue(record, now)) {
 			// A visit counted in time and not yet written renews it.
@@ -1144,7 +1148,7 @@ export class Deployer {
 				) {
 					continue;
 				}
-				await this.ensureRunning(label);
+				await this.ensureRunning(label, true);
 				if (this.ready.has(d.container)) restored.push(label);
 			} catch (err) {
 				this.deps.log(`starting ${label}: ${message(err)}`);
@@ -1213,9 +1217,15 @@ export class Deployer {
 
 	// Caller holds `routing`.
 	private async syncNow(): Promise<void> {
+		await this.applyRoutes(await this.currentRoutes());
+	}
+
+	// The routes the records call for, from Docker's view of the containers.
+	// Caller holds `routing`.
+	private async currentRoutes(): Promise<Route[]> {
 		const records = await this.records();
 		this.live = new Set(records.filter((r) => r.status !== 'expired').map((r) => r.label));
-		await this.applyRoutes(await this.routesFor(records));
+		return this.routesFor(records);
 	}
 
 	// Tells the egress proxy the address of every routed container and its
@@ -1257,15 +1267,18 @@ export class Deployer {
 	// sync first takes dead containers out of the routes and the proxy's map,
 	// and the proxy confirms, before the start. If the new container's
 	// address is one the confirmed map still names, its holder died between
-	// the two, and the map goes to the proxy again at once. A sync that
-	// fails throws RoutingFailed.
+	// the two, and the map goes to the proxy again at once. When the proxy or
+	// Caddy does not take the routes, this throws RoutingFailed; a Docker
+	// error, reading the containers or starting this one, is thrown as it is.
 	private async startFresh(container: string, start: () => Promise<void>): Promise<void> {
 		await this.routing.run(async () => {
-			await this.syncNow().catch(routingFailed);
+			const before = await this.currentRoutes();
+			await this.applyRoutes(before).catch(routingFailed);
 			await start();
 			const { ip } = await this.deps.docker.inspect(container, this.deps.network);
 			if (ip !== undefined && this.told[ip] !== undefined) {
-				await this.syncNow().catch(routingFailed);
+				const after = await this.currentRoutes();
+				await this.applyRoutes(after).catch(routingFailed);
 			}
 		});
 	}
