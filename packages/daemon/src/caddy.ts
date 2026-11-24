@@ -214,9 +214,14 @@ export function caddyApplier(options: {
 						unix: adminSocket,
 					} as RequestInit);
 		if (!res.ok) {
-			throw new Error(
-				`caddy rejected the config: ${res.status} ${(await res.text()).slice(0, 500)}`,
-			);
+			// A DNS provider's module may quote its API key in the error, as
+			// caddy-dns/cloudflare does for one it finds malformed, and koid's
+			// errors reach koi's users. Caddy logs the whole error itself.
+			const why =
+				options.tls?.kind === 'acme-dns'
+					? "(the reason is in Caddy's log: journalctl -u caddy)"
+					: (await res.text()).slice(0, 500);
+			throw new Error(`caddy rejected the config: ${res.status} ${why}`);
 		}
 	};
 	return {

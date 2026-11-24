@@ -249,6 +249,24 @@ describe('caddyApplier', () => {
 		expect(await t.read()).toBe(running);
 	});
 
+	test("with a DNS provider, leaves Caddy's reason out of the error, since it may quote the provider's key", async () => {
+		const dir = await mkdtemp(join(tmpdir(), 'koid-caddy-'));
+		const caddy = caddyApplier({
+			...base,
+			tls: { kind: 'acme-dns', file: '/etc/koi/caddy/dns.caddy' },
+			file: join(dir, 'Caddyfile'),
+			adminUrl: 'http://127.0.0.1:2019',
+			fetch: (async () =>
+				new Response("API token 'abc123' appears invalid", {
+					status: 400,
+				})) as unknown as typeof fetch,
+		});
+		const err = await caddy.apply([]).catch((e: unknown) => e);
+		expect(String(err)).toBe(
+			"Error: caddy rejected the config: 400 (the reason is in Caddy's log: journalctl -u caddy)",
+		);
+	});
+
 	test('a failed second load fails the apply, and the next apply sends again', async () => {
 		// The fourth load, the second of the second apply, is refused.
 		const t = await applier(() => (t.posts.length === 4 ? 502 : 200));
