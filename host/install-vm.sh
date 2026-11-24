@@ -156,9 +156,13 @@ check_caddy() {
 	# The unit systemd runs, wherever its file is and with any drop-in. Only
 	# none at all, or koi's, goes on; a masked or broken unit, or no answer
 	# from systemd, stops here.
-	if [ -z "$found" ] && [ "$(systemctl show -P LoadState caddy.service 2>/dev/null)" != not-found ] &&
-		[[ $(systemctl show -P ExecStart caddy.service 2>/dev/null) != *" $KOI_CADDY_START "* ]]; then
-		found='caddy.service runs another Caddy or config'
+	local state start
+	state=$(systemctl show -P LoadState caddy.service 2>/dev/null) || state=''
+	if [ -z "$found" ] && [ "$state" != not-found ]; then
+		start=$(systemctl show -P ExecStart caddy.service 2>/dev/null) || start=''
+		if [ "$state" != loaded ] || [[ $start != *" $KOI_CADDY_START "* ]]; then
+			found='caddy.service runs another Caddy or config'
+		fi
 	fi
 	[ -z "$found" ] ||
 		die "this machine has a Caddy that koi did not set up ($found). koi's setup replaces caddy.service and removes /etc/caddy/Caddyfile, which would take that Caddy down; install koi in a VM instead"

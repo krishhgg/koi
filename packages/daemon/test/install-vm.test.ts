@@ -404,6 +404,18 @@ describe('host/install-vm.sh, run whole', () => {
 				'systemctl() { case $1 in show) return 1 ;; *) echo "systemctl $*" >> "$calls" ;; esac; }',
 				'caddy.service runs another Caddy or config',
 			],
+			[
+				// koi's start line in a unit systemd could not load whole, and
+				// a query that prints not-found but fails.
+				caddyUnit(
+					'/usr/local/bin/caddy run --config /var/lib/koi-caddy/Caddyfile --adapter caddyfile',
+				).replace('echo loaded', 'echo bad-setting'),
+				'caddy.service runs another Caddy or config',
+			],
+			[
+				'systemctl() { case "$*" in \'show -P LoadState caddy.service\') echo not-found; return 1 ;; show*) return 1 ;; *) echo "systemctl $*" >> "$calls" ;; esac; }',
+				'caddy.service runs another Caddy or config',
+			],
 		] as const) {
 			const b = await box();
 			const r = await run(b, `${setup}\nmain --local`);
