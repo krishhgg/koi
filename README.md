@@ -79,8 +79,8 @@ The CLI uses the AWS profile `koi-cli` (override with `KOI_AWS_PROFILE`). It can
 upload source, start the box, and run commands on it; nothing else. The profile may
 hold static keys or sign in through IAM Identity Center (`aws sso login`). It finds the
 box by its `koi:role = box` tag, the preview domain from the box's `Domain` tag, and the
-upload bucket from the account id; `KOI_INSTANCE_ID`, `KOI_DOMAIN` and `KOI_BUCKET`
-override them. A per-user config file can name the deployment instead, including one
+upload bucket from its `koi:bucket` tag (from the account id for a box applied before
+that tag); `KOI_INSTANCE_ID`, `KOI_DOMAIN` and `KOI_BUCKET` override them. A per-user config file can name the deployment instead, including one
 in another AWS account, and other hosts later; see
 [docs/configuration.md](docs/configuration.md).
 
@@ -158,7 +158,7 @@ OpenTofu.
    | `vpc_id`, `subnet_id` | the default VPC | Set both or neither. The subnet needs a route to an internet gateway. |
    | `tags` | `{}` | Added to every resource that takes tags, on top of the provider's `default_tags`. |
    | `verify_pool` | `10.213.0.0/20` | See [docs/verify.md](docs/verify.md), "Run network". |
-   | `wake_reserved_concurrency` | `10` | Caps the wake function. Set `null` in an account still on the new-account Lambda quota of 10, where nothing can be reserved. |
+   | `wake_reserved_concurrency` | `null` | Reserves concurrency for the wake function, which also caps it. Lambda keeps 100 of a region's quota unreserved, so a reservation fails where other functions already hold all but 100 plus this many, and on the new-account quota of 10. The personal root reserves 10. |
    | `ubuntu_ami_name` | Ubuntu 24.04 | The AMI name pattern for a new box. |
 
    Outputs: `instance_id`, `uploads_bucket`, `previews_parameter`, `domain`,
@@ -185,14 +185,16 @@ OpenTofu.
 
    The box provisions itself at first boot. To provision it again, set
    `KOI_VERIFY_POOL=<verify_pool>` as well and run `scripts/provision-host.sh`. Without
-   `AWS_REGION`, both scripts use the profile's region, then us-east-1.
+   `AWS_REGION`, both scripts use the profile's region, then us-east-1. (For the
+   personal root, with no `KOI_*` set, they use the `region` output of `infra/`.)
 
 5. Point the CLI at the box with a target that names the profile, the instance and the
    bucket ([docs/configuration.md](docs/configuration.md), "A box in another
    account").
 
 The CLI finds a box without a config file by the `koi:role = box` tag the module sets,
-so a root whose `default_tags` set `Project` to something else does not hide it.
+so a root whose `default_tags` set `Project` to something else does not hide it, and
+its bucket by the `koi:bucket` tag, which carries the name prefix.
 
 ## Trust model and limits
 

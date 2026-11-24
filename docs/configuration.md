@@ -419,11 +419,13 @@ Nothing has to change for the deployment to keep working. When ready:
    domain, or know the domain.
 2. Run `koi config import-aws --name owner-aws`. It finds the deployment the
    way koi always has (the profile, the region, the one instance tagged
-   `koi:role=box`, the bucket from the account id) and reads the domain from
+   `koi:role=box`, the bucket from its `koi:bucket` tag or else the account
+   id) and reads the domain from
    `--domain`, `KOI_DOMAIN` or the instance's `Domain` tag, in that order.
    Without any of the three it stops; it does not guess a domain. A box applied
    before the module set `koi:role` is found by `Project=koi` and
-   `Name=koi-box` instead, when no instance has `koi:role`.
+   `Name=koi-box`. Both are asked for, and two different instances between
+   them stop the import: set `KOI_INSTANCE_ID`.
 3. It writes the target to the user's file and prints what it wrote. The first
    target written becomes `defaultTarget`. An existing target of the same name
    is kept unless you pass `--replace`. While it reads and writes the file, it
@@ -500,8 +502,7 @@ included, does not matter to it.
 
    Or let koi find them: `KOI_AWS_PROFILE=koi-company koi config import-aws
    --name company` finds the instance by its `koi:role=box` tag and the bucket
-   as `koi-uploads-<account id>`. With a `name_prefix` other than `koi`, set
-   `KOI_BUCKET` to the bucket for the import. Discovery needs
+   by its `koi:bucket` tag, whatever the `name_prefix`. Discovery needs
    `ec2:DescribeInstances`, which the operator policy has, and
    `sts:GetCallerIdentity`, which every principal has.
 
@@ -516,7 +517,7 @@ With no config file and no `--target`, `KOI_TARGET` or alias, koi behaves as
 before this file existed: `KOI_AWS_PROFILE` (default `koi-cli`),
 `KOI_AWS_REGION` (default `us-east-1`), and `KOI_INSTANCE_ID`, `KOI_BUCKET`
 and `KOI_DOMAIN` when set; what is not set is discovered from the box's tags
-(`koi:role=box`, else `Project=koi` and `Name=koi-box`) and the account. koi prints one notice per run pointing at `koi config
+(`koi:role=box` or `Project=koi` and `Name=koi-box`, and `koi:bucket`) and the account. koi prints one notice per run pointing at `koi config
 import-aws`. This path is for compatibility; explicit targets never read the
 `Domain` tag.
 
