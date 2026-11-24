@@ -97,7 +97,6 @@ export function localTransport(
 	const where = `koid at ${target.socket} (target ${target.name})`;
 	const expected = { name: `target ${JSON.stringify(target.name)}`, domain: target.domain };
 	const fetchKoid = socketFetch(target.socket);
-	let pathChecked = false;
 	let verified = false;
 
 	const ctl = async (args: string[], o?: OperationOptions): Promise<CtlResult> => {
@@ -134,21 +133,26 @@ export function localTransport(
 		}
 	};
 
-	// The socket is there, may be koid's, and this account may open it. The
-	// path is checked once; a socket that is missing, or one this account
-	// may not open, is reported at once rather than waited for.
+	// No account but root, this one and koi could have put the socket there.
+	// Checked again right before the upload connects, not only at the start:
+	// a directory on the way that is removed during the run, from a sticky
+	// directory such as /tmp, could be made again by anyone.
+	const checkPath = async () => {
+		const untrusted = await socketPathProblem(target.socket, uid);
+		if (untrusted !== undefined) {
+			throw new Error(
+				`koi does not trust the control socket of target ${target.name}: ${untrusted}. Another account could have put a socket there and would receive the source; use a socket in a directory only root, you or koid's account can write to, such as the /run/koi/control.sock koid makes`,
+			);
+		}
+	};
+
+	// The socket is there, may be koid's, and this account may open it. A
+	// socket that is missing, or one this account may not open, is reported
+	// at once rather than waited for.
 	const checkSocket = async () => {
 		const problem = await socketProblem(target.socket);
 		if (problem !== undefined) throw new Error(problem);
-		if (!pathChecked) {
-			const untrusted = await socketPathProblem(target.socket, uid);
-			if (untrusted !== undefined) {
-				throw new Error(
-					`koi does not trust the control socket of target ${target.name}: ${untrusted}. Another account could have put a socket there and would receive the source; use a socket in a directory only root, you or koid's account can write to, such as the /run/koi/control.sock koid makes`,
-				);
-			}
-			pathChecked = true;
-		}
+		await checkPath();
 	};
 
 	// Waits for koid to answer `describe`, and checks the first descriptor
@@ -222,6 +226,7 @@ export function localTransport(
 					if (now() >= deadline) {
 						throw new InterruptedError('the deadline passed before the upload started');
 					}
+					await checkPath();
 					const relay = await socketRelay(target.socket, abortSignal);
 					try {
 						await uploadSequence(
