@@ -2,7 +2,13 @@ import { describe, expect, test } from 'bun:test';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { decodeCtlArgs, RepoRecipeSchema, type UpRequest, UpRequestSchema } from '@koi/shared';
+import {
+	decodeCtlArgs,
+	NO_SUCH_PREVIEW,
+	RepoRecipeSchema,
+	type UpRequest,
+	UpRequestSchema,
+} from '@koi/shared';
 import type { Clients } from '../src/box.ts';
 import {
 	awsBox,
@@ -328,6 +334,28 @@ describe('awsBox ctl', () => {
 			async () => {},
 		);
 		expect(await box.ctl(['ping'])).toEqual({ code: 3, stdout: '', stderr: 'cannot reach koid' });
+	});
+
+	test("drops the status line SSM adds to a failed command's standard error", async () => {
+		const client = {
+			send: async (cmd: { constructor: { name: string } }) =>
+				cmd.constructor.name === 'SendCommandCommand'
+					? { Command: { CommandId: 'c' } }
+					: {
+							Status: 'Failed',
+							ResponseCode: 1,
+							StandardErrorContent:
+								'{"error":"no such preview"}\nfailed to run commands: exit status 1',
+						},
+		} as never;
+		const box = awsBox(
+			settings,
+			{ s3: client, ec2: client, ssm: client, sts: client },
+			async () => {},
+		);
+		const r = await box.ctl(['status', 'hello-pr-7']);
+		expect(r).toEqual({ code: 1, stdout: '', stderr: '{"error":"no such preview"}' });
+		expect(transport.ctlErrorText(r)).toBe(NO_SUCH_PREVIEW);
 	});
 
 	test('refuses output that SSM cut at 24,000 characters', async () => {
