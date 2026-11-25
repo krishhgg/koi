@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { PreviewLabelSchema, PrNumberSchema, PullRequestMergeSchema } from './preview.ts';
 import { ProjectNameSchema, RepoRecipeSchema } from './recipe.ts';
@@ -48,6 +49,25 @@ export const KeepSchema = z
 	.max(MAX_KEEP)
 	.refine((names) => new Set(names).size === names.length, 'each name once');
 
+// The most bytes of a commit object a request carries. A commit's headers
+// take a few hundred bytes, a signature about a thousand more; past this the
+// message is long, and koi up sends no object.
+export const MAX_COMMIT_OBJECT_BYTES = 32 * 1024;
+
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+// The id git gives a commit object of these bytes: the SHA-1 of its header
+// ("commit", its size, a NUL) and the bytes.
+export function commitObjectId(bytes: Uint8Array): string {
+	return createHash('sha1').update(`commit ${bytes.length}\0`).update(bytes).digest('hex');
+}
+
+// The tree a commit object names on its first line, as git writes every
+// commit, or undefined when it does not start so.
+export function commitObjectTree(bytes: Uint8Array): string | undefined {
+	return /^tree ([0-9a-f]{40})\n/.exec(Buffer.from(bytes.subarray(0, 46)).toString('latin1'))?.[1];
+}
+
 export const UpRequestSchema = z.object({
 	version: z.literal(1),
 	id: RequestIdSchema,
@@ -55,6 +75,16 @@ export const UpRequestSchema = z.object({
 	project: ProjectNameSchema,
 	repo: RepoIdSchema,
 	commit: CommitSchema,
+	// The commit object of `commit`, as git cat-file commit prints it, in
+	// base64, for koid to read the commit's tree from. koid takes it only
+	// when it hashes to `commit` (deploymentSourceOf in the daemon), so it
+	// can name no tree but that commit's. Absent from a CLI older than it,
+	// and when the object is over MAX_COMMIT_OBJECT_BYTES.
+	commitObject: z
+		.string()
+		.max(Math.ceil(MAX_COMMIT_OBJECT_BYTES / 3) * 4)
+		.regex(BASE64, 'base64')
+		.optional(),
 	branch: z.string().min(1).max(255),
 	pr: PrNumberSchema.optional(),
 	// With `pr`, when `commit` is GitHub's merge of the pull request into its

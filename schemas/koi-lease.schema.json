@@ -89,6 +89,30 @@
 						"baseBranch"
 					],
 					"additionalProperties": false
+				},
+				"source": {
+					"description": "What the deployment was built from, as koid computed it from the source tarball it unpacked: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. To check that a preview is exactly a commit, compare source.tree with git rev-parse COMMIT^{tree}, or read source.matchesCommit.",
+					"type": "object",
+					"properties": {
+						"tree": {
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$",
+							"description": "The git tree id of the source files koid built from, byte for byte as they were in the tarball it unpacked, .koi-runtime/ left out. When the build read exactly a commit's files it is what git rev-parse COMMIT^{tree} prints. It differs when the working tree had changes not committed (untracked files included), and also for a clean checkout in which git converts a file (eol=crlf, core.autocrlf, a filter such as LFS) or that has a submodule: the build read those files as checked out."
+						},
+						"runtimeTree": {
+							"description": "The git tree id of .koi-runtime/, the files koi adds to every build (changed-files.txt, which decides what a slicing recipe keeps), computed by koid the same way. No commit holds them. Absent for an upload without them.",
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"matchesCommit": {
+							"description": "Whether tree is the tree of the deployment's commit, as koid read it from the commit object the request carried, which koid checked hashes to that commit. true means the build read exactly the commit's files. false for changes not in the commit, and for a checkout git converts files in or with a submodule, as tree says. Absent when the request carried no commit object, as from a koi older than this field.",
+							"type": "boolean"
+						}
+					},
+					"required": [
+						"tree"
+					],
+					"additionalProperties": false
 				}
 			},
 			"required": [

@@ -30,7 +30,13 @@ stderr. Exit codes: 0 success, 1 failure, 2 bad usage.
 The JSON that `koi up`, `koi lease` and `koi release` print carries `schemaVersion`, now
 1 for each command. For a recipe that reports what its slice kept, `koi up` also prints
 `slice`: the JSON object the recipe's build wrote, whose shape the recipe defines. It
-describes `deployment`, which after a failed rebuild is the previous build. `--keep NAME`,
+describes `deployment`, which after a failed rebuild is the previous build.
+`deployment.source` says what that build read, as koid hashed it from the tarball it
+unpacked: `tree`, the git tree id of the project's files, which is `git rev-parse
+COMMIT^{tree}` for a build of exactly that commit, and `matchesCommit`, whether it is.
+`dirty` is the CLI's own `git status` of the working tree it packed. A clean checkout
+in which git converts files on checkout (line endings, LFS) gives another tree; see
+[What a deployment was built from](docs/design.md#what-a-deployment-was-built-from). `--keep NAME`,
 repeatable, asks such a recipe to keep NAME whatever the change touched; see Recipes in
 [docs/design.md](docs/design.md). [schemas/](schemas/) holds a JSON Schema (draft 2020-12) of each,
 generated from the zod schemas the CLI's types come from. A command's `schemaVersion`

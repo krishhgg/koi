@@ -62,6 +62,36 @@ export const PullRequestMergeSchema = z.object({
 
 export type PullRequestMerge = z.infer<typeof PullRequestMergeSchema>;
 
+// A git object id as koi's repositories name objects: SHA-1, 40 hex digits.
+const GitObjectIdSchema = z.string().regex(/^[0-9a-f]{40}$/);
+
+// What a deployment was built from, as koid computed it from the source
+// tarball it unpacked for the build (daemon/src/source-tree.ts), never from
+// anything the CLI says about it. `tree` is the git tree id of the
+// project's files as they were in the tarball, byte for byte; `runtimeTree`
+// that of the files koi added under .koi-runtime/, which no commit holds.
+// `matchesCommit` says whether `tree` is the tree of the deployment's
+// commit, which koid reads from the commit object the request carried
+// after checking that it hashes to the commit (deploymentSourceOf in the
+// daemon). Absent when the request had none, as from a CLI older than this
+// field, or one that does not hash to the commit.
+export const DeploymentSourceSchema = z.object({
+	tree: GitObjectIdSchema.describe(
+		"The git tree id of the source files koid built from, byte for byte as they were in the tarball it unpacked, .koi-runtime/ left out. When the build read exactly a commit's files it is what git rev-parse COMMIT^{tree} prints. It differs when the working tree had changes not committed (untracked files included), and also for a clean checkout in which git converts a file (eol=crlf, core.autocrlf, a filter such as LFS) or that has a submodule: the build read those files as checked out.",
+	),
+	runtimeTree: GitObjectIdSchema.optional().describe(
+		'The git tree id of .koi-runtime/, the files koi adds to every build (changed-files.txt, which decides what a slicing recipe keeps), computed by koid the same way. No commit holds them. Absent for an upload without them.',
+	),
+	matchesCommit: z
+		.boolean()
+		.optional()
+		.describe(
+			"Whether tree is the tree of the deployment's commit, as koid read it from the commit object the request carried, which koid checked hashes to that commit. true means the build read exactly the commit's files. false for changes not in the commit, and for a checkout git converts files in or with a submodule, as tree says. Absent when the request carried no commit object, as from a koi older than this field.",
+		),
+});
+
+export type DeploymentSource = z.infer<typeof DeploymentSourceSchema>;
+
 // Names one attempt at building a request: koid gives each acceptance of a
 // request a new one, a retry of the same request id included.
 export const AttemptSchema = z.string().regex(/^[a-z0-9]{16,40}$/);
@@ -105,6 +135,10 @@ export const DeploymentSchema = z.object({
 	// recipe's sliceFile (DeploymentSliceSchema). Absent for a recipe with
 	// none, and in records written before koid kept it.
 	slice: DeploymentSliceSchema.optional(),
+	// What the build read, as koid computed it (DeploymentSourceSchema).
+	// Absent when koid could not compute it, and in records written before
+	// koid kept it.
+	source: DeploymentSourceSchema.optional(),
 	// Set when koid stopped this deployment for good: "disk" when its writable
 	// layer grew past the limit. A visit does not start it again; the next
 	// deployment replaces it.

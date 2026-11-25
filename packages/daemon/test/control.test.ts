@@ -3,6 +3,7 @@ import { mkdtemp, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+	DeploymentIdentitySchema,
 	type HostInfo,
 	type LeaseReply,
 	type PreviewListPage,
@@ -313,6 +314,41 @@ describe('control API', () => {
 		expect('deployment' in reply).toBe(false);
 	});
 
+	test('status carries what the deployment was built from beside its identity, which a CLI from before it still reads', async () => {
+		const source = { tree: '7'.repeat(40), runtimeTree: '8'.repeat(40), matchesCommit: false };
+		const serving = fullRecord({
+			status: 'running',
+			deployment: {
+				...(fullRecord().deployment as NonNullable<PreviewRecord['deployment']>),
+				deploymentId: B,
+				imageDigest: `sha256:${'1'.repeat(64)}`,
+				source,
+			},
+		});
+		const json = (await (
+			await call(deps({}, '', storeOf(serving)), 'GET', '/previews/hello-pr-7')
+		).json()) as { deployment: unknown; source: unknown };
+		expect(json.source).toEqual(source);
+		// An older CLI parses the identity with a schema that refuses keys it
+		// does not name, and drops keys it does not know beside it.
+		expect(DeploymentIdentitySchema.safeParse(json.deployment).success).toBe(true);
+		expect(StatusReplySchema.parse(json).source).toEqual(source);
+		// None without an identity to say what it describes.
+		const halted = deps(
+			{},
+			'',
+			storeOf({
+				...serving,
+				deployment: {
+					...(serving.deployment as NonNullable<PreviewRecord['deployment']>),
+					halted: 'disk',
+				},
+			}),
+		);
+		const reply = (await (await call(halted, 'GET', '/previews/hello-pr-7')).json()) as object;
+		expect('source' in reply).toBe(false);
+	});
+
 	test("status carries the deployment's slice only in a reply with no log lines, once nothing builds", async () => {
 		const slice = { nodes: { core: ['core'] }, apps: ['home'] };
 		const serving = (over: Partial<PreviewRecord>) =>
@@ -380,6 +416,7 @@ describe('control API', () => {
 				imageDigest: `sha256:${'1'.repeat(64)}`,
 				merge: { head: 'e'.repeat(40), base: 'f'.repeat(40), baseBranch: '"'.repeat(255) },
 				slice,
+				source: { tree: '7'.repeat(40), runtimeTree: '8'.repeat(40), matchesCommit: false },
 			},
 		});
 		const text = await (

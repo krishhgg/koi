@@ -4,7 +4,9 @@ import {
 	ContainerUserSchema,
 	type Deployment,
 	DeploymentSliceSchema,
+	type DeploymentSource,
 	deploymentIdentity,
+	deploymentSource,
 	IN_FLIGHT_STATUSES,
 	LEASE_MAX_SECONDS,
 	type Lease,
@@ -37,6 +39,7 @@ import type { LiveList } from './live.ts';
 import { KeyedLock, Mutex, Semaphore } from './lock.ts';
 import type { LoadedRecipe } from './recipes.ts';
 import { redact } from './redact.ts';
+import { deploymentSourceOf, type SourceTrees } from './source-tree.ts';
 import type { PreviewStore } from './store.ts';
 import type { Uploads } from './uploads.ts';
 import { hashRecipeDir } from './verification-snapshot.ts';
@@ -62,6 +65,9 @@ export interface DeployerDeps {
 	readRecipe: (dir: string, name: string) => Promise<Recipe>;
 	keepAwake: () => Promise<void>;
 	extract: (tarball: string, dir: string) => Promise<void>;
+	// The git tree ids of what a source tarball holds (source-tree.ts).
+	// Undefined: deployments record no source.
+	hashSource?: (tarball: string) => Promise<SourceTrees>;
 	resolveInside: (root: string, relative: string) => Promise<string>;
 	// Free space and size, in bytes, of the filesystem Docker keeps its data on.
 	diskSpace: () => Promise<{ free: number; size: number }>;
@@ -576,6 +582,7 @@ export class Deployer {
 			// The build has its own copy; the store may drop the entry now.
 			await releaseUpload();
 			await deps.extract(tarball, src);
+			const source = await this.sourceOf(request, tarball, log);
 			// A built-in recipe is built from a copy in this directory, never
 			// from the installed one: scripts/deploy-host.sh replaces the
 			// installed recipes before it restarts the old koid, so a build
@@ -688,6 +695,7 @@ export class Deployer {
 				env,
 				deployedAt: this.iso(),
 				...(slice !== undefined ? { slice } : {}),
+				...(source !== undefined ? { source } : {}),
 			};
 			await this.lifecycle.run(label, async () => {
 				await this.cutover(label, attempt, deployment, log, plan.loginKeyEnv !== undefined);
@@ -776,6 +784,36 @@ export class Deployer {
 			log.line(`the recipe's files were not hashed: ${message(err)}`);
 			return { plan, recipeCopy, recipe: undefined };
 		}
+	}
+
+	// What a build reads, from the tarball koid unpacked for it
+	// (deploymentSourceOf), said in the build log. A hash that fails loses
+	// the source, not the deploy, as a snapshot that fails does.
+	private async sourceOf(
+		request: UpRequest,
+		tarball: string,
+		log: BuildLog,
+	): Promise<DeploymentSource | undefined> {
+		if (this.deps.hashSource === undefined) return undefined;
+		let trees: SourceTrees;
+		try {
+			trees = await this.deps.hashSource(tarball);
+		} catch (err) {
+			log.line(`the source was not hashed: ${message(err)}`);
+			return undefined;
+		}
+		const { source, commitTree } = deploymentSourceOf(trees, request);
+		const of = `the tree of ${request.commit}`;
+		const said =
+			source.matchesCommit === undefined
+				? request.commitObject !== undefined
+					? `; the request's commit object is not that of ${request.commit}, so koid cannot say whether it is ${of}`
+					: ''
+				: source.matchesCommit
+					? `, ${of}`
+					: `, not ${of} (${commitTree}): ${request.dirty ? 'the working tree had changes not committed' : 'git converts files of it on checkout, or it has a submodule'}`;
+		log.line(`source tree ${source.tree}${said}`);
+		return source;
 	}
 
 	// What the build kept of the project: the JSON object the recipe's build
@@ -1585,7 +1623,8 @@ export class Deployer {
 				expiresAt: new Date(granted.getTime() + ttlSeconds * 1000).toISOString(),
 			};
 			await this.deps.store.update(label, (r) => ({ ...r, lease, updatedAt: this.iso() }));
-			return { lease, deployment };
+			const source = deploymentSource(record);
+			return { lease, deployment, ...(source !== undefined ? { source } : {}) };
 		});
 	}
 

@@ -82,6 +82,8 @@ async function fakeGit(
 		mergeFiles: async () => ['src/payments/stripe.py'],
 		show: async (_commit, path) =>
 			path === 'koi.yaml' ? 'port: 9000\nbuild:\n  kind: dockerfile\n' : undefined,
+		// The commits above are made up, so no object hashes to one.
+		commitObject: async () => undefined,
 		...overrides,
 	};
 }
@@ -320,6 +322,7 @@ describe('up from the working tree', () => {
 			url: `https://${request?.label}.previews.example.net`,
 			status: 'running',
 			commit: COMMIT,
+			dirty: true,
 			keysUrl: `https://keys.previews.example.net/?for=${request?.label}`,
 		});
 	});

@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { hostname, userInfo } from 'node:os';
 import {
+	type DeploymentSource,
 	escapeControls,
 	LeaseReplySchema,
 	type LeaseResult,
@@ -8,6 +9,7 @@ import {
 	logCutNote,
 	PreviewListPageSchema,
 	type PreviewSummary,
+	printedDeployment,
 	type ReleaseResult,
 	randomId,
 } from '@koi/shared';
@@ -231,17 +233,22 @@ export async function run(
 					JSON.parse(await ctlOk(box, ['lease', label, '--holder', holder, '--ttl-seconds', ttl])),
 				);
 				if (cli.json) {
-					const result: LeaseResult = { schemaVersion: 1, ...reply };
+					const result: LeaseResult = {
+						schemaVersion: 1,
+						lease: reply.lease,
+						deployment: printedDeployment(reply.deployment, reply.source),
+					};
 					io.stdout(`${JSON.stringify(result)}\n`);
 				} else {
-					const { lease, deployment } = reply;
+					const { lease, deployment, source } = reply;
 					io.stdout(
 						`leased ${label} until ${lease.expiresAt}\n` +
 							`  lease       ${lease.leaseId}\n` +
 							`  holder      ${lease.holder}\n` +
 							`  deployment  ${deployment.deploymentId}\n` +
 							`  image       ${deployment.imageDigest}\n` +
-							`  commit      ${deployment.commit}\n`,
+							`  commit      ${deployment.commit}\n` +
+							(source !== undefined ? `  tree        ${sourceLine(source)}\n` : ''),
 					);
 				}
 				return 0;
@@ -384,6 +391,13 @@ async function ctlOk(box: Box, args: string[]): Promise<string> {
 	const r = await box.ctl(args);
 	if (r.code !== 0) throw new Error(ctlErrorText(r) || `koid ctl ${args[0]} failed`);
 	return r.stdout;
+}
+
+// The source tree koid built a deployment from, and whether it is the
+// commit's, for koi lease's output.
+function sourceLine(source: DeploymentSource): string {
+	if (source.matchesCommit === undefined) return source.tree;
+	return `${source.tree} (${source.matchesCommit ? "the commit's tree" : "not the commit's tree"})`;
 }
 
 // Every preview. koid ctl list prints a page at a time, small enough for SSM
