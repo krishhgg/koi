@@ -171,9 +171,15 @@ describe('commitObject', () => {
 		expect(UpRequestSchema.safeParse({ ...valid, commitObject: 'not base64!' }).success).toBe(
 			false,
 		);
-		const most = Buffer.alloc(MAX_COMMIT_OBJECT_BYTES, 'x').toString('base64');
-		expect(UpRequestSchema.safeParse({ ...valid, commitObject: most }).success).toBe(true);
-		const over = Buffer.alloc(MAX_COMMIT_OBJECT_BYTES + 3, 'x').toString('base64');
-		expect(UpRequestSchema.safeParse({ ...valid, commitObject: over }).success).toBe(false);
+		// The bound is on the bytes the text decodes to: 32,769 bytes take
+		// as many base64 characters as 32,768 do.
+		const of = (bytes: number) => Buffer.alloc(bytes, 'x').toString('base64');
+		expect(of(MAX_COMMIT_OBJECT_BYTES + 1).length).toBe(of(MAX_COMMIT_OBJECT_BYTES).length);
+		for (const bytes of [MAX_COMMIT_OBJECT_BYTES - 1, MAX_COMMIT_OBJECT_BYTES]) {
+			expect(UpRequestSchema.safeParse({ ...valid, commitObject: of(bytes) }).success).toBe(true);
+		}
+		for (const bytes of [MAX_COMMIT_OBJECT_BYTES + 1, MAX_COMMIT_OBJECT_BYTES + 3]) {
+			expect(UpRequestSchema.safeParse({ ...valid, commitObject: of(bytes) }).success).toBe(false);
+		}
 	});
 });

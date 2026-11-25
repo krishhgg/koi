@@ -14,7 +14,7 @@ import {
 } from '@koi/shared';
 import { BuildLogs } from '../../daemon/src/buildlog.ts';
 import { CapacityError } from '../../daemon/src/deployer.ts';
-import { deploymentSourceOf, sourceTrees } from '../../daemon/src/source-tree.ts';
+import { deploymentSourceOf, hashSourceTarball } from '../../daemon/src/source-tree.ts';
 import { USAGE } from '../src/args.ts';
 import { awsBox, type Box, type CtlResult } from '../src/box.ts';
 import { toYaml } from '../src/config-command.ts';
@@ -245,13 +245,18 @@ describe('run', () => {
 	});
 
 	test('lease puts the source koid says the deployment was built from in the deployment', async () => {
-		const source = { tree: '7'.repeat(40), runtimeTree: '8'.repeat(40), matchesCommit: true };
+		const source = {
+			digest: `sha256:${'6'.repeat(64)}`,
+			tree: '7'.repeat(40),
+			runtimeTree: '8'.repeat(40),
+			matchesCommit: true,
+		};
 		const runtime = fakeRuntime({
 			lease: { code: 0, stdout: JSON.stringify({ ...leaseReply, source }), stderr: '' },
 		});
 		const plain = await capture(['lease', 'hello-pr-7', '--minutes', '30'], runtime);
 		expect(plain.stdout).toEndWith(
-			`  commit      ${record.commit}\n  tree        ${'7'.repeat(40)} (the commit's tree)\n`,
+			`  commit      ${record.commit}\n  source      sha256:${'6'.repeat(64)}\n  tree        ${'7'.repeat(40)} (the commit's tree)\n`,
 		);
 		const json = await capture(['lease', 'hello-pr-7', '--minutes', '30', '--json'], runtime);
 		const out = JSON.parse(json.stdout);
@@ -963,7 +968,7 @@ async function upHashedByKoid(argv: string[], runtime: Pick<Runtime, 'cwd' | 'gi
 		upload: async (r, tarball) => {
 			// koid reads the request file through the schema before it builds.
 			request = UpRequestSchema.parse(JSON.parse(JSON.stringify(r)));
-			source = deploymentSourceOf(await sourceTrees(tarball), request).source;
+			source = deploymentSourceOf(await hashSourceTarball(tarball), request).source;
 		},
 	};
 	const r = await capture(argv, {
@@ -987,6 +992,7 @@ describe('the source koid hashed from the upload, in koi up --json', () => {
 		expect(clean.out.dirty).toBe(false);
 		// The commit's tree as git computes it, with no tarball.
 		expect(clean.out.deployment.source).toEqual({
+			digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
 			tree: await git(dir, 'rev-parse', 'HEAD^{tree}'),
 			runtimeTree: expect.stringMatching(/^[0-9a-f]{40}$/),
 			matchesCommit: true,
@@ -1002,6 +1008,7 @@ describe('the source koid hashed from the upload, in koi up --json', () => {
 		expect(dirty.out.dirty).toBe(true);
 		expect(dirty.out.deployment.source.matchesCommit).toBe(false);
 		expect(dirty.out.deployment.source.tree).not.toBe(clean.out.deployment.source.tree);
+		expect(dirty.out.deployment.source.digest).not.toBe(clean.out.deployment.source.digest);
 		// What git would commit from the working tree as it is.
 		const index = join(await mkdtemp(join(tmpdir(), 'koi-index-')), 'index');
 		const env = { GIT_INDEX_FILE: index };

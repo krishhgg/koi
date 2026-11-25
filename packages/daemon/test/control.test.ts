@@ -315,7 +315,12 @@ describe('control API', () => {
 	});
 
 	test('status carries what the deployment was built from beside its identity, which a CLI from before it still reads', async () => {
-		const source = { tree: '7'.repeat(40), runtimeTree: '8'.repeat(40), matchesCommit: false };
+		const source = {
+			digest: `sha256:${'6'.repeat(64)}`,
+			tree: '7'.repeat(40),
+			runtimeTree: '8'.repeat(40),
+			matchesCommit: false,
+		};
 		const serving = fullRecord({
 			status: 'running',
 			deployment: {
@@ -416,7 +421,12 @@ describe('control API', () => {
 				imageDigest: `sha256:${'1'.repeat(64)}`,
 				merge: { head: 'e'.repeat(40), base: 'f'.repeat(40), baseBranch: '"'.repeat(255) },
 				slice,
-				source: { tree: '7'.repeat(40), runtimeTree: '8'.repeat(40), matchesCommit: false },
+				source: {
+					digest: `sha256:${'6'.repeat(64)}`,
+					tree: '7'.repeat(40),
+					runtimeTree: '8'.repeat(40),
+					matchesCommit: false,
+				},
 			},
 		});
 		const text = await (

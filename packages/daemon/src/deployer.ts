@@ -39,7 +39,7 @@ import type { LiveList } from './live.ts';
 import { KeyedLock, Mutex, Semaphore } from './lock.ts';
 import type { LoadedRecipe } from './recipes.ts';
 import { redact } from './redact.ts';
-import { deploymentSourceOf, type SourceTrees } from './source-tree.ts';
+import { deploymentSourceOf, type SourceHashes } from './source-tree.ts';
 import type { PreviewStore } from './store.ts';
 import type { Uploads } from './uploads.ts';
 import { hashRecipeDir } from './verification-snapshot.ts';
@@ -65,9 +65,10 @@ export interface DeployerDeps {
 	readRecipe: (dir: string, name: string) => Promise<Recipe>;
 	keepAwake: () => Promise<void>;
 	extract: (tarball: string, dir: string) => Promise<void>;
-	// The git tree ids of what a source tarball holds (source-tree.ts).
-	// Undefined: deployments record no source.
-	hashSource?: (tarball: string) => Promise<SourceTrees>;
+	// The hashes of the source directory a build reads, once extract has
+	// unpacked it (hashSourceDir in source-tree.ts). Undefined: deployments
+	// record no source.
+	hashSource?: (dir: string, signal: AbortSignal) => Promise<SourceHashes>;
 	resolveInside: (root: string, relative: string) => Promise<string>;
 	// Free space and size, in bytes, of the filesystem Docker keeps its data on.
 	diskSpace: () => Promise<{ free: number; size: number }>;
@@ -582,7 +583,7 @@ export class Deployer {
 			// The build has its own copy; the store may drop the entry now.
 			await releaseUpload();
 			await deps.extract(tarball, src);
-			const source = await this.sourceOf(request, tarball, log);
+			const source = await this.sourceOf(request, src, signal, log);
 			// A built-in recipe is built from a copy in this directory, never
 			// from the installed one: scripts/deploy-host.sh replaces the
 			// installed recipes before it restarts the old koid, so a build
@@ -786,33 +787,36 @@ export class Deployer {
 		}
 	}
 
-	// What a build reads, from the tarball koid unpacked for it
-	// (deploymentSourceOf), said in the build log. A hash that fails loses
-	// the source, not the deploy, as a snapshot that fails does.
+	// What a build reads, from the directory koid unpacked its tarball into
+	// (hashSourceDir, deploymentSourceOf), said in the build log. A walk that
+	// fails loses the source, not the deploy, as a snapshot that fails does.
 	private async sourceOf(
 		request: UpRequest,
-		tarball: string,
+		src: string,
+		signal: AbortSignal,
 		log: BuildLog,
 	): Promise<DeploymentSource | undefined> {
 		if (this.deps.hashSource === undefined) return undefined;
-		let trees: SourceTrees;
+		let hashes: SourceHashes;
 		try {
-			trees = await this.deps.hashSource(tarball);
+			hashes = await this.deps.hashSource(src, signal);
 		} catch (err) {
 			log.line(`the source was not hashed: ${message(err)}`);
 			return undefined;
 		}
-		const { source, commitTree } = deploymentSourceOf(trees, request);
+		const { source, commitTree } = deploymentSourceOf(hashes, request);
 		const of = `the tree of ${request.commit}`;
 		const said =
-			source.matchesCommit === undefined
-				? request.commitObject !== undefined
-					? `; the request's commit object is not that of ${request.commit}, so koid cannot say whether it is ${of}`
-					: ''
-				: source.matchesCommit
-					? `, ${of}`
-					: `, not ${of} (${commitTree}): ${request.dirty ? 'the working tree had changes not committed' : 'git converts files of it on checkout, or it has a submodule'}`;
-		log.line(`source tree ${source.tree}${said}`);
+			source.tree === undefined
+				? `; no git tree: ${hashes.noTree}`
+				: source.matchesCommit === undefined
+					? request.commitObject !== undefined
+						? `, tree ${source.tree}; the request's commit object is not that of ${request.commit}, so koid cannot say whether it is ${of}`
+						: `, tree ${source.tree}`
+					: source.matchesCommit
+						? `, tree ${source.tree}, ${of}`
+						: `, tree ${source.tree}, not ${of} (${commitTree})`;
+		log.line(`source ${source.digest}${said}`);
 		return source;
 	}
 

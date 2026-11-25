@@ -39,7 +39,7 @@ const HttpsUrlSchema = z.string().regex(/^https:\/\//);
 // (StatusReplySchema) and the CLI puts back in it.
 const PrintedDeploymentSchema = DeploymentIdentitySchema.extend({
 	source: DeploymentSourceSchema.optional().describe(
-		'What the deployment was built from, as koid computed it from the source tarball it unpacked: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. To check that a preview is exactly a commit, compare source.tree with git rev-parse COMMIT^{tree}, or read source.matchesCommit.',
+		"What the deployment was built from, as koid computed it from the directory it unpacked the source tarball into, before the build: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. Bind evidence to deployment.deploymentId together with source.digest, which covers every input file, .koi-runtime/ included. To learn which commit's content the build read, compare source.tree with the tree you expect, computed from your own copy of the repository.",
 	),
 });
 
@@ -76,7 +76,7 @@ export const UpResultSchema = z
 			'The parents of the merge in commit, when koi built a merge of a pull request. Absent for a working tree and with --head.',
 		),
 		deployment: PrintedDeploymentSchema.optional().describe(
-			"The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview, and deployment.source to tell a build of exactly that commit from one with changes not in it.",
+			"The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview, and deployment.source.tree with the tree it expects to tell a build of exactly that commit from one with changes not in it.",
 		),
 		loginKey: LoginKeySchema.optional().describe(
 			'For apps with a sign-in, the key a reviewer types to get in. A secret: never copy it into evidence or logs.',

@@ -56,6 +56,11 @@ export const MAX_COMMIT_OBJECT_BYTES = 32 * 1024;
 
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
+// How many bytes base64 text (BASE64, padded) decodes to.
+function base64Bytes(text: string): number {
+	return (text.length / 4) * 3 - (text.endsWith('==') ? 2 : text.endsWith('=') ? 1 : 0);
+}
+
 // The id git gives a commit object of these bytes: the SHA-1 of its header
 // ("commit", its size, a NUL) and the bytes.
 export function commitObjectId(bytes: Uint8Array): string {
@@ -84,6 +89,10 @@ export const UpRequestSchema = z.object({
 		.string()
 		.max(Math.ceil(MAX_COMMIT_OBJECT_BYTES / 3) * 4)
 		.regex(BASE64, 'base64')
+		.refine(
+			(text) => base64Bytes(text) <= MAX_COMMIT_OBJECT_BYTES,
+			`at most ${MAX_COMMIT_OBJECT_BYTES} bytes`,
+		)
 		.optional(),
 	branch: z.string().min(1).max(255),
 	pr: PrNumberSchema.optional(),

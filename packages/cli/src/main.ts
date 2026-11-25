@@ -248,7 +248,7 @@ export async function run(
 							`  deployment  ${deployment.deploymentId}\n` +
 							`  image       ${deployment.imageDigest}\n` +
 							`  commit      ${deployment.commit}\n` +
-							(source !== undefined ? `  tree        ${sourceLine(source)}\n` : ''),
+							(source !== undefined ? sourceLines(source) : ''),
 					);
 				}
 				return 0;
@@ -393,11 +393,17 @@ async function ctlOk(box: Box, args: string[]): Promise<string> {
 	return r.stdout;
 }
 
-// The source tree koid built a deployment from, and whether it is the
-// commit's, for koi lease's output.
-function sourceLine(source: DeploymentSource): string {
-	if (source.matchesCommit === undefined) return source.tree;
-	return `${source.tree} (${source.matchesCommit ? "the commit's tree" : "not the commit's tree"})`;
+// What koid says a deployment was built from, for koi lease's output: the
+// digest of its source, and its git tree and whether that is the commit's,
+// when it has one.
+function sourceLines(source: DeploymentSource): string {
+	const digest = `  source      ${source.digest}\n`;
+	if (source.tree === undefined) return digest;
+	const matches =
+		source.matchesCommit === undefined
+			? ''
+			: ` (${source.matchesCommit ? "the commit's tree" : "not the commit's tree"})`;
+	return `${digest}  tree        ${source.tree}${matches}\n`;
 }
 
 // Every preview. koid ctl list prints a page at a time, small enough for SSM

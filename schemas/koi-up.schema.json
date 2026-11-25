@@ -68,7 +68,7 @@
 			"additionalProperties": false
 		},
 		"deployment": {
-			"description": "The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview, and deployment.source to tell a build of exactly that commit from one with changes not in it.",
+			"description": "The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview, and deployment.source.tree with the tree it expects to tell a build of exactly that commit from one with changes not in it.",
 			"type": "object",
 			"properties": {
 				"label": {
@@ -112,26 +112,31 @@
 					"additionalProperties": false
 				},
 				"source": {
-					"description": "What the deployment was built from, as koid computed it from the source tarball it unpacked: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. To check that a preview is exactly a commit, compare source.tree with git rev-parse COMMIT^{tree}, or read source.matchesCommit.",
+					"description": "What the deployment was built from, as koid computed it from the directory it unpacked the source tarball into, before the build: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. Bind evidence to deployment.deploymentId together with source.digest, which covers every input file, .koi-runtime/ included. To learn which commit's content the build read, compare source.tree with the tree you expect, computed from your own copy of the repository.",
 					"type": "object",
 					"properties": {
-						"tree": {
+						"digest": {
 							"type": "string",
-							"pattern": "^[0-9a-f]{40}$",
-							"description": "The git tree id of the source files koid built from, byte for byte as they were in the tarball it unpacked, .koi-runtime/ left out. When the build read exactly a commit's files it is what git rev-parse COMMIT^{tree} prints. It differs when the working tree had changes not committed (untracked files included), and also for a clean checkout in which git converts a file (eol=crlf, core.autocrlf, a filter such as LFS) or that has a submodule: the build read those files as checked out."
+							"pattern": "^sha256:[0-9a-f]{64}$",
+							"description": "The SHA-256 of a listing of every entry under the directory koid unpacked the source into, read after unpacking and before the build, .koi-runtime/ included: each path, its type, its permission bits, a file's size and the SHA-256 of its bytes, a symlink's target, every directory whether or not it holds a file, which paths are hard links to one file, and fifos, sockets and devices by path and mode, never opened. Owners and times are left out. Two deployments with the same digest read the same source. Bind evidence to deployment.deploymentId together with source.digest; use source.tree to learn which commit's content that is. The format is in packages/daemon/src/source-tree.ts."
+						},
+						"tree": {
+							"description": "The git tree id of the source files the build read, .koi-runtime/ left out: a file is a blob of its bytes as unpacked, 100755 when the owner may execute it and 100644 otherwise, a symlink a blob of its target, a directory with no file under it left out. When the build read exactly a commit's files it is what git rev-parse COMMIT^{tree} prints. It keeps only what git keeps, so builds that differ in empty directories, other permission bits or hard links share it; source.digest tells them apart. To learn which commit's content a deployment read, compare tree with a tree you compute yourself from your own copy of the repository: git rev-parse COMMIT^{tree}, or, where git converts files on checkout (eol=crlf, core.autocrlf, a filter such as LFS) or the commit has a submodule, what git archive COMMIT | bun scripts/source-tree.ts - prints. Absent when the source holds a fifo, socket or device, which git has no object for.",
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
 						},
 						"runtimeTree": {
-							"description": "The git tree id of .koi-runtime/, the files koi adds to every build (changed-files.txt, which decides what a slicing recipe keeps), computed by koid the same way. No commit holds them. Absent for an upload without them.",
+							"description": "The git tree id of .koi-runtime/, the files koi adds to every build (changed-files.txt, which decides what a slicing recipe keeps), computed by koid the same way. No commit holds them. Absent for an upload without them, and whenever tree is.",
 							"type": "string",
 							"pattern": "^[0-9a-f]{40}$"
 						},
 						"matchesCommit": {
-							"description": "Whether tree is the tree of the deployment's commit, as koid read it from the commit object the request carried, which koid checked hashes to that commit. true means the build read exactly the commit's files. false for changes not in the commit, and for a checkout git converts files in or with a submodule, as tree says. Absent when the request carried no commit object, as from a koi older than this field.",
+							"description": "Whether tree is exactly the tree of the deployment's commit, as koid read it from the commit object the request carried, which koid checked hashes to that commit. true means the build read exactly the commit's files as git stores them. false says only that tree differs from the commit's: a change not committed, a file git converts on checkout and a submodule each make it false, and dirty, which is only the CLI's report, does not tell which. Absent when the request carried no commit object, as from a koi older than this field, and when tree is.",
 							"type": "boolean"
 						}
 					},
 					"required": [
-						"tree"
+						"digest"
 					],
 					"additionalProperties": false
 				}

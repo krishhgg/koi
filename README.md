@@ -31,11 +31,15 @@ The JSON that `koi up`, `koi lease` and `koi release` print carries `schemaVersi
 1 for each command. For a recipe that reports what its slice kept, `koi up` also prints
 `slice`: the JSON object the recipe's build wrote, whose shape the recipe defines. It
 describes `deployment`, which after a failed rebuild is the previous build.
-`deployment.source` says what that build read, as koid hashed it from the tarball it
-unpacked: `tree`, the git tree id of the project's files, which is `git rev-parse
-COMMIT^{tree}` for a build of exactly that commit, and `matchesCommit`, whether it is.
-`dirty` is the CLI's own `git status` of the working tree it packed. A clean checkout
-in which git converts files on checkout (line endings, LFS) gives another tree; see
+`deployment.source` says what that build read, as koid hashed the directory it
+unpacked the upload into: `digest`, exact over every file the build read,
+`.koi-runtime/` included; `tree`, the git tree id of the project's files, which is `git
+rev-parse COMMIT^{tree}` for a build of exactly that commit; and `matchesCommit`,
+whether it is. Bind evidence to `deployment.deploymentId` and `deployment.source.digest`,
+and compare `tree` with a tree you compute from your own copy of the repository to know
+which commit's content the build read. `dirty` is the CLI's own `git status` of the
+working tree it packed, always false with `--pr`. A clean checkout in which git
+converts files on checkout (line endings, LFS) gives another tree; see
 [What a deployment was built from](docs/design.md#what-a-deployment-was-built-from). `--keep NAME`,
 repeatable, asks such a recipe to keep NAME whatever the change touched; see Recipes in
 [docs/design.md](docs/design.md). [schemas/](schemas/) holds a JSON Schema (draft 2020-12) of each,

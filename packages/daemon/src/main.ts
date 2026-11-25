@@ -20,7 +20,7 @@ import { RateLimit } from './ratelimit.ts';
 import { loadBuiltinRecipe, readRecipe } from './recipes.ts';
 import { MAX_SECRET_VALUES, SecretRegistry } from './redact.ts';
 import { createHttpServer } from './server.ts';
-import { sourceTrees } from './source-tree.ts';
+import { hashSourceDir } from './source-tree.ts';
 import { PreviewStore } from './store.ts';
 import { Verification } from './verification.ts';
 import { sudoHelper, VerificationNetwork } from './verification-network.ts';
@@ -169,7 +169,7 @@ async function daemon(): Promise<void> {
 		readRecipe,
 		keepAwake: () => activity.touch(true),
 		extract: extractTarball,
-		hashSource: (tarball) => sourceTrees(tarball),
+		hashSource: (dir, signal) => hashSourceDir(dir, { signal }),
 		resolveInside,
 		diskSpace: () => diskSpace(config.dockerRoot),
 		probe,

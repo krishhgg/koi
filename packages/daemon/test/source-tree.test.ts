@@ -1,11 +1,13 @@
 import { describe, expect, test } from 'bun:test';
-import { link, mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { chmod, link, mkdir, mkdtemp, rm, rmdir, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { gzipSync } from 'node:zlib';
 import { exec } from '../../cli/src/exec.ts';
 import { cliGit, finishTarball, koiFiles, packWorkingTree } from '../../cli/src/git.ts';
-import { sourceTrees } from '../src/source-tree.ts';
+import { hashSourceDir, hashSourceTarball } from '../src/source-tree.ts';
+
+const DIGEST = expect.stringMatching(/^sha256:[0-9a-f]{64}$/);
 
 // A repository whose one commit has what a tree id must get right: nested
 // directories, an executable, a symlink, an empty file, bytes that are not
@@ -85,37 +87,39 @@ async function runtimeTreeOf(dir: string, text: string): Promise<string> {
 	return tree.stdout.trim();
 }
 
-describe('sourceTrees', () => {
+describe('hashSourceTarball, as koid unpacks and walks an upload', () => {
 	test("gives a commit's tree for git archive of it, as koi up --pr uploads it", async () => {
 		const { dir, git, tree } = await repo();
-		const out = await sourceTrees(await archived(dir, await git('rev-parse', 'HEAD'), ['a/x']));
-		expect(out).toEqual({ tree, runtimeTree: await runtimeTreeOf(dir, 'a/x\n') });
+		const out = await hashSourceTarball(
+			await archived(dir, await git('rev-parse', 'HEAD'), ['a/x']),
+		);
+		expect(out).toEqual({ digest: DIGEST, tree, runtimeTree: await runtimeTreeOf(dir, 'a/x\n') });
 	});
 
 	test("gives HEAD's tree for a clean working tree, and the tree of its files once they change", async () => {
 		const { dir, tree } = await repo();
-		const clean = await sourceTrees(await packed(dir));
+		const clean = await hashSourceTarball(await packed(dir));
 		expect(clean.tree).toBe(tree);
 		expect(clean.runtimeTree).toBe(await runtimeTreeOf(dir, '\n'));
 
 		// A change not committed: another tree, the one git would commit.
 		await writeFile(join(dir, 'src/app.ts'), 'export const changed = 1;\n');
-		const edited = await sourceTrees(await packed(dir));
+		const edited = await hashSourceTarball(await packed(dir));
 		expect(edited.tree).not.toBe(tree);
 		expect(edited.tree).toBe(await workingTree(dir));
 
 		// An untracked file is in the tarball too, so in the tree.
 		await writeFile(join(dir, 'src/app.ts'), 'export {};\n');
-		expect((await sourceTrees(await packed(dir))).tree).toBe(tree);
+		expect((await hashSourceTarball(await packed(dir))).tree).toBe(tree);
 		await writeFile(join(dir, 'notes.txt'), 'untracked\n');
-		const untracked = await sourceTrees(await packed(dir));
+		const untracked = await hashSourceTarball(await packed(dir));
 		expect(untracked.tree).not.toBe(tree);
 		expect(untracked.tree).toBe(await workingTree(dir));
 
 		// So is a file whose mode alone changed.
 		await rm(join(dir, 'notes.txt'));
 		await exec(['chmod', '+x', join(dir, 'Dockerfile')]);
-		const mode = await sourceTrees(await packed(dir));
+		const mode = await hashSourceTarball(await packed(dir));
 		expect(mode.tree).not.toBe(tree);
 		expect(mode.tree).toBe(await workingTree(dir));
 	});
@@ -126,7 +130,7 @@ describe('sourceTrees', () => {
 		await exec(['tar', '-cf', tar, '--exclude=./.git', '-C', dir, '.']);
 		expect((await exec(['tar', '-tf', tar])).stdout).toStartWith('./\n');
 		await exec(['gzip', '-n', '-f', tar]);
-		expect(await sourceTrees(`${tar}.gz`)).toEqual({ tree });
+		expect(await hashSourceTarball(`${tar}.gz`)).toEqual({ digest: DIGEST, tree });
 	});
 
 	test('reads a second name GNU tar packs as a hard link as the file it links to', async () => {
@@ -138,7 +142,7 @@ describe('sourceTrees', () => {
 		const tarball = await packed(dir);
 		const listing = (await exec(['tar', '-tvzf', tarball])).stdout;
 		expect(listing).toMatch(/^h.* a\.b link to a-b$/m);
-		expect((await sourceTrees(tarball)).tree).toBe(await git('rev-parse', 'HEAD^{tree}'));
+		expect((await hashSourceTarball(tarball)).tree).toBe(await git('rev-parse', 'HEAD^{tree}'));
 	});
 
 	test('leaves out a directory with no file under it, as git does, so a submodule never matches', async () => {
@@ -150,7 +154,7 @@ describe('sourceTrees', () => {
 		const withSub = await git('rev-parse', 'HEAD^{tree}');
 		const tarball = await archived(dir, await git('rev-parse', 'HEAD'));
 		expect((await exec(['tar', '-tzf', tarball])).stdout.split('\n')).toContain('sub/');
-		const out = await sourceTrees(tarball);
+		const out = await hashSourceTarball(tarball);
 		expect(out.tree).not.toBe(withSub);
 		expect(out.tree).toBe(tree);
 	});
@@ -163,7 +167,7 @@ describe('sourceTrees', () => {
 		await git('commit', '-q', '-m', 'bat');
 		const commitTree = await git('rev-parse', 'HEAD^{tree}');
 		expect(commitTree).not.toBe(tree);
-		const out = await sourceTrees(await archived(dir, await git('rev-parse', 'HEAD')));
+		const out = await hashSourceTarball(await archived(dir, await git('rev-parse', 'HEAD')));
 		expect(out.tree).not.toBe(commitTree);
 		// The tree of the same files with build.bat as git archive wrote it,
 		// CRLF line endings and all.
@@ -189,10 +193,10 @@ describe('sourceTrees', () => {
 		await cliGit(dir).archive(commit, plain);
 		const fromStdin = Bun.spawnSync(['bun', script, '-'], { stdin: Bun.file(plain) });
 		expect(fromStdin.stderr.toString()).toBe('');
-		expect(JSON.parse(fromStdin.stdout.toString())).toEqual({ tree });
+		expect(JSON.parse(fromStdin.stdout.toString())).toEqual({ digest: DIGEST, tree });
 		const gz = await archived(dir, commit, ['a/x']);
 		const fromFile = Bun.spawnSync(['bun', script, gz]);
-		expect(JSON.parse(fromFile.stdout.toString())).toEqual(await sourceTrees(gz));
+		expect(JSON.parse(fromFile.stdout.toString())).toEqual(await hashSourceTarball(gz));
 	});
 
 	test('streams a large file through, past any one chunk', async () => {
@@ -213,138 +217,137 @@ describe('sourceTrees', () => {
 		const blob = await g(['hash-object', '-w', '--no-filters', join(src, 'big.bin')]);
 		const sub = await g(['mktree'], `100644 blob ${blob}\tbig.bin\n`);
 		const root = await g(['mktree'], `040000 tree ${sub}\tsrc\n`);
-		expect(await sourceTrees(`${tar}.gz`)).toEqual({ tree: root });
+		expect(await hashSourceTarball(`${tar}.gz`)).toEqual({ digest: DIGEST, tree: root });
 	});
 });
 
-// A tar header by hand, for what neither git nor GNU tar writes: ustar,
-// with the name and link target given and a correct checksum.
-function header(name: string, type: string, size = 0, linkname = ''): Uint8Array {
-	const h = new Uint8Array(512);
-	const put = (text: string, at: number, length: number) =>
-		h.set(new TextEncoder().encode(text).subarray(0, length), at);
-	put(name, 0, 100);
-	put('0000644\0', 100, 8);
-	put('0000000\0', 108, 8);
-	put('0000000\0', 116, 8);
-	put(`${size.toString(8).padStart(11, '0')}\0`, 124, 12);
-	put('00000000000\0', 136, 12);
-	put(type, 156, 1);
-	put(linkname, 157, 100);
-	put('ustar\0', 257, 6);
-	put('00', 263, 2);
-	put('        ', 148, 8);
-	const sum = h.reduce((a, b) => a + b, 0);
-	put(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8);
-	return h;
-}
+describe('hashSourceDir', () => {
+	const sha256 = (bytes: string | Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+	const listing = (...fields: string[]) =>
+		`sha256:${sha256(['koi-source-digest/1', ...fields].map((f) => `${f}\0`).join(''))}`;
+	const scratch = () => mkdtemp(join(tmpdir(), 'koi-walk-'));
 
-function data(text: string): Uint8Array {
-	const bytes = new TextEncoder().encode(text);
-	const out = new Uint8Array(Math.ceil(bytes.length / 512) * 512);
-	out.set(bytes);
-	return out;
-}
-
-function pax(records: Record<string, string>): string {
-	let body = '';
-	for (const [key, value] of Object.entries(records)) {
-		const rest = ` ${key}=${value}\n`;
-		let length = rest.length + 1;
-		while (`${length}${rest}`.length !== length) length += 1;
-		body += `${length}${rest}`;
-	}
-	return body;
-}
-
-async function tarballOf(...parts: Array<Uint8Array | string>): Promise<string> {
-	const blocks = parts.map((p) => (typeof p === 'string' ? data(p) : p));
-	const end = new Uint8Array(1024);
-	const all = new Uint8Array([...blocks.flatMap((b) => [...b]), ...end]);
-	const file = join(await mkdtemp(join(tmpdir(), 'koi-hand-')), 'source.tar.gz');
-	await writeFile(file, gzipSync(all));
-	return file;
-}
-
-describe('sourceTrees refuses a tarball its id could not describe exactly', () => {
-	const file = (name: string, text: string) => [header(name, '0', text.length), text];
-
-	test('a path given twice', async () => {
-		await expect(
-			sourceTrees(await tarballOf(...file('a', 'x'), ...file('a', 'y'))),
-		).rejects.toThrow('"a" is in the archive twice');
+	test('hashes the listing source-tree.ts describes, sorted by path with a directory read as ending in /', async () => {
+		const dir = await scratch();
+		await writeFile(join(dir, 'a.b'), 'hi\n');
+		await mkdir(join(dir, 'a'));
+		await symlink('../a.b', join(dir, 'a', 'l'));
+		await link(join(dir, 'a.b'), join(dir, 'a', 'h'));
+		await chmod(join(dir, 'a.b'), 0o640);
+		await chmod(join(dir, 'a'), 0o750);
+		const out = await hashSourceDir(dir);
+		expect(out.digest).toBe(
+			listing(
+				...['file', 'a.b', '0640', '3', sha256('hi\n')],
+				...['dir', 'a/', '0750'],
+				...['hardlink', 'a/h', 'a.b'],
+				...['symlink', 'a/l', '0777', '../a.b'],
+			),
+		);
+		expect(out.tree).toMatch(/^[0-9a-f]{40}$/);
 	});
 
-	test('a path that is a file and a directory, as under a symlink', async () => {
-		await expect(
-			sourceTrees(await tarballOf(header('a', '2', 0, '/etc'), ...file('a/passwd', 'x'))),
-		).rejects.toThrow('"a" is both a file and a directory');
+	test('an empty directory and permission bits git does not keep change the digest, not the tree', async () => {
+		const dir = await scratch();
+		await writeFile(join(dir, 'f'), 'x\n');
+		await chmod(join(dir, 'f'), 0o644);
+		const before = await hashSourceDir(dir);
+
+		await mkdir(join(dir, 'empty'));
+		const empty = await hashSourceDir(dir);
+		expect(empty.tree).toBe(before.tree as string);
+		expect(empty.digest).not.toBe(before.digest);
+		await rmdir(join(dir, 'empty'));
+		expect(await hashSourceDir(dir)).toEqual(before);
+
+		await chmod(join(dir, 'f'), 0o600);
+		const mode = await hashSourceDir(dir);
+		expect(mode.tree).toBe(before.tree as string);
+		expect(mode.digest).not.toBe(before.digest);
+		// The owner's execute bit is one git keeps.
+		await chmod(join(dir, 'f'), 0o700);
+		expect((await hashSourceDir(dir)).tree).not.toBe(before.tree as string);
 	});
 
-	test('a path tar would unpack elsewhere', async () => {
-		for (const name of ['../x', '/etc/passwd', 'a//b', 'a/./b']) {
-			await expect(sourceTrees(await tarballOf(...file(name, 'x')))).rejects.toThrow(
-				'which is not a plain relative path',
-			);
+	test('a hard link and a copy of the same bytes share a tree, not a digest', async () => {
+		const copied = await scratch();
+		await writeFile(join(copied, 'a'), 'same\n');
+		await writeFile(join(copied, 'b'), 'same\n');
+		const linked = await scratch();
+		await writeFile(join(linked, 'a'), 'same\n');
+		await link(join(linked, 'a'), join(linked, 'b'));
+		for (const dir of [copied, linked]) {
+			await chmod(join(dir, 'a'), 0o644);
+			await chmod(join(dir, 'b'), 0o644);
 		}
+		const copy = await hashSourceDir(copied);
+		const hard = await hashSourceDir(linked);
+		expect(hard.tree).toBe(copy.tree as string);
+		expect(hard.digest).not.toBe(copy.digest);
 	});
 
-	test('an entry that is not a file, symlink, hard link to a file or directory', async () => {
-		await expect(sourceTrees(await tarballOf(header('dev', '3')))).rejects.toThrow(
-			'"dev" is a character device',
+	test('records a fifo by path and mode without opening it, and gives no tree', async () => {
+		const dir = await scratch();
+		await writeFile(join(dir, 'x'), 'x\n');
+		await chmod(join(dir, 'x'), 0o644);
+		await mkdir(join(dir, '.koi-runtime'));
+		await chmod(join(dir, '.koi-runtime'), 0o755);
+		// No process ever opens the other end, so an open to read it would
+		// wait forever.
+		expect((await exec(['mkfifo', '-m', '600', join(dir, '.koi-runtime', 'p')])).code).toBe(0);
+		expect(await hashSourceDir(dir)).toEqual({
+			digest: listing(
+				...['dir', '.koi-runtime/', '0755'],
+				...['fifo', '.koi-runtime/p', '0600'],
+				...['file', 'x', '0644', '2', sha256('x\n')],
+			),
+			noTree: '".koi-runtime/p" is a fifo, which git has no object for',
+		});
+		// .koi-runtime/ as anything but a directory leaves no tree either.
+		await rm(join(dir, '.koi-runtime'), { recursive: true });
+		await writeFile(join(dir, '.koi-runtime'), '');
+		expect((await hashSourceDir(dir)).noTree).toBe('".koi-runtime" is a file, not a directory');
+	});
+
+	test('reads names as bytes, as git does', async () => {
+		const dir = await scratch();
+		const name = Buffer.from('caf\xe9.txt', 'latin1');
+		await writeFile(Buffer.concat([Buffer.from(`${dir}/`), name]), 'latin1\n');
+		await writeFile(join(dir, 'café.txt'), 'utf-8\n');
+		const git = (...args: string[]) =>
+			exec(['git', '-C', dir, ...args]).then((r) => {
+				if (r.code !== 0) throw new Error(r.stderr);
+				return r.stdout.trim();
+			});
+		await git('init', '-q');
+		await git('add', '-A');
+		const tree = await git('write-tree');
+		await rm(join(dir, '.git'), { recursive: true });
+		expect((await hashSourceDir(dir)).tree).toBe(tree);
+	});
+
+	test('stops past the limits unpacking has, counting a file with two names once', async () => {
+		const dir = await scratch();
+		await writeFile(join(dir, 'a'), 'x');
+		await link(join(dir, 'a'), join(dir, 'b'));
+		await mkdir(join(dir, 'c'));
+		await expect(hashSourceDir(dir, { limits: { entries: 2, bytes: 100 } })).rejects.toThrow(
+			'the source has more than 2 files and directories',
 		);
-		await expect(sourceTrees(await tarballOf(header('fifo', '6')))).rejects.toThrow(
-			'"fifo" is a fifo',
-		);
-		await expect(sourceTrees(await tarballOf(header('l', '1', 0, 'missing')))).rejects.toThrow(
-			'which is not a file before it in the archive',
+		expect((await hashSourceDir(dir, { limits: { entries: 3, bytes: 1 } })).tree).toBeDefined();
+		await writeFile(join(dir, 'c', 'd'), 'y');
+		await expect(hashSourceDir(dir, { limits: { entries: 10, bytes: 1 } })).rejects.toThrow(
+			'the source unpacks to more than 1 bytes',
 		);
 	});
 
-	test('a PAX record that could change what an entry holds', async () => {
-		const records = pax({ size: '1' });
-		await expect(
-			sourceTrees(await tarballOf(header('x', 'x', records.length), records, ...file('a', 'x'))),
-		).rejects.toThrow('a PAX record "size"');
-	});
-
-	test('a symlink with data, and data after the end of the archive', async () => {
-		await expect(sourceTrees(await tarballOf(header('l', '2', 1, 'a'), 'x'))).rejects.toThrow(
-			'"l" is a symlink with data',
+	test('stops when the build is aborted', async () => {
+		const dir = await scratch();
+		await writeFile(join(dir, 'a'), 'x');
+		const stop = new AbortController();
+		stop.abort(new Error('koi down removed the preview'));
+		await expect(hashSourceDir(dir, { signal: stop.signal })).rejects.toThrow(
+			'koi down removed the preview',
 		);
-		const tail = [...file('a', 'x'), new Uint8Array(512), ...file('b', 'y')];
-		await expect(sourceTrees(await tarballOf(...tail))).rejects.toThrow(
-			'the archive has data after its end',
-		);
-	});
-
-	test('more entries or bytes than unpacking takes', async () => {
-		const two = await tarballOf(...file('a', 'x'), ...file('b', 'y'));
-		await expect(sourceTrees(two, { entries: 1, bytes: 100 })).rejects.toThrow(
-			'more than 1 files and directories',
-		);
-		await expect(sourceTrees(two, { entries: 10, bytes: 1 })).rejects.toThrow(
-			'unpacks to more than 1 bytes',
-		);
-	});
-
-	test('reads a PAX path, and names a tree a hand-made archive gives', async () => {
-		const records = pax({ path: 'renamed.txt', mtime: '1' });
-		const out = await sourceTrees(
-			await tarballOf(header('x', 'x', records.length), records, ...file('ignored', 'hi\n')),
-		);
-		// git mktree of one file renamed.txt holding "hi\n".
-		const dir = await mkdtemp(join(tmpdir(), 'koi-hand-git-'));
-		await exec(['git', 'init', '-q', '--bare', dir]);
-		const blob = (
-			await exec(['git', 'hash-object', '-w', '--stdin'], { stdin: 'hi\n', env: { GIT_DIR: dir } })
-		).stdout.trim();
-		const tree = (
-			await exec(['git', 'mktree'], {
-				stdin: `100644 blob ${blob}\trenamed.txt\n`,
-				env: { GIT_DIR: dir },
-			})
-		).stdout.trim();
-		expect(out).toEqual({ tree });
 	});
 });
