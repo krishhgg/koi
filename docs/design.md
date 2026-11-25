@@ -220,11 +220,18 @@ empty directory, and, for `--pr`, an `export-ignore` or `export-subst` attribute
 rocketride-server is one such repository: four `.bat` and `.cmd` files are
 `eol=crlf`. `matchesCommit` false says only that the trees differ, and `dirty` cannot
 say why. For such a repository the consumer computes the tree it expects from its
-own copy, as `koi up --pr` uploads the commit, `git archive COMMIT | bun
-scripts/source-tree.ts -`, and compares it with `tree`. The script unpacks the
-archive with koid's `extractTarball` and walks it with `hashSourceDir`, so it and
-koid cannot disagree. `git archive` must run with the same `core.autocrlf` and
-attributes as the build's.
+own copy, packed the way the build's upload was, and compares it with `tree`:
+
+- `koi up --pr` uploads `git archive` of the merge commit, so: `git archive COMMIT |
+  bun scripts/source-tree.ts -`, with the same `core.autocrlf` and attributes as the
+  build's. `export-ignore` and `export-subst` apply here.
+- A local build uploads the working tree's files that `git ls-files --cached --others
+  --exclude-standard` lists, as checked out, and no attribute leaves one out. For a
+  clean checkout of COMMIT, with the same `core.autocrlf`: `git ls-files -z | tar
+  --null -T - -czf - | bun scripts/source-tree.ts -`.
+
+The script unpacks the archive with koid's `extractTarball` and walks it with
+`hashSourceDir`, so it and koid cannot disagree on the same bytes.
 
 A walk that fails loses `source`, and the build goes on and says why in its log: an
 entry the walk cannot read, a file that changed while it was read, or more than the

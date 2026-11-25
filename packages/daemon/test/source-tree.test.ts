@@ -286,6 +286,20 @@ describe('hashSourceDir', () => {
 		expect(hard.digest).not.toBe(copy.digest);
 	});
 
+	test('a hard-linked symlink and two symlinks to one target share a tree, not a digest', async () => {
+		const separate = await scratch();
+		await symlink('t', join(separate, 'a'));
+		await symlink('t', join(separate, 'b'));
+		const linked = await scratch();
+		await symlink('t', join(linked, 'a'));
+		// link(2) does not follow a symlink on Linux: b is a second name for a.
+		await link(join(linked, 'a'), join(linked, 'b'));
+		const apart = await hashSourceDir(separate);
+		const hard = await hashSourceDir(linked);
+		expect(hard.tree).toBe(apart.tree as string);
+		expect(hard.digest).not.toBe(apart.digest);
+	});
+
 	test('records a fifo by path and mode without opening it, and gives no tree', async () => {
 		const dir = await scratch();
 		await writeFile(join(dir, 'x'), 'x\n');

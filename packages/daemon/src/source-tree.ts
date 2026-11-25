@@ -116,12 +116,16 @@ interface Child {
 	stats: BigIntStats;
 }
 
-// An entry of a git tree object.
-interface GitEntry {
-	name: Buffer;
-	key: Buffer;
+// What a git tree says of one name: its mode and object id.
+interface GitBlob {
 	mode: string;
 	oid: Buffer;
+}
+
+// An entry of a git tree object.
+interface GitEntry extends GitBlob {
+	name: Buffer;
+	key: Buffer;
 }
 
 const SLASH = Buffer.from('/');
@@ -155,7 +159,9 @@ class Walk {
 	private readonly digest = createHash('sha256').update('koi-source-digest/1\0');
 	private readonly buffer = Buffer.allocUnsafe(READ_BYTES);
 	// The first path, and the blob id, of each file with more than one name.
-	private readonly inodes = new Map<string, { path: Buffer; oid: Buffer; mode: string }>();
+	// The first path of each inode with more than one name, and its entry in a
+	// git tree (none for a type git has no object for).
+	private readonly inodes = new Map<string, { path: Buffer; blob: GitBlob | undefined }>();
 	private entries = 0;
 	private bytes = 0;
 	private noTree: string | undefined;
@@ -215,24 +221,39 @@ class Walk {
 	// Writes the record of one entry and returns its mode and id in a git
 	// tree, or undefined for a directory with no file under it and an entry
 	// git has no object for.
-	private async entry(
-		abs: Buffer,
-		path: Buffer,
-		stats: BigIntStats,
-	): Promise<{ mode: string; oid: Buffer } | undefined> {
+	private async entry(abs: Buffer, path: Buffer, stats: BigIntStats): Promise<GitBlob | undefined> {
 		const mode = (Number(stats.mode) & 0o7777).toString(8).padStart(4, '0');
 		if (stats.isDirectory()) {
 			this.record('dir', path, mode);
 			const oid = treeId(await this.directory(abs, path));
 			return oid !== undefined ? { mode: '40000', oid } : undefined;
 		}
-		if (stats.isFile()) {
-			const inode = stats.nlink > 1n ? `${stats.dev}:${stats.ino}` : undefined;
-			const first = inode !== undefined ? this.inodes.get(inode) : undefined;
-			if (first !== undefined) {
-				this.record('hardlink', path, first.path);
-				return { mode: first.mode, oid: first.oid };
+		// GNU tar links a second name to any type but a directory, a symlink
+		// or a fifo included, so every one of them is recorded as a link to
+		// the first name. In a git tree each name stays what that one is.
+		const inode = stats.nlink > 1n ? `${stats.dev}:${stats.ino}` : undefined;
+		const first = inode !== undefined ? this.inodes.get(inode) : undefined;
+		if (first !== undefined) {
+			this.record('hardlink', path, first.path);
+			if (first.blob === undefined) {
+				this.noTree ??= `${quoted(path)} is ${kind(stats)}, which git has no object for`;
 			}
+			return first.blob;
+		}
+		const blob = await this.leaf(abs, path, stats, mode);
+		if (inode !== undefined) this.inodes.set(inode, { path, blob });
+		return blob;
+	}
+
+	// Writes the record of a file, symlink or other entry that is not a
+	// directory, seen under its first name.
+	private async leaf(
+		abs: Buffer,
+		path: Buffer,
+		stats: BigIntStats,
+		mode: string,
+	): Promise<GitBlob | undefined> {
+		if (stats.isFile()) {
 			const size = Number(stats.size);
 			this.bytes += size;
 			if (this.bytes > this.limits.bytes) {
@@ -240,9 +261,7 @@ class Walk {
 			}
 			const { oid, sha256 } = await this.file(abs, path, stats);
 			this.record('file', path, mode, String(size), sha256);
-			const blob = { mode: (Number(stats.mode) & 0o100) !== 0 ? '100755' : '100644', oid };
-			if (inode !== undefined) this.inodes.set(inode, { path, ...blob });
-			return blob;
+			return { mode: (Number(stats.mode) & 0o100) !== 0 ? '100755' : '100644', oid };
 		}
 		if (stats.isSymbolicLink()) {
 			const target = await readlink(abs, { encoding: 'buffer' });

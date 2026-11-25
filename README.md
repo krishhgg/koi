@@ -31,9 +31,10 @@ The JSON that `koi up`, `koi lease` and `koi release` print carries `schemaVersi
 1 for each command. For a recipe that reports what its slice kept, `koi up` also prints
 `slice`: the JSON object the recipe's build wrote, whose shape the recipe defines. It
 describes `deployment`, which after a failed rebuild is the previous build.
-`deployment.source` says what that build read, as koid hashed the directory it
-unpacked the upload into: `digest`, exact over every file the build read,
-`.koi-runtime/` included; `tree`, the git tree id of the project's files, which is `git
+`deployment.source` describes the upload that build was given, as koid hashed the
+directory it unpacked it into, before the build: `digest`, exact over every entry of
+that directory, `.koi-runtime/` included (which of them the Docker build reads is up to
+the recipe's Dockerfile and `.dockerignore`); `tree`, the git tree id of the project's files, which is `git
 rev-parse COMMIT^{tree}` for a build of exactly that commit; and `matchesCommit`,
 whether it is. Bind evidence to `deployment.deploymentId` and `deployment.source.digest`,
 and compare `tree` with a tree you compute from your own copy of the repository to know
