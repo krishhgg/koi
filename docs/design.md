@@ -172,7 +172,7 @@ them, and never takes a value from the CLI.
   mode, never opened. Records are sorted by path as bytes and each field ends in a
   NUL; `Walk` in the source file gives the format. Owners and times are left out:
   koid owns every file it unpacks, and two uploads of the same files carry different
-  times. Two deployments with the same `digest` read the same source. tar applies koid's umask to the permission bits
+  times. Two deployments with the same `digest` were given the same unpacked upload. tar applies koid's umask to the permission bits
   (`--no-same-permissions`), so a digest computed elsewhere matches koid's only under
   the same umask.
 - `tree` is git's view of the same files, `.koi-runtime/` left out. A regular file is
