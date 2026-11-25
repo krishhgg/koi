@@ -149,6 +149,110 @@ The CLI uploads a tarball of the source to an S3 bucket and tells the daemon on 
 box to build it, through SSM. Only people with AWS credentials for the account can
 run `koi up`.
 
+### What a deployment was built from
+
+A pull request build and a build of a working tree both reach koid as a tarball the
+CLI made: `git archive` of the commit for `--pr`, the working tree's files for a
+working tree. koid never fetches source itself. Both builds report the same `commit`
+whether or not the working tree had changes, so koid also records what upload the
+build was given, as `source` on the deployment (`DeploymentSourceSchema` in
+`packages/shared/src/preview.ts`). `koi up --json` and `koi lease --json` print it as
+`deployment.source`.
+
+koid computes `source` from the directory it unpacked the tarball into
+(`hashSourceDir` in `packages/daemon/src/source-tree.ts`), after tar has run and
+before the build starts. It describes the unpacked upload, however tar wrote it, and
+never takes a value from the CLI.
+
+- `digest` is exact: `sha256:` and the SHA-256 of a listing of every entry under
+  that directory, `.koi-runtime/` included. The listing gives each entry's path, type
+  and permission bits (`st_mode & 07777`); a file's size and the SHA-256 of its bytes;
+  a symlink's target, never followed; every directory, empty or not; each further
+  name of a file as a hard link to the first; and a fifo, socket or device by path and
+  mode, never opened. Records are sorted by path as bytes and each field ends in a
+  NUL; `Walk` in the source file gives the format. Owners and times are left out:
+  koid owns every file it unpacks, and two uploads of the same files carry different
+  times. Two deployments with the same `digest` were given the same unpacked upload. tar applies koid's umask to the permission bits
+  (`--no-same-permissions`), so a digest computed elsewhere matches koid's only under
+  the same umask.
+- `tree` is git's view of the same files, `.koi-runtime/` left out. A regular file is
+  a blob of its bytes, mode 100755 when the owner may execute it and 100644 otherwise;
+  a symlink is a blob of its target; a hard link is a file like any other; a
+  directory is a tree of what is under it, and one with no file under it is left out,
+  as git leaves it out. For a build of exactly a commit's files, `tree` is what `git
+  rev-parse COMMIT^{tree}` prints, so anyone with the repository can check it
+  without the tarball. It keeps only what git keeps: builds that differ in an empty
+  directory, a permission bit other than the owner's execute bit, or which files are
+  hard links share a `tree` and not a `digest`. A source with a fifo, socket or
+  device has no `tree`, since git has no object for those, and the build log names
+  the entry.
+- `runtimeTree` is the tree id of `.koi-runtime/`, computed the same way. Those are
+  koi's own files (`changed-files.txt`), which no commit holds, so they stay out of
+  `tree`, where they would keep it from ever matching a commit. They are reported
+  rather than dropped because a recipe reads them: two builds of one tree with
+  different lists of changed files can keep different parts of the project.
+- `matchesCommit` says whether `tree` is exactly the commit's tree. The CLI sends the
+  commit object with the request (`commitObject`, `git cat-file commit` in base64),
+  and koid reads the tree from its first line only when the object hashes to
+  `commit` (`deploymentSourceOf`), so the CLI can name no tree but the one that
+  commit has. A commit object over 32 KiB, or one that is not UTF-8, is not sent;
+  koid says in the build log when one does not hash to the commit. Either way
+  `matchesCommit` is then absent, and it is absent whenever `tree` is.
+
+A consumer that records evidence about a preview binds it to
+`deployment.deploymentId` and `deployment.source.digest`. The deployment id names
+the build and its image; the digest names every entry of the unpacked upload, `.koi-runtime/`
+included. To know which commit's content that is, the consumer compares
+`source.tree` with a tree it computes itself from its own copy of the repository,
+never with one the CLI reports.
+
+`koi up --json` also prints `dirty`: whether `git status` saw changes in the working
+tree that `commit` does not have, untracked files included. It is the CLI's own
+report, which koid does not check, and it is always false with `--pr`.
+
+`matchesCommit` is strict: the two trees are equal or it is false. `tree` hashes the
+project's files in the unpacked upload as they are there, not as git stores them. A file git converts on
+checkout (`eol=crlf`, `core.autocrlf`, a filter such as LFS, `ident`) is in the
+tarball as checked out, and `git archive` converts it the same way, so a clean build
+of such a repository gives another tree than the commit's, and `matchesCommit` is
+false. So does a submodule, which the commit holds as a commit and the tarball as an
+empty directory, and, for `--pr`, an `export-ignore` or `export-subst` attribute.
+rocketride-server is one such repository: four `.bat` and `.cmd` files are
+`eol=crlf`. `matchesCommit` false says only that the trees differ, and `dirty` cannot
+say why. For such a repository the consumer computes the tree it expects from its
+own copy, packed the way the build's upload was, and compares it with `tree`:
+
+- `koi up --pr` uploads `git archive` of the merge commit, so: `git archive COMMIT |
+  bun scripts/source-tree.ts -`, with the same `core.autocrlf` and attributes as the
+  build's. `export-ignore` and `export-subst` apply here.
+- A local build uploads the working tree's files that `git ls-files --cached --others
+  --exclude-standard` lists, as checked out, and no attribute leaves one out. For a
+  clean checkout of COMMIT, with the same `core.autocrlf`: `git ls-files -z | tar
+  --null -T - -czf - | bun scripts/source-tree.ts -`.
+
+The script unpacks the archive with koid's `extractTarball` and walks it with
+`hashSourceDir`, so it and koid cannot disagree on the same bytes.
+
+A walk that fails loses `source`, and the build goes on and says why in its log: an
+entry the walk cannot read, a file that changed while it was read, or more than the
+limits unpacking has (4 GiB of files, 200,000 entries), which the walk counts again
+as it goes. It stops when the build is aborted, as `koi down` does.
+
+The walk reads each file once, through both hashes, and holds paths and ids, never a
+file's bytes. On an AMD Ryzen 9 6900HS, for rocketride-server (163 MB gzipped; 5,767
+files and 1,177 directories, 208 MB of files) it takes 1.1 s, after the 2.0 s koid's
+listing and unpacking take. Ten copies of that tree (1.66 GB gzipped, 69,450 entries,
+2.08 GB of files) take 11.2 s after 21.3 s of listing and unpacking, and the peak
+resident memory of the process went from 83 MiB to 141 MiB during the walk.
+
+`source` reaches the CLI in `koid ctl status` and `koid ctl lease`, beside
+`deployment` and not in it. The identity is a strict object, so a CLI from before
+`source` would refuse a deployment with a key it does not name; a key it does not
+know beside it is dropped. A koid from before `source` records none, and `koi up`
+prints no `deployment.source`. A CLI from before `commitObject` sends none, and koid
+records `digest`, `tree` and `runtimeTree` without `matchesCommit`. The request file a koid
+from before `commitObject` reads drops the field.
+
 ### Reviewer
 
 The link always points at CloudFront, which holds the certificate for

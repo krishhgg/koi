@@ -33,6 +33,10 @@
 			"pattern": "^[0-9a-f]{40}$",
 			"description": "What koi built: for a pull request, the merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit. The merge is GitHub's (refs/pull/N/merge), or one koi made itself from the same two parents when GitHub's stayed out of date; koi makes its own the same way every time, so the parents give the commit."
 		},
+		"dirty": {
+			"description": "Whether git saw changes in the working tree that commit does not have, untracked files included, when koi up packed it (git status): the CLI's own account, which koid does not check. Always false with --pr, which builds the commit as git archive gives it. koid's account of what the deployment read is deployment.source. Absent from a koi older than this field.",
+			"type": "boolean"
+		},
 		"pr": {
 			"description": "The pull request built, with --pr.",
 			"type": "integer",
@@ -64,7 +68,7 @@
 			"additionalProperties": false
 		},
 		"deployment": {
-			"description": "The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview.",
+			"description": "The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview, and deployment.source.tree with the tree it expects to tell a build of exactly that commit from one with changes not in it.",
 			"type": "object",
 			"properties": {
 				"label": {
@@ -104,6 +108,35 @@
 						"head",
 						"base",
 						"baseBranch"
+					],
+					"additionalProperties": false
+				},
+				"source": {
+					"description": "What the deployment was built from, as koid computed it from the directory it unpacked the source tarball into, before the build: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. Bind evidence to deployment.deploymentId together with source.digest, which covers every input file, .koi-runtime/ included. To learn which commit's content the build read, compare source.tree with the tree you expect, computed from your own copy of the repository.",
+					"type": "object",
+					"properties": {
+						"digest": {
+							"type": "string",
+							"pattern": "^sha256:[0-9a-f]{64}$",
+							"description": "The SHA-256 of a listing of every entry under the directory koid unpacked the source into, read after unpacking and before the build, .koi-runtime/ included: each path, its type, its permission bits, a file's size and the SHA-256 of its bytes, a symlink's target, every directory whether or not it holds a file, which paths are second names of an inode named earlier, and fifos, sockets and devices by path and mode, never opened. Owners and times are left out. Two deployments with the same digest were given the same unpacked upload; which of its entries the Docker build reads is up to the recipe's Dockerfile and .dockerignore. Bind evidence to deployment.deploymentId together with source.digest; use source.tree to learn which commit's content that is. The format is in packages/daemon/src/source-tree.ts."
+						},
+						"tree": {
+							"description": "The git tree id of the files of the upload koid unpacked for the build, .koi-runtime/ left out: a file is a blob of its bytes as unpacked, 100755 when the owner may execute it and 100644 otherwise, a symlink a blob of its target, a directory with no file under it left out. When the upload is exactly a commit's files it is what git rev-parse COMMIT^{tree} prints. It keeps only what git keeps, so uploads that differ in empty directories, other permission bits or hard links share it; source.digest tells them apart. To learn which commit's content an upload is, compare tree with a tree you compute yourself from your own copy of the repository, packed the way the build's upload was: for a koi up --pr build what git archive COMMIT | bun scripts/source-tree.ts - prints (export-ignore and export-subst apply), and for a local build of a clean checkout of COMMIT what git ls-files -z | tar --null -T - -czf - | bun scripts/source-tree.ts - prints, with the build's core.autocrlf. git rev-parse COMMIT^{tree} is a shortcut only where that packing keeps the commit's tree: no file git converts on checkout (eol=crlf, core.autocrlf, a filter such as LFS), no submodule, and for --pr no export-ignore or export-subst. Absent when the source holds a fifo, socket or device, which git has no object for.",
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"runtimeTree": {
+							"description": "The git tree id of .koi-runtime/, the files koi adds to every build (changed-files.txt, which decides what a slicing recipe keeps), computed by koid the same way. No commit holds them. Absent for an upload without them, and whenever tree is.",
+							"type": "string",
+							"pattern": "^[0-9a-f]{40}$"
+						},
+						"matchesCommit": {
+							"description": "Whether tree is exactly the tree of the deployment's commit, as koid read it from the commit object the request carried, which koid checked hashes to that commit. true means the upload is exactly the commit's files as git stores them. false says only that tree differs from the commit's: a change not committed, a file git converts on checkout and a submodule each make it false, and dirty, which is only the CLI's report, does not tell which. Absent when the request carried no commit object, as from a koi older than this field, and when tree is.",
+							"type": "boolean"
+						}
+					},
+					"required": [
+						"digest"
 					],
 					"additionalProperties": false
 				}

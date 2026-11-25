@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { LEASE_MAX_SECONDS, type PreviewRecord, RecipeSchema } from '@koi/shared';
+import { commitObjectId, LEASE_MAX_SECONDS, type PreviewRecord, RecipeSchema } from '@koi/shared';
 import { Activity } from '../src/activity.ts';
 import { caddyApplier, type Route } from '../src/caddy.ts';
 import {
@@ -15,6 +15,7 @@ import {
 	OwnershipError,
 	sameOwner,
 } from '../src/deployer.ts';
+import type { SourceHashes } from '../src/source-tree.ts';
 import { eventually, Gate, request, setup } from './fakes.ts';
 
 // 62 characters each: with quotes and commas, 63 of them make a live list of
@@ -3202,6 +3203,108 @@ describe('lease', () => {
 		const again = await t.deployer.acquireLease('hello-pr-7', 'dev@laptop', 60);
 		expect(again.deployment.deploymentId).toBe(replaced?.deploymentId ?? '');
 		expect(again.deployment.commit).toBe('b'.repeat(40));
+	});
+});
+
+describe('the source a deployment was built from', () => {
+	// A commit object naming `tree`, as git writes one, and the commit it is.
+	function commitNaming(tree: string): { commit: string; commitObject: string } {
+		const bytes = Buffer.from(
+			`tree ${tree}\nauthor t <t@example.com> 0 +0000\ncommitter t <t@example.com> 0 +0000\n\ninit\n`,
+		);
+		return { commit: commitObjectId(bytes), commitObject: bytes.toString('base64') };
+	}
+
+	async function withHash(hash: (dir: string, signal: AbortSignal) => Promise<SourceHashes>) {
+		const t = await setup();
+		t.deps.hashSource = hash;
+		t.restart();
+		return t;
+	}
+
+	async function buildLogOf(t: Awaited<ReturnType<typeof setup>>, label: string) {
+		const record = await t.store.get(label);
+		return readFile(join(t.stateDir, 'logs', label, `${record?.attempt}.build.log`), 'utf8');
+	}
+
+	const digest = `sha256:${'6'.repeat(64)}`;
+
+	test('is the hashes of the directory the build unpacked, and whether its tree is the commit tree, which the lease gives', async () => {
+		const walked: string[] = [];
+		const hashes = { digest, tree: '7'.repeat(40), runtimeTree: '8'.repeat(40) };
+		const t = await withHash(async (dir, signal) => {
+			// The directory extract unpacked into, walked with the build's
+			// signal, which koi down aborts.
+			expect(t.extracted).toContain(dir);
+			expect(signal.aborted).toBe(false);
+			walked.push(dir);
+			return hashes;
+		});
+		const match = commitNaming(hashes.tree);
+		await t.up(request(match));
+		const record = await t.store.get('hello-pr-7');
+		expect(walked).toEqual([join(t.stateDir, 'builds', 'hello-pr-7', 'aaaaaaaaaaaaaaaa1', 'src')]);
+		expect(record?.deployment?.source).toEqual({ ...hashes, matchesCommit: true });
+		expect(await buildLogOf(t, 'hello-pr-7')).toContain(
+			`source ${digest}, tree ${hashes.tree}, the tree of ${match.commit}\n`,
+		);
+		const lease = await t.deployer.acquireLease('hello-pr-7', 'dev@laptop', 60);
+		expect(lease.source).toEqual({ ...hashes, matchesCommit: true });
+		await t.deployer.releaseLease('hello-pr-7', lease.lease.leaseId);
+
+		// A commit whose tree is another. The log does not guess why: dirty
+		// is the CLI's word, already in the request line.
+		const other = commitNaming('9'.repeat(40));
+		await t.up(request({ id: 'bbbbbbbbbbbbbbbb2', dirty: false, ...other }));
+		const rebuilt = await t.store.get('hello-pr-7');
+		expect(rebuilt?.deployment?.source).toEqual({ ...hashes, matchesCommit: false });
+		expect(await buildLogOf(t, 'hello-pr-7')).toContain(
+			`source ${digest}, tree ${hashes.tree}, not the tree of ${other.commit} (${'9'.repeat(40)})\n`,
+		);
+
+		// No commit object, as from an older CLI: the hashes, and no answer.
+		await t.up(request({ id: 'cccccccccccccccc3', commit: 'c'.repeat(40) }));
+		expect((await t.store.get('hello-pr-7'))?.deployment?.source).toEqual(hashes);
+
+		// An object that is not the commit's, naming the tree koid found:
+		// koid does not take it, so it says nothing of the commit.
+		const forged = request({
+			id: 'dddddddddddddddd4',
+			commit: 'd'.repeat(40),
+			commitObject: match.commitObject,
+		});
+		await t.up(forged);
+		expect((await t.store.get('hello-pr-7'))?.deployment?.source).toEqual(hashes);
+		expect(await buildLogOf(t, 'hello-pr-7')).toContain(
+			`source ${digest}, tree ${hashes.tree}; the request's commit object is not that of ${'d'.repeat(40)}, so koid cannot say whether it is the tree of ${'d'.repeat(40)}\n`,
+		);
+	});
+
+	test('is the digest alone for a source git has no tree for, and the log says why', async () => {
+		const t = await withHash(async () => ({
+			digest,
+			noTree: '"p" is a fifo, which git has no object for',
+		}));
+		await t.up(request(commitNaming('7'.repeat(40))));
+		expect((await t.store.get('hello-pr-7'))?.deployment?.source).toEqual({ digest });
+		expect(await buildLogOf(t, 'hello-pr-7')).toContain(
+			`source ${digest}; no git tree: "p" is a fifo, which git has no object for\n`,
+		);
+	});
+
+	test('is left out when the walk fails, and the build goes on', async () => {
+		const t = await withHash(async () => {
+			throw new Error('the source has more than 200000 files and directories');
+		});
+		await t.up(request());
+		const record = await t.store.get('hello-pr-7');
+		expect(record?.status).toBe('running');
+		expect(record?.deployment?.source).toBeUndefined();
+		expect(await buildLogOf(t, 'hello-pr-7')).toContain(
+			'the source was not hashed: the source has more than 200000 files and directories\n',
+		);
+		const lease = await t.deployer.acquireLease('hello-pr-7', 'dev@laptop', 60);
+		expect('source' in lease).toBe(false);
 	});
 });
 

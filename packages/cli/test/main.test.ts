@@ -3,15 +3,18 @@ import { mkdir, mkdtemp, readdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type {
-	Deployment,
-	DeploymentIdentity,
-	LeaseReply,
-	PreviewRecord,
-	UpRequest,
+import {
+	type Deployment,
+	type DeploymentIdentity,
+	type DeploymentSource,
+	type LeaseReply,
+	type PreviewRecord,
+	type UpRequest,
+	UpRequestSchema,
 } from '@koi/shared';
 import { BuildLogs } from '../../daemon/src/buildlog.ts';
 import { CapacityError } from '../../daemon/src/deployer.ts';
+import { deploymentSourceOf, hashSourceTarball } from '../../daemon/src/source-tree.ts';
 import { USAGE } from '../src/args.ts';
 import { awsBox, type Box, type CtlResult } from '../src/box.ts';
 import { toYaml } from '../src/config-command.ts';
@@ -239,6 +242,30 @@ describe('run', () => {
 		);
 		expect(json.code).toBe(0);
 		expect(JSON.parse(json.stdout)).toEqual({ schemaVersion: 1, ...leaseReply });
+	});
+
+	test('lease puts the source koid says the deployment was built from in the deployment', async () => {
+		const source = {
+			digest: `sha256:${'6'.repeat(64)}`,
+			tree: '7'.repeat(40),
+			runtimeTree: '8'.repeat(40),
+			matchesCommit: true,
+		};
+		const runtime = fakeRuntime({
+			lease: { code: 0, stdout: JSON.stringify({ ...leaseReply, source }), stderr: '' },
+		});
+		const plain = await capture(['lease', 'hello-pr-7', '--minutes', '30'], runtime);
+		expect(plain.stdout).toEndWith(
+			`  commit      ${record.commit}\n  source      sha256:${'6'.repeat(64)}\n  tree        ${'7'.repeat(40)} (the commit's tree)\n`,
+		);
+		const json = await capture(['lease', 'hello-pr-7', '--minutes', '30', '--json'], runtime);
+		const out = JSON.parse(json.stdout);
+		expect(out).toEqual({
+			schemaVersion: 1,
+			lease: leaseReply.lease,
+			deployment: { ...identity, source },
+		});
+		expect(schemaErrors('koi-lease', out)).toEqual([]);
 	});
 
 	test('lease names the local user and host as the holder when none is given', async () => {
@@ -683,6 +710,7 @@ describe('run against koid through SSM', () => {
 			url: `https://${request?.label}.example.dev`,
 			status: 'running',
 			commit: expect.stringMatching(/^[0-9a-f]{40}$/),
+			dirty: false,
 			deployment: { ...identity, label: request?.label },
 			keysUrl: `https://keys.example.dev/?for=${request?.label}`,
 		});
@@ -903,6 +931,119 @@ async function upThroughKoid(record: (request: UpRequest) => PreviewRecord) {
 	return { ...r, request };
 }
 
+// koi up with `argv` against the real koid ctl and control API behind SSM,
+// where koid's record of the build has the source koid's own hash gives the
+// tarball koi up uploaded (deploymentSourceOf, as the deployer records it).
+async function upHashedByKoid(argv: string[], runtime: Pick<Runtime, 'cwd' | 'git' | 'github'>) {
+	let request: UpRequest | undefined;
+	let source: DeploymentSource | undefined;
+	const clients = koidClients(
+		koidDeps({
+			deployer: {
+				...koidDeps({}).deployer,
+				up: async () => ({ label: request?.label ?? '', queued: false }),
+			},
+			store: {
+				get: async () =>
+					request === undefined
+						? undefined
+						: previewRecord({
+								label: request.label,
+								requestId: request.id,
+								commit: request.commit,
+								status: 'running',
+								deployment: deployment({
+									requestId: request.id,
+									commit: request.commit,
+									...(source !== undefined ? { source } : {}),
+								}),
+							}),
+				list: async () => [],
+			},
+			buildLogs: { read: async () => ({ next: 0, lines: [] }), tail: async () => '' },
+		}),
+	);
+	const box: Box = {
+		...awsBox(settings, clients, async () => {}),
+		upload: async (r, tarball) => {
+			// koid reads the request file through the schema before it builds.
+			request = UpRequestSchema.parse(JSON.parse(JSON.stringify(r)));
+			source = deploymentSourceOf(await hashSourceTarball(tarball), request).source;
+		},
+	};
+	const r = await capture(argv, {
+		box: async () => ({ box, domain: 'previews.example.net' }),
+		sleep: async () => {},
+		...runtime,
+	});
+	if (request === undefined) throw new Error(`koi up uploaded nothing: ${r.stderr}`);
+	return { ...r, request, out: JSON.parse(r.stdout) };
+}
+
+describe('the source koid hashed from the upload, in koi up --json', () => {
+	const git = async (dir: string, ...args: string[]) =>
+		(await exec(['git', '-C', dir, ...args])).stdout.trim();
+
+	test("is the commit's tree for a clean checkout, and another with changes not committed", async () => {
+		const dir = await gitRepo();
+		const clean = await upHashedByKoid(['up', '--json'], { cwd: dir });
+		expect(clean.code).toBe(0);
+		expect(schemaErrors('koi-up', clean.out)).toEqual([]);
+		expect(clean.out.dirty).toBe(false);
+		// The commit's tree as git computes it, with no tarball.
+		expect(clean.out.deployment.source).toEqual({
+			digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+			tree: await git(dir, 'rev-parse', 'HEAD^{tree}'),
+			runtimeTree: expect.stringMatching(/^[0-9a-f]{40}$/),
+			matchesCommit: true,
+		});
+
+		// An edit and an untracked file, on the same commit.
+		await writeFile(join(dir, 'Dockerfile'), 'FROM busybox\n');
+		await writeFile(join(dir, 'notes.txt'), 'not committed\n');
+		const dirty = await upHashedByKoid(['up', '--json'], { cwd: dir });
+		expect(dirty.code).toBe(0);
+		expect(schemaErrors('koi-up', dirty.out)).toEqual([]);
+		expect(dirty.out.commit).toBe(clean.out.commit);
+		expect(dirty.out.dirty).toBe(true);
+		expect(dirty.out.deployment.source.matchesCommit).toBe(false);
+		expect(dirty.out.deployment.source.tree).not.toBe(clean.out.deployment.source.tree);
+		expect(dirty.out.deployment.source.digest).not.toBe(clean.out.deployment.source.digest);
+		// What git would commit from the working tree as it is.
+		const index = join(await mkdtemp(join(tmpdir(), 'koi-index-')), 'index');
+		const env = { GIT_INDEX_FILE: index };
+		await exec(['git', '-C', dir, 'add', '-A'], { env });
+		const working = (await exec(['git', '-C', dir, 'write-tree'], { env })).stdout.trim();
+		expect(dirty.out.deployment.source.tree).toBe(working);
+	});
+
+	test("is the merge commit's tree for a pull request", async () => {
+		const o = await pullRequestOrigin();
+		const github: GitHub = {
+			pullRequestBranches: async () => ({ head: 'feature', base: 'main' }),
+			pullRequestFiles: async () => ['pr.txt'],
+			pullRequestMergeState: async () => {
+				throw new Error('the merge is current; there is nothing to recompute');
+			},
+			upsertComment: async () => {
+				throw new Error('no comment in this test');
+			},
+		};
+		const r = await upHashedByKoid(['up', '--pr', '7', '--json'], {
+			cwd: o.user,
+			git: cliGit(o.user, asGitHub()),
+			github: () => github,
+		});
+		expect(r.code).toBe(0);
+		expect(schemaErrors('koi-up', r.out)).toEqual([]);
+		expect(r.out).toMatchObject({ commit: o.merge7, dirty: false });
+		expect(r.out.deployment.source).toMatchObject({
+			tree: await git(o.user, 'rev-parse', `${o.merge7}^{tree}`),
+			matchesCommit: true,
+		});
+	});
+});
+
 describe('--json output matches the JSON Schemas in schemas/', () => {
 	test('up, for a preview that runs the build it asked for', async () => {
 		const loginKey = `koi-${'k'.repeat(24)}`;
@@ -926,6 +1067,7 @@ describe('--json output matches the JSON Schemas in schemas/', () => {
 			url: `https://${label}.previews.example.net`,
 			status: 'running',
 			commit,
+			dirty: false,
 			deployment: {
 				label,
 				deploymentId: 'b'.repeat(20),

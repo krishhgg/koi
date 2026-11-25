@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { LeaseSchema, PreviewLabelSchema, PreviewRecordSchema } from './preview.ts';
+import {
+	DeploymentSourceSchema,
+	LeaseSchema,
+	PreviewLabelSchema,
+	PreviewRecordSchema,
+} from './preview.ts';
 import { DeploymentSliceSchema } from './recipe.ts';
 import { DeploymentIdentitySchema } from './verify.ts';
 
@@ -100,11 +105,18 @@ export type BuildLogPage = z.infer<typeof BuildLogPageSchema>;
 // that deployment's build kept (DeploymentSliceSchema), when its recipe
 // reports one. It comes only in a reply with no log lines for a record no
 // longer queued or building, where it has room under SSM's limit: koi up's
-// last read, once the log has been read to its end, is one.
+// last read, once the log has been read to its end, is one. `source` is what
+// that deployment was built from (DeploymentSourceSchema), when koid knows.
+//
+// `source` sits beside `deployment` rather than in it: DeploymentIdentity
+// is a strict object, and a CLI from before `source` would refuse a
+// deployment with a key it does not name, while it drops a key it does not
+// know here.
 export const StatusReplySchema = z.object({
 	record: PreviewRecordSchema.omit({ deployment: true }),
 	log: BuildLogPageSchema,
 	deployment: DeploymentIdentitySchema.optional(),
+	source: DeploymentSourceSchema.optional(),
 	slice: DeploymentSliceSchema.optional(),
 });
 
@@ -137,10 +149,12 @@ export type PreviewListPage = z.infer<typeof PreviewListPageSchema>;
 
 // `koid ctl lease <label> --holder <text> --ttl-seconds <n>`: the lease koid
 // took, and the deployment it holds, so the caller can stop when that is not
-// the one it expects.
+// the one it expects. `source` is what that deployment was built from, when
+// koid knows, beside the deployment for the reason StatusReplySchema gives.
 export const LeaseReplySchema = z.object({
 	lease: LeaseSchema,
 	deployment: DeploymentIdentitySchema,
+	source: DeploymentSourceSchema.optional(),
 });
 
 export type LeaseReply = z.infer<typeof LeaseReplySchema>;

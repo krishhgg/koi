@@ -62,6 +62,48 @@ export const PullRequestMergeSchema = z.object({
 
 export type PullRequestMerge = z.infer<typeof PullRequestMergeSchema>;
 
+// A git object id as koi's repositories name objects: SHA-1, 40 hex digits.
+const GitObjectIdSchema = z.string().regex(/^[0-9a-f]{40}$/);
+
+// What a deployment was built from, as koid computed it from the directory
+// it unpacked the build's source tarball into, after unpacking and before
+// the build (daemon/src/source-tree.ts), never from anything the CLI says
+// about it. `digest` is exact over every entry the build could read,
+// .koi-runtime/ included; `tree` is git's view of the project's files and
+// `runtimeTree` that of what koi added under .koi-runtime/, which no commit
+// holds. `matchesCommit` says whether `tree` is the tree of the
+// deployment's commit, which koid reads from the commit object the request
+// carried after checking that it hashes to the commit (deploymentSourceOf
+// in the daemon). Absent when the request had none, as from a CLI older
+// than this field, or one that does not hash to the commit.
+//
+// Evidence about a deployment is bound to deploymentId and `digest`:
+// `digest` says which upload the build was given, `tree` which commit's
+// content that upload is, by comparison with a tree the consumer computes
+// itself.
+export const DeploymentSourceSchema = z.object({
+	digest: z
+		.string()
+		.regex(/^sha256:[0-9a-f]{64}$/)
+		.describe(
+			"The SHA-256 of a listing of every entry under the directory koid unpacked the source into, read after unpacking and before the build, .koi-runtime/ included: each path, its type, its permission bits, a file's size and the SHA-256 of its bytes, a symlink's target, every directory whether or not it holds a file, which paths are second names of an inode named earlier, and fifos, sockets and devices by path and mode, never opened. Owners and times are left out. Two deployments with the same digest were given the same unpacked upload; which of its entries the Docker build reads is up to the recipe's Dockerfile and .dockerignore. Bind evidence to deployment.deploymentId together with source.digest; use source.tree to learn which commit's content that is. The format is in packages/daemon/src/source-tree.ts.",
+		),
+	tree: GitObjectIdSchema.optional().describe(
+		"The git tree id of the files of the upload koid unpacked for the build, .koi-runtime/ left out: a file is a blob of its bytes as unpacked, 100755 when the owner may execute it and 100644 otherwise, a symlink a blob of its target, a directory with no file under it left out. When the upload is exactly a commit's files it is what git rev-parse COMMIT^{tree} prints. It keeps only what git keeps, so uploads that differ in empty directories, other permission bits or hard links share it; source.digest tells them apart. To learn which commit's content an upload is, compare tree with a tree you compute yourself from your own copy of the repository, packed the way the build's upload was: for a koi up --pr build what git archive COMMIT | bun scripts/source-tree.ts - prints (export-ignore and export-subst apply), and for a local build of a clean checkout of COMMIT what git ls-files -z | tar --null -T - -czf - | bun scripts/source-tree.ts - prints, with the build's core.autocrlf. git rev-parse COMMIT^{tree} is a shortcut only where that packing keeps the commit's tree: no file git converts on checkout (eol=crlf, core.autocrlf, a filter such as LFS), no submodule, and for --pr no export-ignore or export-subst. Absent when the source holds a fifo, socket or device, which git has no object for.",
+	),
+	runtimeTree: GitObjectIdSchema.optional().describe(
+		'The git tree id of .koi-runtime/, the files koi adds to every build (changed-files.txt, which decides what a slicing recipe keeps), computed by koid the same way. No commit holds them. Absent for an upload without them, and whenever tree is.',
+	),
+	matchesCommit: z
+		.boolean()
+		.optional()
+		.describe(
+			"Whether tree is exactly the tree of the deployment's commit, as koid read it from the commit object the request carried, which koid checked hashes to that commit. true means the upload is exactly the commit's files as git stores them. false says only that tree differs from the commit's: a change not committed, a file git converts on checkout and a submodule each make it false, and dirty, which is only the CLI's report, does not tell which. Absent when the request carried no commit object, as from a koi older than this field, and when tree is.",
+		),
+});
+
+export type DeploymentSource = z.infer<typeof DeploymentSourceSchema>;
+
 // Names one attempt at building a request: koid gives each acceptance of a
 // request a new one, a retry of the same request id included.
 export const AttemptSchema = z.string().regex(/^[a-z0-9]{16,40}$/);
@@ -105,6 +147,10 @@ export const DeploymentSchema = z.object({
 	// recipe's sliceFile (DeploymentSliceSchema). Absent for a recipe with
 	// none, and in records written before koid kept it.
 	slice: DeploymentSliceSchema.optional(),
+	// The upload the build was given, as koid computed it (DeploymentSourceSchema).
+	// Absent when koid could not compute it, and in records written before
+	// koid kept it.
+	source: DeploymentSourceSchema.optional(),
 	// Set when koid stopped this deployment for good: "disk" when its writable
 	// layer grew past the limit. A visit does not start it again; the next
 	// deployment replaces it.

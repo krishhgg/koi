@@ -4,6 +4,7 @@ import {
 	AttemptSchema,
 	ByteCountSchema,
 	deploymentIdentity,
+	deploymentSource,
 	type HostInfo,
 	IN_FLIGHT_STATUSES,
 	IndexCursorSchema,
@@ -242,10 +243,12 @@ export async function control(request: Request, deps: ControlDeps): Promise<Resp
 					!IN_FLIGHT_STATUSES.has(record.status)
 						? record.deployment?.slice
 						: undefined;
+				const source = deploymentSource(record);
 				const reply: StatusReply = {
 					record: statusRecord(record),
 					log,
 					...(deployment !== undefined ? { deployment } : {}),
+					...(source !== undefined ? { source } : {}),
 					...(slice !== undefined ? { slice } : {}),
 				};
 				return Response.json(reply);

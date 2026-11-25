@@ -2,7 +2,16 @@ import type { Stats } from 'node:fs';
 import { lstat, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
-import { ExecError, type ExecOptions, type ExecResult, exec, execOk, FULL_OUTPUT } from './exec.ts';
+import { commitObjectId, MAX_COMMIT_OBJECT_BYTES } from '@koi/shared';
+import {
+	ExecError,
+	type ExecOptions,
+	type ExecResult,
+	exec,
+	execOk,
+	FULL_OUTPUT,
+	OutputTooLargeError,
+} from './exec.ts';
 
 // How long a fetch from the remote may take: a stalled network or credential
 // helper fails koi up with an error rather than holding it forever.
@@ -59,6 +68,12 @@ export interface Git {
 	mergeFiles(pr: number, merge: string): Promise<string[]>;
 	// A file's content at a commit, or undefined when it does not exist there.
 	show(commit: string, path: string): Promise<string | undefined>;
+	// The commit's object, as git cat-file commit prints it, in base64: what
+	// koid reads the commit's tree from (UpRequest's commitObject). Undefined when it
+	// is over MAX_COMMIT_OBJECT_BYTES, when its bytes are not UTF-8 (koi
+	// reads git's output as text, and they would no longer hash to the
+	// commit), or when git cannot print it.
+	commitObject(commit: string): Promise<string | undefined>;
 }
 
 // git run with a time limit shared by the commands of one operation: the
@@ -318,6 +333,20 @@ export function cliGit(
 		async show(commit, path) {
 			const r = await run(await at(['show', `${commit}:${path}`]));
 			return r.code === 0 ? r.stdout : undefined;
+		},
+		async commitObject(commit) {
+			let r: ExecResult;
+			try {
+				r = await run(await at(['cat-file', 'commit', commit]), {
+					maxBytes: MAX_COMMIT_OBJECT_BYTES,
+				});
+			} catch (err) {
+				if (err instanceof OutputTooLargeError) return undefined;
+				throw err;
+			}
+			if (r.code !== 0 || r.timedOut) return undefined;
+			const bytes = Buffer.from(r.stdout, 'utf8');
+			return commitObjectId(bytes) === commit ? bytes.toString('base64') : undefined;
 		},
 	};
 }

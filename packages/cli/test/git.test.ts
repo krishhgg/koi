@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { commitObjectId, commitObjectTree, MAX_COMMIT_OBJECT_BYTES } from '@koi/shared';
 import { type ExecOptions, type ExecResult, exec, execOk } from '../src/exec.ts';
 import { cliGit, FETCH_TIMEOUT_MS, finishTarball, koiFiles, packWorkingTree } from '../src/git.ts';
 import { pullRequestOrigin, shallowCheckout } from './pulls.ts';
@@ -679,6 +680,46 @@ describe('mergeCommit', () => {
 		const whole = fetchesOf();
 		await expect(cliGit(o.user, whole.run).mergeCommit(o.base, unrelated)).rejects.toThrow(refusal);
 		expect(whole.fetches).toEqual([]);
+	});
+});
+
+describe('commitObject', () => {
+	test('gives the commit object as git stores it, in base64, so that koid can check it', async () => {
+		const { dir, git } = await repo();
+		const head = (await git('rev-parse', 'HEAD')).stdout.trim();
+		const object = await cliGit(dir).commitObject(head);
+		const bytes = Buffer.from(object ?? '', 'base64');
+		expect(commitObjectId(bytes)).toBe(head);
+		expect(commitObjectTree(bytes)).toBe((await git('rev-parse', 'HEAD^{tree}')).stdout.trim());
+		// A signed or multibyte message is still UTF-8, and still hashes.
+		await git('commit', '-q', '--allow-empty', '-m', 'caf\u00e9 \u2014 na\u00efve');
+		const utf8 = (await git('rev-parse', 'HEAD')).stdout.trim();
+		expect(
+			commitObjectId(Buffer.from((await cliGit(dir).commitObject(utf8)) ?? '', 'base64')),
+		).toBe(utf8);
+	});
+
+	test('gives nothing for an object that is not UTF-8, or over the size a request takes', async () => {
+		const { dir, git } = await repo();
+		// A message in Latin-1, which koi reads as text and could not send as
+		// the bytes git hashed.
+		const latin1 = join(dir, '..', 'latin1-message');
+		await writeFile(latin1, Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]));
+		await git(
+			'-c',
+			'i18n.commitEncoding=ISO-8859-1',
+			'commit',
+			'-q',
+			'--allow-empty',
+			'-F',
+			latin1,
+		);
+		const head = (await git('rev-parse', 'HEAD')).stdout.trim();
+		expect(await cliGit(dir).commitObject(head)).toBeUndefined();
+		await git('commit', '-q', '--allow-empty', '-m', 'x'.repeat(MAX_COMMIT_OBJECT_BYTES));
+		const long = (await git('rev-parse', 'HEAD')).stdout.trim();
+		expect(await cliGit(dir).commitObject(long)).toBeUndefined();
+		expect(await cliGit(dir).commitObject('0'.repeat(40))).toBeUndefined();
 	});
 });
 

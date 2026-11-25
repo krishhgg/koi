@@ -6,6 +6,7 @@ import {
 	NO_SUCH_PREVIEW,
 	type PullRequestMerge,
 	previewHostLabel,
+	printedDeployment,
 	type Recipe,
 	repoIdFromRemote,
 	type StatusReply,
@@ -243,6 +244,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 		}
 
 		const tarball = await finishTarball(tar, koiFiles(changed));
+		const commitObject = await git.commitObject(commit);
 		const { project, recipe, limits, reportsSlice } = await resolveRecipe(
 			repo,
 			deps.builtins,
@@ -268,6 +270,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 			project,
 			repo,
 			commit,
+			...(commitObject !== undefined ? { commitObject } : {}),
 			branch,
 			...(options.pr !== undefined ? { pr: options.pr } : {}),
 			...(merge !== undefined ? { merge } : {}),
@@ -294,6 +297,7 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 		const followed = await follow(label, request.id, buildMs, deps);
 		const record = followed?.record;
 		const deployment = followed?.deployment;
+		const source = followed?.source;
 		const slice = followed?.slice;
 		// A koid older than this CLI drops --keep from the request and has no
 		// slice to give, so the build ran without the names. No reply of
@@ -313,9 +317,10 @@ export async function up(options: UpOptions, deps: UpDeps): Promise<UpResult> {
 			url,
 			status: record?.status === 'running' && unkept === undefined ? 'running' : 'failed',
 			commit,
+			dirty,
 			...(options.pr !== undefined ? { pr: options.pr } : {}),
 			...(merge !== undefined ? { merge } : {}),
-			...(deployment !== undefined ? { deployment } : {}),
+			...(deployment !== undefined ? { deployment: printedDeployment(deployment, source) } : {}),
 			...(slice !== undefined ? { slice } : {}),
 			...(record?.loginKey !== undefined ? { loginKey: record.loginKey } : {}),
 			keysUrl: keysPageUrl(deps.domain, label),
@@ -762,7 +767,8 @@ function noBaseBranch(): string {
 
 // Polls the preview's status until this request has finished, passing along
 // its build log, and returns the record and the identity of the deployment
-// then serving, or undefined when koi down removed the preview first. The
+// then serving, with what koid says it was built from and its slice, or
+// undefined when koi down removed the preview first. The
 // first poll learns which attempt at the request koid is on. Each poll after
 // asks for the lines of that attempt's log from where the last page ended
 // (koid's `next`), so no line is skipped or shown twice however many arrive
@@ -781,7 +787,7 @@ async function follow(
 	id: string,
 	buildMs: number,
 	deps: UpDeps,
-): Promise<Pick<StatusReply, 'record' | 'deployment' | 'slice'> | undefined> {
+): Promise<Pick<StatusReply, 'record' | 'deployment' | 'source' | 'slice'> | undefined> {
 	let attempt: string | undefined;
 	let next = 0;
 	let wait = true;
@@ -809,7 +815,7 @@ async function follow(
 			}
 		} else {
 			failing = undefined;
-			const { record, log, deployment, slice } = read.reply;
+			const { record, log, deployment, source, slice } = read.reply;
 			// Lines of the attempt asked about, which is this request's.
 			for (const line of log.lines) deps.buildLine(line);
 			next = log.next;
@@ -845,6 +851,7 @@ async function follow(
 					return {
 						record,
 						...(deployment !== undefined ? { deployment } : {}),
+						...(source !== undefined && deployment !== undefined ? { source } : {}),
 						...(slice !== undefined && deployment !== undefined ? { slice } : {}),
 					};
 				}

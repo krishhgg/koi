@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { LeaseReplySchema, ReleaseReplySchema } from './control.ts';
 import {
+	DeploymentSourceSchema,
 	LeaseIdSchema,
 	LoginKeySchema,
 	PreviewLabelSchema,
@@ -33,6 +34,24 @@ function schemaVersion<V extends number>(version: V) {
 // The preview's address and its keys page: https, under the box's domain.
 const HttpsUrlSchema = z.string().regex(/^https:\/\//);
 
+// A deployment as koi up and koi lease print it: its identity, and what koid
+// says it was built from, which koid's replies carry beside the identity
+// (StatusReplySchema) and the CLI puts back in it.
+const PrintedDeploymentSchema = DeploymentIdentitySchema.extend({
+	source: DeploymentSourceSchema.optional().describe(
+		"What the deployment was built from, as koid computed it from the directory it unpacked the source tarball into, before the build: koid vouches for it, not the CLI. Absent from a koid older than this field, and when koid could not compute it. Bind evidence to deployment.deploymentId together with source.digest, which covers every input file, .koi-runtime/ included. To learn which commit's content the build read, compare source.tree with the tree you expect, computed from your own copy of the repository.",
+	),
+});
+
+// A deployment and the source beside it in one of koid's replies, as
+// PrintedDeploymentSchema puts them together.
+export function printedDeployment<D extends object>(
+	deployment: D,
+	source: z.infer<typeof DeploymentSourceSchema> | undefined,
+): D & { source?: z.infer<typeof DeploymentSourceSchema> } {
+	return source !== undefined ? { ...deployment, source } : deployment;
+}
+
 export const UpResultSchema = z
 	.object({
 		schemaVersion: schemaVersion(1),
@@ -46,12 +65,18 @@ export const UpResultSchema = z
 		commit: CommitSchema.describe(
 			"What koi built: for a pull request, the merge of it into its base, whose parents are in merge, or with --head the head as pushed; for a working tree, its HEAD commit. The merge is GitHub's (refs/pull/N/merge), or one koi made itself from the same two parents when GitHub's stayed out of date; koi makes its own the same way every time, so the parents give the commit.",
 		),
+		dirty: z
+			.boolean()
+			.optional()
+			.describe(
+				"Whether git saw changes in the working tree that commit does not have, untracked files included, when koi up packed it (git status): the CLI's own account, which koid does not check. Always false with --pr, which builds the commit as git archive gives it. koid's account of what the deployment read is deployment.source. Absent from a koi older than this field.",
+			),
 		pr: PrNumberSchema.optional().describe('The pull request built, with --pr.'),
 		merge: PullRequestMergeSchema.optional().describe(
 			'The parents of the merge in commit, when koi built a merge of a pull request. Absent for a working tree and with --head.',
 		),
-		deployment: DeploymentIdentitySchema.optional().describe(
-			"The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview.",
+		deployment: PrintedDeploymentSchema.optional().describe(
+			"The identity of the deployment koid has on record for the preview as koi up ended, when it has one: absent after a first build that failed. It says nothing about whether the preview's container is running. After a failed rebuild it can be the previous deployment, so a caller compares deployment.commit with commit before it trusts the preview, and deployment.source.tree with the tree it expects to tell a build of exactly that commit from one with changes not in it.",
 		),
 		loginKey: LoginKeySchema.optional().describe(
 			'For apps with a sign-in, the key a reviewer types to get in. A secret: never copy it into evidence or logs.',
@@ -85,7 +110,7 @@ export const LeaseResultSchema = z
 		lease: LeaseReplySchema.shape.lease.describe(
 			'The lease koid took. While it lasts koid refuses a build of the preview, and koi down needs --force.',
 		),
-		deployment: LeaseReplySchema.shape.deployment.describe(
+		deployment: PrintedDeploymentSchema.describe(
 			'The deployment the lease holds. A caller stops when it is not the one koi up returned.',
 		),
 	})

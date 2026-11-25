@@ -5,7 +5,7 @@ import { join, posix } from 'node:path';
 import { z } from 'zod';
 import { GlobWork, globProblem } from './glob.ts';
 import { RelativePathSchema } from './paths.ts';
-import { PreviewLabelSchema, type PreviewRecord } from './preview.ts';
+import { type DeploymentSource, PreviewLabelSchema, type PreviewRecord } from './preview.ts';
 import { ProviderIdSchema } from './providers.ts';
 import { CommitSchema } from './request.ts';
 
@@ -510,6 +510,13 @@ export function deploymentIdentity(record: PreviewRecord): DeploymentIdentity | 
 			? { merge: { head: merge.head, base: merge.base, baseBranch: merge.baseBranch } }
 			: {}),
 	};
+}
+
+// What the deployment deploymentIdentity names was built from, as koid
+// computed it (DeploymentSourceSchema): undefined whenever that identity
+// is, and for a deployment koid has no source for.
+export function deploymentSource(record: PreviewRecord): DeploymentSource | undefined {
+	return deploymentIdentity(record) !== undefined ? record.deployment?.source : undefined;
 }
 
 const uniqueIds = (items: Array<{ id: string }>) =>

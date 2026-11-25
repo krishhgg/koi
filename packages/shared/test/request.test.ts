@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	commitObjectId,
+	commitObjectTree,
 	KeepSchema,
+	MAX_COMMIT_OBJECT_BYTES,
 	MAX_KEEP,
 	repoIdFromRemote,
 	requestKey,
@@ -144,5 +147,39 @@ describe('koi up --keep', () => {
 		expect(KeepSchema.safeParse(Array.from({ length: MAX_KEEP }, (_, i) => `n${i}`)).success).toBe(
 			true,
 		);
+	});
+});
+
+describe('commitObject', () => {
+	// A commit object as git writes one, and the commit it is.
+	const object = Buffer.from(
+		`tree ${'7'.repeat(40)}\nparent ${'6'.repeat(40)}\nauthor t <t@example.com> 0 +0000\ncommitter t <t@example.com> 0 +0000\n\ninit\n`,
+	);
+
+	test('hashes as git hashes a commit, and names its tree', () => {
+		const git = Bun.spawnSync(['git', 'hash-object', '-t', 'commit', '--stdin'], { stdin: object });
+		expect(commitObjectId(object)).toBe(git.stdout.toString().trim());
+		expect(commitObjectTree(object)).toBe('7'.repeat(40));
+		expect(
+			commitObjectTree(Buffer.from('author t <t@example.com> 0 +0000\n\nx\n')),
+		).toBeUndefined();
+	});
+
+	test('goes in a request as base64 of at most MAX_COMMIT_OBJECT_BYTES', () => {
+		const parsed = UpRequestSchema.parse({ ...valid, commitObject: object.toString('base64') });
+		expect(parsed.commitObject).toBe(object.toString('base64'));
+		expect(UpRequestSchema.safeParse({ ...valid, commitObject: 'not base64!' }).success).toBe(
+			false,
+		);
+		// The bound is on the bytes the text decodes to: 32,769 bytes take
+		// as many base64 characters as 32,768 do.
+		const of = (bytes: number) => Buffer.alloc(bytes, 'x').toString('base64');
+		expect(of(MAX_COMMIT_OBJECT_BYTES + 1).length).toBe(of(MAX_COMMIT_OBJECT_BYTES).length);
+		for (const bytes of [MAX_COMMIT_OBJECT_BYTES - 1, MAX_COMMIT_OBJECT_BYTES]) {
+			expect(UpRequestSchema.safeParse({ ...valid, commitObject: of(bytes) }).success).toBe(true);
+		}
+		for (const bytes of [MAX_COMMIT_OBJECT_BYTES + 1, MAX_COMMIT_OBJECT_BYTES + 3]) {
+			expect(UpRequestSchema.safeParse({ ...valid, commitObject: of(bytes) }).success).toBe(false);
+		}
 	});
 });

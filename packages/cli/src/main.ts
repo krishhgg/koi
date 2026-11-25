@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { hostname, userInfo } from 'node:os';
 import {
+	type DeploymentSource,
 	escapeControls,
 	LeaseReplySchema,
 	type LeaseResult,
@@ -8,6 +9,7 @@ import {
 	logCutNote,
 	PreviewListPageSchema,
 	type PreviewSummary,
+	printedDeployment,
 	type ReleaseResult,
 	randomId,
 } from '@koi/shared';
@@ -231,17 +233,22 @@ export async function run(
 					JSON.parse(await ctlOk(box, ['lease', label, '--holder', holder, '--ttl-seconds', ttl])),
 				);
 				if (cli.json) {
-					const result: LeaseResult = { schemaVersion: 1, ...reply };
+					const result: LeaseResult = {
+						schemaVersion: 1,
+						lease: reply.lease,
+						deployment: printedDeployment(reply.deployment, reply.source),
+					};
 					io.stdout(`${JSON.stringify(result)}\n`);
 				} else {
-					const { lease, deployment } = reply;
+					const { lease, deployment, source } = reply;
 					io.stdout(
 						`leased ${label} until ${lease.expiresAt}\n` +
 							`  lease       ${lease.leaseId}\n` +
 							`  holder      ${lease.holder}\n` +
 							`  deployment  ${deployment.deploymentId}\n` +
 							`  image       ${deployment.imageDigest}\n` +
-							`  commit      ${deployment.commit}\n`,
+							`  commit      ${deployment.commit}\n` +
+							(source !== undefined ? sourceLines(source) : ''),
 					);
 				}
 				return 0;
@@ -384,6 +391,19 @@ async function ctlOk(box: Box, args: string[]): Promise<string> {
 	const r = await box.ctl(args);
 	if (r.code !== 0) throw new Error(ctlErrorText(r) || `koid ctl ${args[0]} failed`);
 	return r.stdout;
+}
+
+// What koid says a deployment was built from, for koi lease's output: the
+// digest of its source, and its git tree and whether that is the commit's,
+// when it has one.
+function sourceLines(source: DeploymentSource): string {
+	const digest = `  source      ${source.digest}\n`;
+	if (source.tree === undefined) return digest;
+	const matches =
+		source.matchesCommit === undefined
+			? ''
+			: ` (${source.matchesCommit ? "the commit's tree" : "not the commit's tree"})`;
+	return `${digest}  tree        ${source.tree}${matches}\n`;
 }
 
 // Every preview. koid ctl list prints a page at a time, small enough for SSM
