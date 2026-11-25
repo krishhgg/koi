@@ -88,7 +88,7 @@ export async function hashSourceTarball(
 	}
 }
 
-// What a build read (DeploymentSourceSchema): its hashes, and whether the
+// The upload a build was given (DeploymentSourceSchema): its hashes, and whether the
 // project's tree is the one the request's commit object names, with that
 // tree. koid takes the object only when it hashes to the request's commit,
 // so the CLI can name no tree but that commit's; for one that does not, or

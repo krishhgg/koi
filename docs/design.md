@@ -154,15 +154,15 @@ run `koi up`.
 A pull request build and a build of a working tree both reach koid as a tarball the
 CLI made: `git archive` of the commit for `--pr`, the working tree's files for a
 working tree. koid never fetches source itself. Both builds report the same `commit`
-whether or not the working tree had changes, so koid also records what the build
-read, as `source` on the deployment (`DeploymentSourceSchema` in
+whether or not the working tree had changes, so koid also records what upload the
+build was given, as `source` on the deployment (`DeploymentSourceSchema` in
 `packages/shared/src/preview.ts`). `koi up --json` and `koi lease --json` print it as
 `deployment.source`.
 
 koid computes `source` from the directory it unpacked the tarball into
 (`hashSourceDir` in `packages/daemon/src/source-tree.ts`), after tar has run and
-before the build starts. It describes the files the build reads, however tar wrote
-them, and never takes a value from the CLI.
+before the build starts. It describes the unpacked upload, however tar wrote it, and
+never takes a value from the CLI.
 
 - `digest` is exact: `sha256:` and the SHA-256 of a listing of every entry under
   that directory, `.koi-runtime/` included. The listing gives each entry's path, type
@@ -201,7 +201,7 @@ them, and never takes a value from the CLI.
 
 A consumer that records evidence about a preview binds it to
 `deployment.deploymentId` and `deployment.source.digest`. The deployment id names
-the build and its image; the digest names every file the build read, `.koi-runtime/`
+the build and its image; the digest names every entry of the unpacked upload, `.koi-runtime/`
 included. To know which commit's content that is, the consumer compares
 `source.tree` with a tree it computes itself from its own copy of the repository,
 never with one the CLI reports.
@@ -211,7 +211,7 @@ tree that `commit` does not have, untracked files included. It is the CLI's own
 report, which koid does not check, and it is always false with `--pr`.
 
 `matchesCommit` is strict: the two trees are equal or it is false. `tree` hashes the
-files as the build read them, not as git stores them. A file git converts on
+project's files in the unpacked upload as they are there, not as git stores them. A file git converts on
 checkout (`eol=crlf`, `core.autocrlf`, a filter such as LFS, `ident`) is in the
 tarball as checked out, and `git archive` converts it the same way, so a clean build
 of such a repository gives another tree than the commit's, and `matchesCommit` is
