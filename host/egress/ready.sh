@@ -14,7 +14,8 @@ listening() {
 	ss -Htln "sport = :$KOI_EGRESS_PORT" | grep -qF "$KOI_EGRESS_HOST:$KOI_EGRESS_PORT" &&
 		{ [ -z "${KOI_EGRESS_TRANSPARENT_PORT:-}" ] ||
 			ss -Htln "sport = :$KOI_EGRESS_TRANSPARENT_PORT" | grep -qF "$KOI_EGRESS_HOST:$KOI_EGRESS_TRANSPARENT_PORT"; } &&
-		{ [ -z "${KOI_EGRESS_TRANSPARENT_PORT:-}" ] || ss -Hlun "sport = :53" | grep -qF "$KOI_EGRESS_HOST:53"; }
+		{ [ -z "${KOI_EGRESS_DNS_PORT:-}" ] ||
+			ss -Hlun "sport = :$KOI_EGRESS_DNS_PORT" | grep -qF "$KOI_EGRESS_HOST:$KOI_EGRESS_DNS_PORT"; }
 }
 for _ in $(seq 1 "${KOI_EGRESS_READY_SECONDS:-30}"); do
 	if listening; then

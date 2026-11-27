@@ -27,7 +27,8 @@ opens to that name, under the same checks as a proxied request.
 Previews resolve names through this proxy's DNS listener: allowed names only,
 IPv4 addresses only (previews have no IPv6 route, and the firewall redirects
 IPv4), and public ones only. A name the policy would refuse is not looked up
-at all, so a lookup carries nothing out of the box.
+at all, so the listener looks up no name the proxy would not look up itself
+for a CONNECT.
 
 koi_fixtures names a host this proxy answers itself with test pages
 (redirects, status codes, delays, large bodies; see fixture_response), so a
@@ -203,7 +204,10 @@ SWEEP_SECONDS = 600
 MAX_PREVIEWS = 1000
 # What the fixtures host serves at most: a body of this many bytes, a delay
 # of this many seconds, a chain of this many redirects, a Location this long.
-FIXTURE_MAX_BYTES = 16 * 1024 * 1024
+# mitmproxy holds a response this addon makes whole until the client reads
+# it, so its size bounds what one request can make the shared proxy hold. To
+# check a size limit, set the fetching code's limit below it.
+FIXTURE_MAX_BYTES = 256 * 1024
 FIXTURE_MAX_DELAY = 10
 FIXTURE_MAX_REDIRECTS = 20
 FIXTURE_MAX_LOCATION = 2048
@@ -219,7 +223,7 @@ FIXTURE_HTML = b"""<!doctype html>
 <li><a href="/redirect/3">/redirect/N</a>: N redirects, then a page</li>
 <li><a href="/redirect-to?url=http://example.com:99999/">/redirect-to?url=URL&amp;status_code=3XX</a>: one redirect to URL, whatever it is</li>
 <li><a href="/delay/2">/delay/SECONDS</a>: a page after up to 10 seconds</li>
-<li><a href="/bytes/1024">/bytes/N</a>: N bytes, up to 16 MiB</li>
+<li><a href="/bytes/1024">/bytes/N</a>: N bytes, up to 256 KiB</li>
 <li><a href="/json">/json</a>, <a href="/headers">/headers</a>: JSON, and the request's own headers</li>
 </ul>
 </body></html>
@@ -367,17 +371,11 @@ def transparent(client):
 
 
 def public(packed):
-    """True if a DNS answer's address is one on the internet: global, not multicast, nothing private inside it."""
-    try:
-        ip = ipaddress.ip_address(packed)
-    except ValueError:
+    """True if an A record's address is one on the internet: global and not multicast."""
+    if len(packed) != 4:
         return False
-    inner = [ip]
-    if ip.version == 6:
-        inner += [a for a in (ip.ipv4_mapped, ip.sixtofour) if a is not None]
-        if ip.teredo is not None:
-            inner += list(ip.teredo)
-    return all(a.is_global and not a.is_multicast for a in inner)
+    ip = ipaddress.IPv4Address(packed)
+    return ip.is_global and not ip.is_multicast
 
 
 def page(status, body, content_type="text/plain", **headers):
@@ -399,6 +397,11 @@ async def fixture_response(request):
         return page(200, FIXTURE_HTML, "text/html; charset=utf-8")
     if head == "status" and number is not None and 200 <= int(number) <= 599:
         code = int(number)
+        if code in (204, 304):
+            # No body and no Content-Length: a client reads none.
+            response = page(code, b"")
+            del response.headers["content-length"]
+            return response
         extra = {"location": "/"} if 300 <= code < 400 else {}
         return page(code, f"status {code}\n".encode(), **extra)
     if head == "redirect" and number is not None and int(number) <= FIXTURE_MAX_REDIRECTS:
@@ -990,8 +993,8 @@ class KoiEgress:
     def dns_request(self, flow: dns.DNSFlow):
         """Answer only lookups of names a preview may reach, and only for addresses.
 
-        A name the policy would refuse gets NXDOMAIN and is never looked up,
-        so the lookup itself carries nothing out of the box. An allowed name
+        A name the policy would refuse gets NXDOMAIN and is never looked up:
+        only names the proxy would look up itself for a CONNECT go out. An allowed name
         gets an empty answer for any type but A: previews have no IPv6
         route, so an IPv6 address would only send a client the wrong way
         first. mitmproxy's own resolver, which runs after this addon, looks

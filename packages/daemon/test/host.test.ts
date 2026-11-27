@@ -1732,7 +1732,7 @@ describe('koi-firewall, run in bash', () => {
 				// The command after any -t TABLE decides: -C and -D find nothing.
 				'iptables() { echo "iptables $*" >> "$calls"; local c=$1; [ "$c" = -t ] && c=$3; case "$c" in -C | -D) return 1 ;; esac; }',
 				// The preview network's subnet, as Docker reports it.
-				'docker() { echo 172.18.0.0/16; }',
+				'docker() { case "$*" in *Gateway*) echo 172.18.0.1 ;; *) echo 172.18.0.0/16 ;; esac; }',
 				'ip6tables() { echo "ip6tables $*" >> "$calls"; case "$1" in -C | -D) return 1 ;; esac; }',
 				'modprobe() { echo "modprobe $*" >> "$calls"; }',
 				'sysctl() { echo "sysctl $*" >> "$calls"; }',
@@ -1753,8 +1753,8 @@ describe('koi-firewall, run in bash', () => {
 		'iptables -I INPUT -i koi-previews0 -m conntrack --ctstate NEW -j DROP',
 		'iptables -I INPUT -i koi-previews0 -p tcp --dport 3128 -m conntrack --ctstate NEW -j ACCEPT',
 		'iptables -I INPUT -i koi-previews0 -p tcp --dport 3129 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT',
-		'iptables -I INPUT -i koi-previews0 -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT',
-		'iptables -I INPUT -i koi-previews0 -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT',
+		'iptables -I INPUT -i koi-previews0 -p tcp --dport 3153 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT',
+		'iptables -I INPUT -i koi-previews0 -p udp --dport 3153 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT',
 	];
 	const inserted = (calls: string[]) => calls.filter((c) => / -I /.test(c)).sort();
 
@@ -1764,6 +1764,13 @@ describe('koi-firewall, run in bash', () => {
 		expect(run.calls).toContain(
 			'iptables -t nat -A PREROUTING -i koi-previews0 ! -d 172.18.0.0/16 -p tcp -m multiport --dports 443,80 -j REDIRECT --to-ports 3129',
 		);
+		// Lookups reach the proxy's DNS listener and no other server on the host.
+		for (const proto of ['udp', 'tcp']) {
+			expect(run.calls).toContain(
+				`iptables -t nat -A PREROUTING -i koi-previews0 -d 172.18.0.1 -p ${proto} --dport 53 -j REDIRECT --to-ports 3153`,
+			);
+		}
+		expect(run.calls.filter((c) => /--dport 53 .*ACCEPT/.test(c))).toEqual([]);
 	});
 
 	test('the script names the helper on a line these tests can replace', () => {

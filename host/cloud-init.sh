@@ -323,20 +323,28 @@ iptables -I "${accept[@]}"
 # and the proxy's DNS listener as its DNS server. New connections to ports
 # 443 and 80 anywhere off the bridge go to the proxy's transparent listener,
 # which applies the same policy, by name, whatever address they were for.
-# Only connections redirected there are accepted on its port. Everything else
+# Only connections redirected there are accepted on its ports. Everything else
 # that would leave the bridge is dropped: by Docker's rules for an internal
 # network, and by the DOCKER-USER rule below in case those ever change.
 subnet=$(docker network inspect koi-previews -f '{{(index .IPAM.Config 0).Subnet}}')
+gateway=$(docker network inspect koi-previews -f '{{(index .IPAM.Config 0).Gateway}}')
+# shellcheck disable=SC2054 # 443,80 is one multiport list
 redirect=(PREROUTING -i koi-previews0 ! -d "$subnet" -p tcp -m multiport --dports 443,80 -j REDIRECT --to-ports 3129)
 iptables -t nat -C "${redirect[@]}" 2>/dev/null || iptables -t nat -A "${redirect[@]}"
+# Previews' lookups go to port 53 on the gateway, and from there only to the
+# proxy's DNS listener: no other server on the host can answer them.
+for proto in udp tcp; do
+	dns=(PREROUTING -i koi-previews0 -d "$gateway" -p "$proto" --dport 53 -j REDIRECT --to-ports 3153)
+	iptables -t nat -C "${dns[@]}" 2>/dev/null || iptables -t nat -A "${dns[@]}"
+done
 # Each accept goes in again at the top, ahead of the drop rules, as above.
 on_top() {
 	while iptables -D "$@" 2>/dev/null; do :; done
 	iptables -I "$@"
 }
 on_top INPUT -i koi-previews0 -p tcp --dport 3129 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
-on_top INPUT -i koi-previews0 -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
-on_top INPUT -i koi-previews0 -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+on_top INPUT -i koi-previews0 -p udp --dport 3153 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
+on_top INPUT -i koi-previews0 -p tcp --dport 3153 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
 leave=(DOCKER-USER -i koi-previews0 ! -o koi-previews0 -j DROP)
 iptables -C "${leave[@]}" 2>/dev/null || iptables -I "${leave[@]}"
 

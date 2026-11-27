@@ -1409,12 +1409,14 @@ export class Deployer {
 			const before = await this.currentRoutes();
 			await this.applyRoutes(before).catch(routingFailed);
 			await start();
-			await this.routeOut(container);
 			const { ip } = await this.deps.docker.inspect(container, this.deps.network);
 			if (ip !== undefined && this.told[ip] !== undefined) {
 				const after = await this.currentRoutes();
 				await this.applyRoutes(after).catch(routingFailed);
 			}
+			// After the map is right: the helper can take a while, and until
+			// the map is fixed this container could pass as the dead one.
+			await this.routeOut(container);
 		});
 	}
 

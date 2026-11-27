@@ -204,6 +204,7 @@ def test_the_fixtures_host_serves_its_pages(proxy):
     assert get(sock, FIXTURES, "/redirect/2").getheader("location") == "/redirect/1"
     assert get(sock, FIXTURES, "/redirect/0").body == b"redirects done\n"
     assert get(sock, FIXTURES, "/bytes/70000").body == b"x" * 70000
+    assert get(sock, FIXTURES, "/bytes/262145").status == 404
     assert get(sock, FIXTURES, "/delay/0.2").body == b"delayed 0.2 seconds\n"
     assert get(sock, FIXTURES, "/json").getheader("content-type") == "application/json"
     assert get(sock, FIXTURES, "/delay/11").status == 400
@@ -214,8 +215,18 @@ def test_the_fixtures_host_serves_its_pages(proxy):
 
 
 def test_the_fixtures_host_over_plain_http(proxy):
-    assert request(redirected(proxy, 80), FIXTURES, "/status/204")[0] == 204
+    assert request(redirected(proxy, 80), FIXTURES, "/status/418") == (418, b"status 418\n")
     assert proxy.to_upstream.asked == []
+
+
+def test_a_bodyless_status_keeps_the_connection_usable(proxy):
+    sock = proxy.tls(redirected(proxy), FIXTURES)
+    for path in ("/status/204", "/status/304"):
+        response = get(sock, FIXTURES, path)
+        assert response.body == b""
+        assert response.getheader("content-length") is None
+    # The next response on the same connection reads as it should.
+    assert get(sock, FIXTURES, "/json").status == 200
 
 
 def test_the_fixtures_host_takes_no_body(proxy):
