@@ -33,7 +33,7 @@ import {
 	type RunOptions,
 	readerName,
 } from './docker.ts';
-import { type Egress, egressEnv, egressFiles } from './egress-config.ts';
+import { type Egress, egressDns, egressEnv, egressFiles } from './egress-config.ts';
 import { minFreeBytes } from './fsutil.ts';
 import type { LiveList } from './live.ts';
 import { KeyedLock, Mutex, Semaphore } from './lock.ts';
@@ -92,6 +92,10 @@ export interface DeployerDeps {
 	registerSecret?: (value: string) => void;
 	// The egress proxy previews use; undefined leaves them with no way out.
 	egress?: Egress;
+	// Gives a preview container just started its default route to the
+	// bridge, the way to the same proxy for code that ignores the proxy
+	// setting (egress-config.ts, previewRoute). Undefined: no such route.
+	routeOut?: (container: string) => Promise<void>;
 	// Tells the egress proxy which preview each container address runs, the
 	// whole map each time, for its koi tokens (see previewAddresses).
 	// Resolves once the proxy holds this map, or holds none at all; rejects
@@ -504,10 +508,14 @@ export class Deployer {
 	// come from the daemon's config each time a container is created.
 	private withEgress(
 		env: Record<string, string>,
-	): Pick<RunOptions, 'env'> & Partial<Pick<RunOptions, 'files'>> {
+	): Pick<RunOptions, 'env'> & Partial<Pick<RunOptions, 'files' | 'dns'>> {
 		const egress = this.deps.egress;
 		if (egress === undefined) return { env };
-		return { env: { ...env, ...egressEnv(egress) }, files: egressFiles(egress) };
+		return {
+			env: { ...env, ...egressEnv(egress) },
+			files: egressFiles(egress),
+			dns: egressDns(egress),
+		};
 	}
 
 	// Whether `attempt` is still the label's latest.
@@ -1401,12 +1409,28 @@ export class Deployer {
 			const before = await this.currentRoutes();
 			await this.applyRoutes(before).catch(routingFailed);
 			await start();
+			await this.routeOut(container);
 			const { ip } = await this.deps.docker.inspect(container, this.deps.network);
 			if (ip !== undefined && this.told[ip] !== undefined) {
 				const after = await this.currentRoutes();
 				await this.applyRoutes(after).catch(routingFailed);
 			}
 		});
+	}
+
+	// Gives a container just started its default route to the bridge. Each
+	// start makes a new network namespace, so this follows every one. A
+	// preview without the route runs as before, its direct connections
+	// failing at once, so a failure is logged and the start goes on.
+	private async routeOut(container: string): Promise<void> {
+		if (this.deps.routeOut === undefined) return;
+		try {
+			await this.deps.routeOut(container);
+		} catch (err) {
+			this.deps.log(
+				`${container}: no route to the egress proxy for code that ignores the proxy setting: ${message(err)}`,
+			);
+		}
 	}
 
 	// Publishes the labels allowed to wake the box, as of the last sync. One

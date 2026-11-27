@@ -103,7 +103,7 @@ rm -rf /usr/local/share/koi/egress
 mkdir -p /usr/local/share/koi/egress
 tar -xzf egress.tar.gz -C /usr/local/share/koi/egress --no-same-owner
 rm -f egress.tar.gz
-bash /usr/local/share/koi/egress/install.sh
+KOI_DOMAIN='$domain' bash /usr/local/share/koi/egress/install.sh
 # The verification network helper (host/verify), which koid runs through
 # sudo to install a run's firewall permits. The sudoers rule comes from
 # provisioning (scripts/provision-host.sh); the chains the helper installs

@@ -5,12 +5,26 @@
 # preview network's gateway address, the only address previews can reach. It
 # intercepts TLS, so it also publishes its CA certificate for koid to copy
 # into previews.
+#
+# It listens three ways, all under the one policy: as the proxy in previews'
+# HTTP(S)_PROXY (PORT); transparently, for the connections to ports 443 and
+# 80 the firewall (host/cloud-init.sh, koi-firewall) redirects from previews
+# whose code ignores the proxy setting (TRANSPARENT_PORT); and as the DNS
+# server koid gives previews (port 53). KOI_DOMAIN, from deploy-host.sh, names
+# the fixtures host the policy answers itself: fixtures.koi.<domain>, which
+# the box's wildcard record already resolves. Two labels deep, it can never
+# be a preview's name.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 
 MITM_VERSION=12.2.3
 MITM_SHA256=2e95286b618fa6fd33e5e62a78c2e5112571d85f42ec2bac29b97ee242bdb5c5
 PORT=3128
+TRANSPARENT_PORT=3129
+fixtures=""
+if [[ ${KOI_DOMAIN:-} =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ ]]; then
+	fixtures=fixtures.koi.$KOI_DOMAIN
+fi
 
 if [ "$(/usr/local/bin/mitmdump --version 2>/dev/null | awk '/^Mitmproxy:/ {print $2}')" != "$MITM_VERSION" ]; then
 	tmp=$(mktemp -d)
@@ -97,13 +111,19 @@ put() {
 put 0644 koi_egress.py
 put 0644 allow.txt
 put 0755 ready.sh
+# The helper koid runs through sudo to give each preview a default route to
+# the bridge (see the file). The sudoers rule comes from provisioning.
+install -d -m 0755 /usr/local/libexec
+install -m 0755 -o root -g root "$here/koi-preview-route" /usr/local/libexec/.koi-preview-route.new
+mv -f /usr/local/libexec/.koi-preview-route.new /usr/local/libexec/koi-preview-route
 
 gateway=$(docker network inspect koi-previews -f '{{(index .IPAM.Config 0).Gateway}}')
 case "$gateway" in
 	*.*.*.*) ;;
 	*) echo "koi-previews has no IPv4 gateway (got '$gateway')" >&2; exit 1 ;;
 esac
-printf 'KOI_EGRESS_HOST=%s\nKOI_EGRESS_PORT=%s\n' "$gateway" "$PORT" > /etc/koi/egress/env
+printf 'KOI_EGRESS_HOST=%s\nKOI_EGRESS_PORT=%s\nKOI_EGRESS_TRANSPARENT_PORT=%s\nKOI_EGRESS_FIXTURES=%s\n' \
+	"$gateway" "$PORT" "$TRANSPARENT_PORT" "$fixtures" > /etc/koi/egress/env
 
 cat > /etc/systemd/system/koi-egress.service <<'UNIT'
 [Unit]
@@ -122,8 +142,12 @@ RuntimeDirectoryMode=0750
 # its server on, and ready.sh holds the start until then. A policy file that
 # fails to load, or finds no usable token secret, leaves the proxy down,
 # never open.
-ExecStart=/usr/local/bin/mitmdump --quiet --listen-host ${KOI_EGRESS_HOST} --listen-port ${KOI_EGRESS_PORT} --set server=false --set confdir=/var/lib/koi-egress --set koi_allow=/etc/koi/egress/allow.txt --set koi_control=/run/koi-egress/control.sock --set koi_secret=/etc/koi/egress/private/token-secret -s /etc/koi/egress/koi_egress.py
+ExecStart=/usr/local/bin/mitmdump --quiet --listen-host ${KOI_EGRESS_HOST} --mode regular@${KOI_EGRESS_PORT} --mode transparent@${KOI_EGRESS_TRANSPARENT_PORT} --mode dns@53 --set server=false --set confdir=/var/lib/koi-egress --set koi_allow=/etc/koi/egress/allow.txt --set koi_control=/run/koi-egress/control.sock --set koi_secret=/etc/koi/egress/private/token-secret --set koi_fixtures=${KOI_EGRESS_FIXTURES} -s /etc/koi/egress/koi_egress.py
 ExecStartPost=/etc/koi/egress/ready.sh
+# The DNS listener's port 53 is below 1024. Binding it is the one privilege
+# the proxy's user gets.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 Restart=on-failure
 RestartSec=3
 # Outside koi.slice, so previews cannot starve it, but with a ceiling of its
@@ -179,7 +203,7 @@ for _ in $(seq 1 20); do
 	# The policy opens the control socket before it starts listening.
 	if [ -S /run/koi-egress/control.sock ] && [ -s /var/lib/koi-egress/mitmproxy-ca-cert.pem ]; then
 		publish_ca
-		echo "koi-egress listening on $gateway:$PORT"
+		echo "koi-egress listening on $gateway:$PORT, $gateway:$TRANSPARENT_PORT and $gateway:53"
 		exit 0
 	fi
 	sleep 1

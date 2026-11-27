@@ -128,6 +128,24 @@ describe('runArgs', () => {
 		expect(sliced.at(-1)).toBe('i');
 	});
 
+	test('sets the DNS server only when one is given', () => {
+		expect(args).not.toContain('--dns');
+		const withDns = runArgs({
+			name: 'n',
+			image: 'i',
+			network: 'koi-previews',
+			user: '1:1',
+			env: {},
+			labels: {},
+			dns: '172.18.0.1',
+		});
+		expect(withDns.slice(withDns.indexOf('--dns'), withDns.indexOf('--dns') + 2)).toEqual([
+			'--dns',
+			'172.18.0.1',
+		]);
+		expect(withDns.at(-1)).toBe('i');
+	});
+
 	test('passes env values as single arguments, never through a shell', () => {
 		expect(args).toContain('MODE=a b; rm -rf /');
 		expect(args.at(-1)).toBe('koi-preview/hello:abc');

@@ -366,7 +366,11 @@ builder, and the egress proxy.
   no published ports, and memory, CPU and process limits, on the internal network
   `koi-previews`. That network has no route out, previews cannot reach each other,
   and the firewall drops new connections from it to the host except to the egress
-  proxy.
+  proxy. koid gives each preview a default route to the bridge after it starts
+  (`host/egress/koi-preview-route`, through sudo), for code that ignores the proxy
+  setting: the firewall sends its new connections to ports 443 and 80 off the bridge
+  to the proxy's transparent listener, and Docker's internal-network rules and a
+  `DOCKER-USER` rule drop the rest.
 - **Memory**: the builder and every preview run in one systemd slice, `koi.slice`,
   capped at 82% of the box's memory, so together they cannot take the memory Docker,
   Caddy, koid and the egress proxy need. The egress proxy is a host service and runs
@@ -380,6 +384,17 @@ builder, and the egress proxy.
   than holding them, and cuts off a refused request at its headers. On requests to
   LLM providers it swaps a koi token for the reviewer's key (see Keys). Previews
   trust its CA through a bundle koid copies into each container before it starts.
+  It takes previews' requests three ways under the one policy: as the proxy in their
+  `HTTP(S)_PROXY`; transparently, for the connections the firewall redirects, where
+  the TLS server name (or, in plain HTTP, the Host header) is the one name the
+  connection is for and the upstream connection opens to that name, never to the
+  address the preview dialed; and as previews' DNS server, which answers only
+  allowed names, only with IPv4 addresses (previews have no IPv6 route), and only
+  public ones, and never looks up a name it would refuse. So code that resolves a host itself and refuses private
+  addresses, as RocketRide's web nodes do, works on a preview for allowed hosts. The
+  proxy also answers `fixtures.koi.<domain>` itself with test pages (`/status/CODE`,
+  `/redirect/N`, `/redirect-to?url=`, `/delay/S`, `/bytes/N`, `/json`, `/headers`),
+  so a preview can check how its code fetches the web without reaching any site.
 - **koid** owns the Caddyfile and regenerates it whenever a preview starts, stops or
   is replaced. Caddy proxies each running preview directly and sends everything else
   to koid, which shows a status page or starts a stopped preview.

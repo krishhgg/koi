@@ -13,6 +13,26 @@ fails, and the Host header and :authority of every request inside, which must
 match or the connection is killed. The upstream connection is opened only for
 a request that passed, and only with the CONNECT host as its server name.
 
+Some code ignores a proxy setting on purpose. RocketRide's web nodes resolve
+a URL's host themselves, refuse private addresses and connect to the address
+they checked. For them the box gives each preview a default route to its
+bridge, and the box's firewall sends a preview's new connections to ports 443
+and 80 to this proxy's transparent listener (install.sh, host/cloud-init.sh);
+Docker drops everything else. The address the preview connected to proves
+nothing, so the policy never uses it. Over TLS, the server name is the one
+name such a connection is for, held to the requests inside as a CONNECT host
+is; in plain HTTP, each request's Host header is. The upstream connection
+opens to that name, under the same checks as a proxied request.
+
+Previews resolve names through this proxy's DNS listener: allowed names only,
+IPv4 addresses only (previews have no IPv6 route, and the firewall redirects
+IPv4), and public ones only. A name the policy would refuse is not looked up
+at all, so a lookup carries nothing out of the box.
+
+koi_fixtures names a host this proxy answers itself with test pages
+(redirects, status codes, delays, large bodies; see fixture_response), so a
+preview can check how its code fetches the web. Nothing for it goes upstream.
+
 Bodies stream through: the proxy never holds a whole upload or download, and
 a refused request with a body is cut off at its headers, so the body is never
 read. WebSockets and other upgraded connections stream through as bytes. The service's own memory ceiling (install.sh) bounds what is left.
@@ -63,10 +83,11 @@ import stat
 import struct
 import time
 import weakref
-from urllib.parse import quote, quote_plus, urlsplit
+from urllib.parse import parse_qs, quote, quote_plus, urlsplit
 
-from mitmproxy import connection, ctx, http, tcp, tls
+from mitmproxy import connection, ctx, dns, http, tcp, tls
 from mitmproxy.net.http import url
+from mitmproxy.proxy import mode_specs
 from OpenSSL import SSL
 
 log = logging.getLogger("koi_egress")
@@ -180,6 +201,29 @@ MAX_TOKENS_PER_SOURCE = 200
 SWEEP_SECONDS = 600
 # Container addresses koid may map to previews at once.
 MAX_PREVIEWS = 1000
+# What the fixtures host serves at most: a body of this many bytes, a delay
+# of this many seconds, a chain of this many redirects, a Location this long.
+FIXTURE_MAX_BYTES = 16 * 1024 * 1024
+FIXTURE_MAX_DELAY = 10
+FIXTURE_MAX_REDIRECTS = 20
+FIXTURE_MAX_LOCATION = 2048
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+HOSTNAME_RE = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+FIXTURE_HTML = b"""<!doctype html>
+<html><head><title>koi fixtures</title></head>
+<body>
+<h1>koi fixtures</h1>
+<p>Test pages for previews. Nothing here reaches the internet.</p>
+<ul>
+<li><a href="/status/404">/status/CODE</a>: that status</li>
+<li><a href="/redirect/3">/redirect/N</a>: N redirects, then a page</li>
+<li><a href="/redirect-to?url=http://example.com:99999/">/redirect-to?url=URL&amp;status_code=3XX</a>: one redirect to URL, whatever it is</li>
+<li><a href="/delay/2">/delay/SECONDS</a>: a page after up to 10 seconds</li>
+<li><a href="/bytes/1024">/bytes/N</a>: N bytes, up to 16 MiB</li>
+<li><a href="/json">/json</a>, <a href="/headers">/headers</a>: JSON, and the request's own headers</li>
+</ul>
+</body></html>
+"""
 
 
 def load_allowlist(path):
@@ -315,6 +359,79 @@ def address(text):
     if ip.version == 6 and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     return str(ip)
+
+
+def transparent(client):
+    """True if the box's firewall redirected this connection here, rather than the preview asking the proxy."""
+    return isinstance(client.proxy_mode, mode_specs.TransparentMode)
+
+
+def public(packed):
+    """True if a DNS answer's address is one on the internet: global, not multicast, nothing private inside it."""
+    try:
+        ip = ipaddress.ip_address(packed)
+    except ValueError:
+        return False
+    inner = [ip]
+    if ip.version == 6:
+        inner += [a for a in (ip.ipv4_mapped, ip.sixtofour) if a is not None]
+        if ip.teredo is not None:
+            inner += list(ip.teredo)
+    return all(a.is_global and not a.is_multicast for a in inner)
+
+
+def page(status, body, content_type="text/plain", **headers):
+    return http.Response.make(status, body, {"content-type": content_type, "cache-control": "no-store", **headers})
+
+
+async def fixture_response(request):
+    """The fixtures host's answer to a GET or HEAD request (see FIXTURE_HTML for what it serves).
+
+    It answers from what the path asks for only, within the FIXTURE_MAX
+    limits, and quotes the request back to the one preview that sent it on
+    /headers alone.
+    """
+    parts = urlsplit(request.path)
+    words = [w for w in parts.path.split("/") if w]
+    head, arg = (words + ["", ""])[:2]
+    number = arg if len(words) == 2 and arg.isdigit() and len(arg) <= 9 else None
+    if not words:
+        return page(200, FIXTURE_HTML, "text/html; charset=utf-8")
+    if head == "status" and number is not None and 200 <= int(number) <= 599:
+        code = int(number)
+        extra = {"location": "/"} if 300 <= code < 400 else {}
+        return page(code, f"status {code}\n".encode(), **extra)
+    if head == "redirect" and number is not None and int(number) <= FIXTURE_MAX_REDIRECTS:
+        n = int(number)
+        if n == 0:
+            return page(200, b"redirects done\n")
+        return page(302, b"", location=f"/redirect/{n - 1}")
+    if head == "redirect-to" and len(words) == 1:
+        query = parse_qs(parts.query, keep_blank_values=True)
+        target = (query.get("url") or [""])[0]
+        code = (query.get("status_code") or ["302"])[0]
+        if not target or len(target) > FIXTURE_MAX_LOCATION or any(not 0x21 <= ord(c) <= 0x7E for c in target):
+            return page(400, b"redirect-to needs url=, printable ASCII without spaces, up to 2048 characters\n")
+        if not code.isdigit() or int(code) not in REDIRECT_CODES:
+            return page(400, b"status_code must be 301, 302, 303, 307 or 308\n")
+        return page(int(code), b"", location=target)
+    if head == "delay" and len(words) == 2:
+        try:
+            seconds = float(arg)
+        except ValueError:
+            seconds = -1.0
+        if not 0 <= seconds <= FIXTURE_MAX_DELAY:
+            return page(400, f"delay takes 0 to {FIXTURE_MAX_DELAY} seconds\n".encode())
+        await asyncio.sleep(seconds)
+        return page(200, f"delayed {seconds:g} seconds\n".encode())
+    if head == "bytes" and number is not None and int(number) <= FIXTURE_MAX_BYTES:
+        return page(200, b"x" * int(number), "application/octet-stream")
+    if head == "json" and len(words) == 1:
+        return page(200, b'{"fixture": "koi", "ok": true}\n', "application/json")
+    if head == "headers" and len(words) == 1:
+        sent = [[name, value] for name, value in request.headers.items(multi=True)]
+        return page(200, (json.dumps({"headers": sent}) + "\n").encode(), "application/json")
+    return page(404, b"no such fixture; see /\n")
 
 
 def token_in(header, value):
@@ -571,9 +688,14 @@ class KoiEgress:
         # Whether configure has read the allowlist; until then running()
         # leaves mitmproxy's server off.
         self.ready = False
+        # The host this proxy answers itself with test pages (koi_fixtures),
+        # or "" for none; and the flows for it whose answer is due.
+        self.fixtures = ""
+        self.fixture_flows = weakref.WeakSet()
 
     def load(self, loader):
         loader.add_option("koi_allow", str, "/etc/koi/egress/allow.txt", "allowlist file")
+        loader.add_option("koi_fixtures", str, "", "host this proxy answers itself with test pages (empty: none)")
         loader.add_option("koi_control", str, "", "unix socket for token registration (empty: off)")
         # The default is where install.sh puts it, so a running mitmdump that
         # loads this file again finds the secret before the service restarts
@@ -593,6 +715,11 @@ class KoiEgress:
             self.exact |= set(PROVIDERS)
             log.info("koi egress: %d hosts, %d suffixes", len(self.exact), len(self.suffixes))
             self.ready = True
+        if "koi_fixtures" in updated:
+            name = clean(ctx.options.koi_fixtures)
+            self.fixtures = name if HOSTNAME_RE.fullmatch(name) else ""
+            if name and not self.fixtures:
+                log.error("koi egress: koi_fixtures is not a hostname; no fixtures host")
         if "koi_secret" in updated:
             # A secret that cannot be used leaves the registry without one,
             # and running() then keeps the proxy down. The log names the
@@ -706,10 +833,21 @@ class KoiEgress:
         self.previews = mapping
 
     def allowed(self, host, port):
+        """True if a request may go upstream to host on port. Never the fixtures host, which is answered here."""
+        return port in ALLOWED_PORTS and self.allowed_name(host)
+
+    def allowed_name(self, host):
         host = clean(host)
-        if port not in ALLOWED_PORTS:
+        if self.fixtures and host == self.fixtures:
             return False
         return host in self.exact or any(host.endswith(s) for s in self.suffixes)
+
+    def is_fixture(self, host, port):
+        return bool(self.fixtures) and clean(host) == self.fixtures and port in ALLOWED_PORTS
+
+    def reachable(self, host, port):
+        """True if a preview may ask for host on port: upstream, or the fixtures host here."""
+        return self.allowed(host, port) or self.is_fixture(host, port)
 
     def deny(self, flow, why):
         # The log names the preview by its address, never the host it asked
@@ -733,7 +871,7 @@ class KoiEgress:
     def http_connect(self, flow: http.HTTPFlow):
         # mitmproxy itself refuses a CONNECT inside a tunnel (400), so this
         # sees only the one that opens a connection's tunnel.
-        if flow.request.port != 443 or not self.allowed(flow.request.host, 443):
+        if flow.request.port != 443 or not self.reachable(flow.request.host, 443):
             self.deny(flow, "connect")
         else:
             self.tunnels[flow.client_conn.id] = clean(flow.request.host)
@@ -744,6 +882,17 @@ class KoiEgress:
         client = data.context.client
         host = self.tunnels.get(client.id)
         sni = clean(data.client_hello.sni)
+        if transparent(client):
+            # No CONNECT named a host, so the server name is the one this
+            # connection is for, held to every request in it as a CONNECT
+            # host is. The port is the one the preview connected to.
+            if not sni:
+                self.refuse(client, "TLS without a server name")
+            elif not self.reachable(sni, client.sockname[1]):
+                self.refuse(client, "TLS server name not allowed")
+            else:
+                self.tunnels[client.id] = sni
+            return
         if host is None:
             self.refuse(client, "TLS outside a CONNECT tunnel")
         elif not sni:
@@ -764,8 +913,11 @@ class KoiEgress:
             return  # http_connect decides
         client = flow.client_conn
         tunnel = self.tunnels.get(client.id)
-        why = self.check(flow.request, client, tunnel)
+        why = (self.aim(flow, tunnel) if transparent(client) else None) or self.check(flow.request, client, tunnel)
         if why is None:
+            if self.is_fixture(flow.request.host, flow.request.port):
+                self.fixture(flow)
+                return
             # The request's headers leave as soon as this hook returns, so the
             # token swap happens here, not in a request hook.
             if not self.swap_keys(flow, tunnel):
@@ -788,11 +940,82 @@ class KoiEgress:
             return "plain text inside a tunnel"
         if tunnel is not None and host != tunnel:
             return "request host is not the CONNECT host"
-        if not self.allowed(host, request.port):
+        if not self.reachable(host, request.port):
             return "host not allowed"
         if not names_only(authorities(request), host, request.port):
             return "Host or :authority names another host"
         return None
+
+    def aim(self, flow: http.HTTPFlow, tunnel):
+        """Point a redirected request at the name it is for, or say why it has none.
+
+        mitmproxy aims it at the address the preview connected to, which
+        proves nothing, so the policy never connects there. Over TLS the
+        name is the server name tls_clienthello took as the connection's
+        tunnel; in plain HTTP, the request's Host header. check() then holds
+        every name in the request to it, and mitmproxy connects upstream to
+        that name. Only the target changes here, never a header.
+        """
+        request, client = flow.request, flow.client_conn
+        if client.tls:
+            if tunnel is None:
+                return "TLS without a checked server name"
+            name = tunnel
+        else:
+            names = authorities(request)
+            if not names:
+                return "no Host header"
+            try:
+                name, _ = url.parse_authority(names[0], check=True)
+            except ValueError:
+                return "Host is not a host"
+        request.data.host = clean(name)
+        return None
+
+    def fixture(self, flow: http.HTTPFlow):
+        """Answer a request for the fixtures host here, in the request hook, once it is whole; nothing goes upstream."""
+        if flow.request.method not in ("GET", "HEAD") or has_body(flow.request):
+            self.answer(flow, 405, "the fixtures host takes GET and HEAD without a body")
+            return
+        self.fixture_flows.add(flow)
+
+    async def request(self, flow: http.HTTPFlow):
+        if flow in self.fixture_flows:
+            self.fixture_flows.discard(flow)
+            response = await fixture_response(flow.request)
+            if flow.request.method == "HEAD":
+                response.content = b""
+            flow.response = response
+
+    def dns_request(self, flow: dns.DNSFlow):
+        """Answer only lookups of names a preview may reach, and only for addresses.
+
+        A name the policy would refuse gets NXDOMAIN and is never looked up,
+        so the lookup itself carries nothing out of the box. An allowed name
+        gets an empty answer for any type but A: previews have no IPv6
+        route, so an IPv6 address would only send a client the wrong way
+        first. mitmproxy's own resolver, which runs after this addon, looks
+        up the A records, and dns_response keeps only public addresses. The
+        log names the preview, never the name it asked for.
+        """
+        request = flow.request
+        question = request.question
+        if not request.query or len(request.questions) != 1 or question is None or question.class_ != dns.classes.IN:
+            flow.response = request.fail(dns.response_codes.REFUSED)
+            return
+        name = clean(question.name)
+        if not (self.allowed_name(name) or name == self.fixtures):
+            log.warning("koi egress refused a name lookup from %s", peer(flow.client_conn))
+            flow.response = request.fail(dns.response_codes.NXDOMAIN)
+            return
+        if question.type != dns.types.A:
+            flow.response = request.succeed([])
+
+    def dns_response(self, flow: dns.DNSFlow):
+        response = flow.response
+        response.answers = [r for r in response.answers if r.type == dns.types.A and public(r.data)]
+        response.authorities = []
+        response.additionals = []
 
     def swap_keys(self, flow: http.HTTPFlow, tunnel):
         """Swap koi tokens for keys in the provider's own auth fields; False if the request was refused.

@@ -317,6 +317,28 @@ done
 accept=(INPUT -i koi-previews0 -p tcp --dport 3128 -m conntrack --ctstate NEW -j ACCEPT)
 while iptables -D "${accept[@]}" 2>/dev/null; do :; done
 iptables -I "${accept[@]}"
+# The same proxy for code in a preview that ignores the proxy setting, such
+# as code that resolves a host itself to refuse private addresses. koid gives
+# each preview a default route to the bridge (host/egress/koi-preview-route)
+# and the proxy's DNS listener as its DNS server. New connections to ports
+# 443 and 80 anywhere off the bridge go to the proxy's transparent listener,
+# which applies the same policy, by name, whatever address they were for.
+# Only connections redirected there are accepted on its port. Everything else
+# that would leave the bridge is dropped: by Docker's rules for an internal
+# network, and by the DOCKER-USER rule below in case those ever change.
+subnet=$(docker network inspect koi-previews -f '{{(index .IPAM.Config 0).Subnet}}')
+redirect=(PREROUTING -i koi-previews0 ! -d "$subnet" -p tcp -m multiport --dports 443,80 -j REDIRECT --to-ports 3129)
+iptables -t nat -C "${redirect[@]}" 2>/dev/null || iptables -t nat -A "${redirect[@]}"
+# Each accept goes in again at the top, ahead of the drop rules, as above.
+on_top() {
+	while iptables -D "$@" 2>/dev/null; do :; done
+	iptables -I "$@"
+}
+on_top INPUT -i koi-previews0 -p tcp --dport 3129 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
+on_top INPUT -i koi-previews0 -p udp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+on_top INPUT -i koi-previews0 -p tcp --dport 53 -m conntrack --ctstate NEW -j ACCEPT
+leave=(DOCKER-USER -i koi-previews0 ! -o koi-previews0 -j DROP)
+iptables -C "${leave[@]}" 2>/dev/null || iptables -I "${leave[@]}"
 
 # --- Verification run networks (kv+) ------------------------------------------
 # Verification is optional and the rules above are not. koid.service Requires=
@@ -416,6 +438,18 @@ SUDO
 chmod 0440 /etc/sudoers.d/.koi-verify-net.new
 visudo -cf /etc/sudoers.d/.koi-verify-net.new >/dev/null
 mv -f /etc/sudoers.d/.koi-verify-net.new /etc/sudoers.d/koi-verify-net
+
+# The same for the helper that gives a preview its default route to the
+# bridge (host/egress/koi-preview-route, which the egress installer puts in
+# place). It checks its one argument and changes nothing but that route.
+cat > /etc/sudoers.d/.koi-preview-route.new <<'SUDO'
+# koid gives each preview it starts a default route to its bridge through
+# this helper. The helper checks its input.
+koi ALL=(root:root) NOPASSWD: /usr/local/libexec/koi-preview-route
+SUDO
+chmod 0440 /etc/sudoers.d/.koi-preview-route.new
+visudo -cf /etc/sudoers.d/.koi-preview-route.new >/dev/null
+mv -f /etc/sudoers.d/.koi-preview-route.new /etc/sudoers.d/koi-preview-route
 
 # --- Caddy with the Route 53 DNS module (wildcard certificate via DNS-01) ----
 # Download beside the binary and rename over it: overwriting a running

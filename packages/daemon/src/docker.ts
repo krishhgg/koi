@@ -71,6 +71,9 @@ export interface RunOptions {
 	// every file is in (see run), so a container found by name never lacks
 	// them.
 	files?: Array<{ path: string; content: string }>;
+	// The DNS server the container's own resolver (Docker's, at 127.0.0.11)
+	// sends lookups to: the egress proxy's, which is all a preview may reach.
+	dns?: string;
 }
 
 // A network, from `docker network inspect`, with what koid checks on a
@@ -398,6 +401,7 @@ export function runArgs(
 		'koi.role=',
 	];
 	if (slice !== undefined) args.push('--cgroup-parent', slice);
+	if (options.dns !== undefined) args.push('--dns', options.dns);
 	for (const [key, value] of Object.entries(options.labels))
 		args.push('--label', `${key}=${value}`);
 	for (const [key, value] of Object.entries(options.env)) args.push('--env', `${key}=${value}`);

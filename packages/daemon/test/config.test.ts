@@ -33,6 +33,7 @@ describe('loadConfig', () => {
 			region: 'us-east-1',
 			egressControl: '/run/koi-egress/control.sock',
 			verifyHelper: '/usr/local/libexec/koi-verify-net',
+			previewRouteHelper: '/usr/local/libexec/koi-preview-route',
 			recorderSeccomp: '/usr/local/share/koi/recorder-seccomp.json',
 			verifierImages: [],
 		});
