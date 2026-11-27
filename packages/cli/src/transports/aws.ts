@@ -98,13 +98,26 @@ export interface Clients {
 	sts: STSClient;
 }
 
-export function clients(profile: string, region: string): Clients {
-	const credentials = fromIni({ profile });
+// Every AWS call fails if its connection takes longer than connectionTimeout
+// to open, or then goes socketTimeout without a byte either way. The SDK sets
+// neither, so a reply that never comes, as when a network drops a connection
+// without closing it, held koi forever: koi up once waited three hours on a
+// status read SSM had answered in a second. Such a call fails with a
+// TimeoutError, which koi treats as a network error that can pass, as it
+// treats a reset connection. An upload that is still sending is not idle.
+export const AWS_HTTP = { connectionTimeout: 10_000, socketTimeout: 60_000 };
+
+export function clients(
+	profile: string,
+	region: string,
+	http: { connectionTimeout?: number; socketTimeout?: number } = AWS_HTTP,
+): Clients {
+	const config = { region, credentials: fromIni({ profile }), requestHandler: http };
 	return {
-		s3: new S3Client({ region, credentials }),
-		ec2: new EC2Client({ region, credentials }),
-		ssm: new SSMClient({ region, credentials }),
-		sts: new STSClient({ region, credentials }),
+		s3: new S3Client(config),
+		ec2: new EC2Client(config),
+		ssm: new SSMClient(config),
+		sts: new STSClient(config),
 	};
 }
 
