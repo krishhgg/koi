@@ -470,7 +470,14 @@ async def fixture_response(request):
     if head == "json" and len(words) == 1:
         return page(200, b'{"fixture": "koi", "ok": true}\n', "application/json")
     if head == "headers" and len(words) == 1:
-        sent = [[name, value] for name, value in request.headers.items(multi=True)]
+        # Counted as they are taken, so a request with huge headers costs no
+        # more than the budget to refuse; JSON escaping is checked at the end.
+        sent, size = [], 0
+        for name, value in request.headers.items(multi=True):
+            size += len(name) + len(value)
+            if size > FIXTURE_MAX_ECHO:
+                return page(431, b"too many request headers to echo\n")
+            sent.append([name, value])
         body = (json.dumps({"headers": sent}) + "\n").encode()
         if len(body) > FIXTURE_MAX_ECHO:
             return page(431, b"too many request headers to echo\n")
@@ -722,7 +729,13 @@ class DnsServer(asyncio.DatagramProtocol):
         task.add_done_callback(self.pending.discard)
 
     async def answer(self, data, addr):
-        reply = await self.policy.dns_answer(data, addr[0])
+        try:
+            reply = await self.policy.dns_answer(data, addr[0])
+        except (ValueError, struct.error, IndexError, OverflowError):
+            # A question mitmproxy could read but not write back. Its text
+            # stays out of the log.
+            log.warning("koi egress could not answer a name lookup from %s", addr[0])
+            return
         if reply is not None and self.transport is not None and not self.transport.is_closing():
             self.transport.sendto(reply, addr)
 
@@ -1099,8 +1112,9 @@ class KoiEgress:
         try:
             name = clean(question.name).encode("idna").decode("ascii")
         except UnicodeError:
-            name = ""
-        if not (self.allowed_name(name) or name == self.fixtures):
+            log.warning("koi egress refused a name lookup from %s", source)
+            return request.fail(dns.response_codes.NXDOMAIN).packed
+        if not (self.allowed_name(name) or (self.fixtures and name == self.fixtures)):
             log.warning("koi egress refused a name lookup from %s", source)
             return request.fail(dns.response_codes.NXDOMAIN).packed
         if question.type != dns.types.A:

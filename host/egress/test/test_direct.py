@@ -345,6 +345,26 @@ def test_redirected_tls_whose_server_name_is_not_a_hostname_is_refused(proxy):
     assert proxy.to_upstream.asked == []
 
 
+def test_a_lookup_that_cannot_be_answered_is_dropped_without_its_text(proxy):
+    policy = proxy.policy()
+    real = policy.dns_answer
+
+    async def failing(data, source):
+        raise ValueError("secret-name.attacker.example")
+
+    policy.dns_answer = failing
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.sendto(query("pypi.org"), proxy.dns_at)
+            assert refused(lambda: s.recv(4096))
+        proxy.wait_logged("could not answer a name lookup")
+    finally:
+        policy.dns_answer = real
+    assert not any("attacker" in m for m in proxy.log.messages)
+    assert addresses(lookup(proxy, "pypi.org")) == ["151.101.0.223"]
+
+
 def test_an_internationalized_name_is_checked_and_looked_up_in_ascii(proxy):
     lookup(proxy, "xn--bcher-kva.hf.test")
     assert proxy.resolver.looked_up == ["xn--bcher-kva.hf.test"]
@@ -355,6 +375,10 @@ def test_headers_echoes_a_few_kib_at_most(proxy):
     conn = http.client.HTTPConnection(FIXTURES)
     conn.sock = sock
     conn.request("GET", "/headers", headers={"Host": FIXTURES, "X-Big": "x" * 9000})
+    response = conn.getresponse()
+    assert (response.status, response.read()) == (431, b"too many request headers to echo\n")
+    # Under the count but over once JSON escapes it: refused all the same.
+    conn.request("GET", "/headers", headers={"Host": FIXTURES, "X-Quote": '"' * 5000})
     response = conn.getresponse()
     assert (response.status, response.read()) == (431, b"too many request headers to echo\n")
     assert get(sock, FIXTURES, "/headers").status == 200
