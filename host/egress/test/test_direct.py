@@ -298,12 +298,41 @@ def test_a_name_that_is_not_a_hostname_is_never_looked_up(proxy):
     assert proxy.resolver.looked_up == ["models.hf.test"]
 
 
+def with_record(data, record):
+    """data with one more record in its additional section."""
+    data = bytearray(data)
+    data[11] += 1
+    return bytes(data) + record
+
+
+# EDNS, as resolvers add it: the root name, type OPT, a 1232-byte UDP size, no options.
+OPT = b"\x00" + struct.pack(">HHIH", 41, 1232, 0, 0)
+
+
+def test_a_query_with_edns_is_answered(proxy):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(10)
+        s.sendto(with_record(query("pypi.org"), OPT), proxy.dns_at)
+        assert addresses(dns.DNSMessage.unpack(s.recv(4096))) == ["151.101.0.223"]
+
+
 def test_a_query_that_is_not_a_plain_one_gets_nothing(proxy):
     two_questions = bytearray(query("pypi.org"))
     two_questions[5] = 2
     response = bytearray(query("pypi.org"))
     response[2] |= 0x80
-    for data in (bytes(two_questions), bytes(response), query("pypi.org") + b"x" * 600):
+    # An extra record that is not OPT: an A record named by a pointer to the question.
+    not_opt = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes(4)
+    # The question's name as a compression pointer.
+    pointer = query("pypi.org")[:12] + b"\xc0\x0c" + struct.pack(">HH", 1, 1)
+    for data in (
+        bytes(two_questions),
+        bytes(response),
+        query("pypi.org") + b"x" * 600,
+        with_record(query("pypi.org"), not_opt),
+        with_record(query("pypi.org"), OPT + b"x"),
+        pointer,
+    ):
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.settimeout(1)
             s.sendto(data, proxy.dns_at)
@@ -314,6 +343,21 @@ def test_a_query_that_is_not_a_plain_one_gets_nothing(proxy):
 def test_redirected_tls_whose_server_name_is_not_a_hostname_is_refused(proxy):
     assert refused(lambda: request(proxy.tls(redirected(proxy), "a_b.hf.test"), "a_b.hf.test"))
     assert proxy.to_upstream.asked == []
+
+
+def test_an_internationalized_name_is_checked_and_looked_up_in_ascii(proxy):
+    lookup(proxy, "xn--bcher-kva.hf.test")
+    assert proxy.resolver.looked_up == ["xn--bcher-kva.hf.test"]
+
+
+def test_headers_echoes_a_few_kib_at_most(proxy):
+    sock = proxy.tls(redirected(proxy), FIXTURES)
+    conn = http.client.HTTPConnection(FIXTURES)
+    conn.sock = sock
+    conn.request("GET", "/headers", headers={"Host": FIXTURES, "X-Big": "x" * 9000})
+    response = conn.getresponse()
+    assert (response.status, response.read()) == (431, b"too many request headers to echo\n")
+    assert get(sock, FIXTURES, "/headers").status == 200
 
 
 def test_the_fixtures_host_resolves(proxy):

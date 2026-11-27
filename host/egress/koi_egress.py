@@ -223,6 +223,7 @@ DNS_HEADER = 12
 FIXTURE_MAX_DELAY = 10
 FIXTURE_MAX_REDIRECTS = 20
 FIXTURE_MAX_LOCATION = 2048
+FIXTURE_MAX_ECHO = 8 * 1024
 REDIRECT_CODES = (301, 302, 303, 307, 308)
 HOSTNAME_RE = re.compile(r"(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 FIXTURE_HTML = b"""<!doctype html>
@@ -235,7 +236,7 @@ FIXTURE_HTML = b"""<!doctype html>
 <li><a href="/redirect/3">/redirect/N</a>: N redirects, then a page</li>
 <li><a href="/redirect-to?url=http://example.com:99999/">/redirect-to?url=URL&amp;status_code=3XX</a>: one redirect to URL, whatever it is</li>
 <li><a href="/delay/2">/delay/SECONDS</a>: a page after up to 10 seconds</li>
-<li><a href="/json">/json</a>, <a href="/headers">/headers</a>: JSON, and the request's own headers</li>
+<li><a href="/json">/json</a>, <a href="/headers">/headers</a>: JSON, and the request's own headers, up to 8 KiB</li>
 </ul>
 </body></html>
 """
@@ -389,6 +390,34 @@ def public(packed):
     return ip.is_global and not ip.is_multicast
 
 
+def plain_query(data):
+    """True if data is a small DNS query and nothing more, checked before anything parses it.
+
+    One question, its name in plain labels (no compression pointer), and at
+    most one more record, which must be EDNS's OPT: the root name, type 41,
+    and data that ends the message.
+    """
+    if not DNS_HEADER <= len(data) <= MAX_DNS_QUERY:
+        return False
+    _, flags, questions, answers, authorities, additionals = struct.unpack(">HHHHHH", data[:DNS_HEADER])
+    if flags & 0xF800 or questions != 1 or answers or authorities or additionals > 1:
+        return False
+    i = DNS_HEADER
+    while True:
+        if i >= len(data) or data[i] > 63:
+            return False
+        if data[i] == 0:
+            i += 1
+            break
+        i += 1 + data[i]
+    i += 4  # the question's type and class
+    if not additionals:
+        return i == len(data)
+    if len(data) < i + 11 or data[i] != 0 or data[i + 1 : i + 3] != b"\x00\x29":
+        return False
+    return i + 11 + int.from_bytes(data[i + 9 : i + 11], "big") == len(data)
+
+
 def page(status, body, content_type="text/plain", **headers):
     return http.Response.make(status, body, {"content-type": content_type, "cache-control": "no-store", **headers})
 
@@ -442,7 +471,10 @@ async def fixture_response(request):
         return page(200, b'{"fixture": "koi", "ok": true}\n', "application/json")
     if head == "headers" and len(words) == 1:
         sent = [[name, value] for name, value in request.headers.items(multi=True)]
-        return page(200, (json.dumps({"headers": sent}) + "\n").encode(), "application/json")
+        body = (json.dumps({"headers": sent}) + "\n").encode()
+        if len(body) > FIXTURE_MAX_ECHO:
+            return page(431, b"too many request headers to echo\n")
+        return page(200, body, "application/json")
     return page(404, b"no such fixture; see /\n")
 
 
@@ -1048,13 +1080,7 @@ class KoiEgress:
         and per preview; past either cap a query gets SERVFAIL, and its
         client asks again. The log names the preview, never the name.
         """
-        # A plain query only, small, with one question and at most an EDNS
-        # record, checked before anything is parsed; anything else gets
-        # nothing.
-        if not DNS_HEADER <= len(data) <= MAX_DNS_QUERY:
-            return None
-        _, flags, questions, answers, authorities, additionals = struct.unpack(">HHHHHH", data[:DNS_HEADER])
-        if flags & 0xF800 or questions != 1 or answers or authorities or additionals > 1:
+        if not plain_query(data):
             return None
         try:
             request = dns.DNSMessage.unpack(data)
@@ -1068,7 +1094,12 @@ class KoiEgress:
             or question.class_ != dns.classes.IN
         ):
             return request.fail(dns.response_codes.REFUSED).packed
-        name = clean(question.name)
+        # mitmproxy decodes IDNA labels; the policy and the resolver both
+        # take the ASCII form an allowlist names.
+        try:
+            name = clean(question.name).encode("idna").decode("ascii")
+        except UnicodeError:
+            name = ""
         if not (self.allowed_name(name) or name == self.fixtures):
             log.warning("koi egress refused a name lookup from %s", source)
             return request.fail(dns.response_codes.NXDOMAIN).packed
