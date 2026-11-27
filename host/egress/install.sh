@@ -9,10 +9,10 @@
 # It listens three ways, all under the one policy: as the proxy in previews'
 # HTTP(S)_PROXY (PORT); transparently, for the connections to ports 443 and
 # 80 the firewall (host/cloud-init.sh, koi-firewall) redirects from previews
-# whose code ignores the proxy setting (TRANSPARENT_PORT); and as the DNS
-# server koid gives previews (DNS_PORT, where the firewall redirects their
-# lookups to port 53 on the gateway, so no other server on the host answers
-# them). KOI_DOMAIN, from deploy-host.sh, names
+# whose code ignores the proxy setting (TRANSPARENT_PORT); and, through the
+# policy's own UDP server, as the DNS server koid gives previews (DNS_PORT,
+# where the firewall redirects their lookups to port 53 on the gateway, so
+# no other server on the host answers them). KOI_DOMAIN, from deploy-host.sh, names
 # the fixtures host the policy answers itself: fixtures.koi.<domain>, which
 # the box's wildcard record already resolves. Two labels deep, it can never
 # be a preview's name.
@@ -145,7 +145,7 @@ RuntimeDirectoryMode=0750
 # its server on, and ready.sh holds the start until then. A policy file that
 # fails to load, or finds no usable token secret, leaves the proxy down,
 # never open.
-ExecStart=/usr/local/bin/mitmdump --quiet --listen-host ${KOI_EGRESS_HOST} --mode regular@${KOI_EGRESS_PORT} --mode transparent@${KOI_EGRESS_TRANSPARENT_PORT} --mode dns@${KOI_EGRESS_DNS_PORT} --set server=false --set confdir=/var/lib/koi-egress --set koi_allow=/etc/koi/egress/allow.txt --set koi_control=/run/koi-egress/control.sock --set koi_secret=/etc/koi/egress/private/token-secret --set koi_fixtures=${KOI_EGRESS_FIXTURES} -s /etc/koi/egress/koi_egress.py
+ExecStart=/usr/local/bin/mitmdump --quiet --listen-host ${KOI_EGRESS_HOST} --mode regular@${KOI_EGRESS_PORT} --mode transparent@${KOI_EGRESS_TRANSPARENT_PORT} --set server=false --set confdir=/var/lib/koi-egress --set koi_allow=/etc/koi/egress/allow.txt --set koi_control=/run/koi-egress/control.sock --set koi_secret=/etc/koi/egress/private/token-secret --set koi_fixtures=${KOI_EGRESS_FIXTURES} --set koi_dns=${KOI_EGRESS_HOST}:${KOI_EGRESS_DNS_PORT} -s /etc/koi/egress/koi_egress.py
 ExecStartPost=/etc/koi/egress/ready.sh
 Restart=on-failure
 RestartSec=3

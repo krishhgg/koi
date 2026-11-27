@@ -24,7 +24,8 @@ name such a connection is for, held to the requests inside as a CONNECT host
 is; in plain HTTP, each request's Host header is. The upstream connection
 opens to that name, under the same checks as a proxied request.
 
-Previews resolve names through this proxy's DNS listener: allowed names only,
+Previews resolve names through this policy's own DNS server (koi_dns, UDP):
+allowed names only,
 IPv4 addresses only (previews have no IPv6 route, and the firewall redirects
 IPv4), and public ones only. A name the policy would refuse is not looked up
 at all, so the listener looks up no name the proxy would not look up itself
@@ -202,12 +203,19 @@ MAX_TOKENS_PER_SOURCE = 200
 SWEEP_SECONDS = 600
 # Container addresses koid may map to previews at once.
 MAX_PREVIEWS = 1000
+# DNS lookups in flight at once, in all and for one preview, and how long a
+# client may keep an answer.
+MAX_LOOKUPS = 64
+MAX_LOOKUPS_PER_SOURCE = 8
+DNS_TTL = 60
 # What the fixtures host serves at most: a body of this many bytes, a delay
 # of this many seconds, a chain of this many redirects, a Location this long.
 # mitmproxy holds a response this addon makes whole until the client reads
-# it, so its size bounds what one request can make the shared proxy hold. To
-# check a size limit, set the fetching code's limit below it.
-FIXTURE_MAX_BYTES = 256 * 1024
+# it, so /bytes is no larger than the request body it holds for any request
+# (stream_large_bodies, 64k), and lets no request make the shared proxy hold
+# more than it already could. To check a size limit, set the fetching code's
+# limit below it.
+FIXTURE_MAX_BYTES = 64 * 1024
 FIXTURE_MAX_DELAY = 10
 FIXTURE_MAX_REDIRECTS = 20
 FIXTURE_MAX_LOCATION = 2048
@@ -223,7 +231,7 @@ FIXTURE_HTML = b"""<!doctype html>
 <li><a href="/redirect/3">/redirect/N</a>: N redirects, then a page</li>
 <li><a href="/redirect-to?url=http://example.com:99999/">/redirect-to?url=URL&amp;status_code=3XX</a>: one redirect to URL, whatever it is</li>
 <li><a href="/delay/2">/delay/SECONDS</a>: a page after up to 10 seconds</li>
-<li><a href="/bytes/1024">/bytes/N</a>: N bytes, up to 256 KiB</li>
+<li><a href="/bytes/1024">/bytes/N</a>: N bytes, up to 64 KiB</li>
 <li><a href="/json">/json</a>, <a href="/headers">/headers</a>: JSON, and the request's own headers</li>
 </ul>
 </body></html>
@@ -664,6 +672,28 @@ class Registry:
         return entry["key"], None
 
 
+class DnsServer(asyncio.DatagramProtocol):
+    """The previews' DNS server: one query in, one answer out, and nothing kept once it is sent."""
+
+    def __init__(self, policy):
+        self.policy = policy
+        self.transport = None
+        self.pending = set()  # the answers being worked out, so none is collected before it is sent
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        task = asyncio.get_running_loop().create_task(self.answer(data, addr))
+        self.pending.add(task)
+        task.add_done_callback(self.pending.discard)
+
+    async def answer(self, data, addr):
+        reply = await self.policy.dns_answer(data, addr[0])
+        if reply is not None and self.transport is not None and not self.transport.is_closing():
+            self.transport.sendto(reply, addr)
+
+
 class KoiEgress:
     def __init__(self, registry=None):
         self.exact = set()
@@ -695,10 +725,16 @@ class KoiEgress:
         # or "" for none; and the flows for it whose answer is due.
         self.fixtures = ""
         self.fixture_flows = weakref.WeakSet()
+        # The DNS server's task and UDP socket while it serves (koi_dns), and
+        # its lookups in flight per preview address.
+        self.dns_server = None
+        self.dns_sock = None
+        self.lookups = {}
 
     def load(self, loader):
         loader.add_option("koi_allow", str, "/etc/koi/egress/allow.txt", "allowlist file")
         loader.add_option("koi_fixtures", str, "", "host this proxy answers itself with test pages (empty: none)")
+        loader.add_option("koi_dns", str, "", "host:port the previews' DNS server listens on, over UDP (empty: none)")
         loader.add_option("koi_control", str, "", "unix socket for token registration (empty: off)")
         # The default is where install.sh puts it, so a running mitmdump that
         # loads this file again finds the secret before the service restarts
@@ -744,6 +780,8 @@ class KoiEgress:
         path = ctx.options.koi_control
         if path:
             self.listen_control(path)
+        if ctx.options.koi_dns:
+            self.listen_dns(ctx.options.koi_dns)
         ctx.options.update(server=True)
         log.info("koi egress: policy active, proxy listening")
 
@@ -775,11 +813,12 @@ class KoiEgress:
     def done(self):
         # mitmproxy is unloading this addon: it is shutting down, or about to
         # load this file again after it changed. The control socket closes
-        # with it, so no registration reaches an addon that no longer swaps.
-        # Then stop listening and close every open connection, which would
-        # otherwise carry on with no policy. If the new file fails to load,
-        # the proxy stays down.
+        # with it, so no registration reaches an addon that no longer swaps,
+        # and so does the DNS server. Then stop listening and close every open
+        # connection, which would otherwise carry on with no policy. If the
+        # new file fails to load, the proxy stays down.
         self.close_control()
+        self.close_dns()
         # The keys and the secret go with it. A new load starts with an
         # empty registry, so a Forget could never reach these copies.
         self.registry.clear()
@@ -987,38 +1026,91 @@ class KoiEgress:
             self.fixture_flows.discard(flow)
             response = await fixture_response(flow.request)
             if flow.request.method == "HEAD":
-                response.content = b""
+                # Not .content, which would set Content-Length to 0.
+                response.raw_content = b""
             flow.response = response
 
-    def dns_request(self, flow: dns.DNSFlow):
-        """Answer only lookups of names a preview may reach, and only for addresses.
+    async def dns_answer(self, data, source):
+        """The packed answer to one DNS query from a preview at address source, or None to send nothing.
 
-        A name the policy would refuse gets NXDOMAIN and is never looked up:
-        only names the proxy would look up itself for a CONNECT go out. An allowed name
-        gets an empty answer for any type but A: previews have no IPv6
-        route, so an IPv6 address would only send a client the wrong way
-        first. mitmproxy's own resolver, which runs after this addon, looks
-        up the A records, and dns_response keeps only public addresses. The
-        log names the preview, never the name it asked for.
+        Only names a preview may reach are looked up: a name the policy would
+        refuse gets NXDOMAIN at once, so the server looks up no name the
+        proxy would not look up itself for a CONNECT. An allowed name gets
+        an empty answer for any type but A: previews have no IPv6 route, so
+        an IPv6 address would only send a client the wrong way first. Only
+        public addresses are given. Lookups in flight are capped, overall
+        and per preview; past either cap a query gets SERVFAIL, and its
+        client asks again. The log names the preview, never the name.
         """
-        request = flow.request
+        try:
+            request = dns.DNSMessage.unpack(data)
+        except (struct.error, ValueError, IndexError):
+            return None
         question = request.question
-        if not request.query or len(request.questions) != 1 or question is None or question.class_ != dns.classes.IN:
-            flow.response = request.fail(dns.response_codes.REFUSED)
-            return
+        if (
+            not request.query
+            or request.op_code != dns.op_codes.QUERY
+            or question is None
+            or question.class_ != dns.classes.IN
+        ):
+            return request.fail(dns.response_codes.REFUSED).packed
         name = clean(question.name)
         if not (self.allowed_name(name) or name == self.fixtures):
-            log.warning("koi egress refused a name lookup from %s", peer(flow.client_conn))
-            flow.response = request.fail(dns.response_codes.NXDOMAIN)
-            return
+            log.warning("koi egress refused a name lookup from %s", source)
+            return request.fail(dns.response_codes.NXDOMAIN).packed
         if question.type != dns.types.A:
-            flow.response = request.succeed([])
+            return request.succeed([]).packed
+        held = self.lookups.get(source, 0)
+        if sum(self.lookups.values()) >= MAX_LOOKUPS or held >= MAX_LOOKUPS_PER_SOURCE:
+            return request.fail(dns.response_codes.SERVFAIL).packed
+        self.lookups[source] = held + 1
+        try:
+            addresses = await self.lookup(name)
+        except socket.gaierror as e:
+            if e.args[0] == socket.EAI_NONAME:
+                return request.fail(dns.response_codes.NXDOMAIN).packed
+            addresses = [] if e.args[0] == socket.EAI_NODATA else None
+            if addresses is None:
+                return request.fail(dns.response_codes.SERVFAIL).packed
+        except OSError:
+            return request.fail(dns.response_codes.SERVFAIL).packed
+        finally:
+            self.lookups[source] -= 1
+            if not self.lookups[source]:
+                del self.lookups[source]
+        records = []
+        for text in sorted(set(addresses)):
+            ip = ipaddress.ip_address(text)
+            if ip.version == 4 and public(ip.packed):
+                records.append(dns.ResourceRecord.A(question.name, ip, ttl=DNS_TTL))
+        return request.succeed(records).packed
 
-    def dns_response(self, flow: dns.DNSFlow):
-        response = flow.response
-        response.answers = [r for r in response.answers if r.type == dns.types.A and public(r.data)]
-        response.authorities = []
-        response.additionals = []
+    @staticmethod
+    async def lookup(name):
+        """The IPv4 addresses the box's resolver has for name; socket.gaierror if none."""
+        infos = await asyncio.get_running_loop().getaddrinfo(name, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        return [info[4][0] for info in infos]
+
+    def listen_dns(self, where):
+        """Bind the DNS server's UDP socket at host:port now, and serve it on the event loop."""
+        host, _, port = where.rpartition(":")
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((host, int(port)))
+        sock.setblocking(False)
+        self.dns_sock = sock
+        loop = asyncio.get_running_loop()
+        self.dns_server = loop.create_task(loop.create_datagram_endpoint(lambda: DnsServer(self), sock=sock))
+        log.info("koi egress DNS on %s", where)
+
+    def close_dns(self):
+        task, self.dns_server = self.dns_server, None
+        if task is None:
+            return
+        if task.done() and not task.cancelled() and task.exception() is None:
+            task.result()[0].close()
+        else:
+            task.cancel()
+        self.dns_sock.close()
 
     def swap_keys(self, flow: http.HTTPFlow, tunnel):
         """Swap koi tokens for keys in the provider's own auth fields; False if the request was refused.

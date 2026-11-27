@@ -333,10 +333,8 @@ redirect=(PREROUTING -i koi-previews0 ! -d "$subnet" -p tcp -m multiport --dport
 iptables -t nat -C "${redirect[@]}" 2>/dev/null || iptables -t nat -A "${redirect[@]}"
 # Previews' lookups go to port 53 on the gateway, and from there only to the
 # proxy's DNS listener: no other server on the host can answer them.
-for proto in udp tcp; do
-	dns=(PREROUTING -i koi-previews0 -d "$gateway" -p "$proto" --dport 53 -j REDIRECT --to-ports 3153)
-	iptables -t nat -C "${dns[@]}" 2>/dev/null || iptables -t nat -A "${dns[@]}"
-done
+dns=(PREROUTING -i koi-previews0 -d "$gateway" -p udp --dport 53 -j REDIRECT --to-ports 3153)
+iptables -t nat -C "${dns[@]}" 2>/dev/null || iptables -t nat -A "${dns[@]}"
 # Each accept goes in again at the top, ahead of the drop rules, as above.
 on_top() {
 	while iptables -D "$@" 2>/dev/null; do :; done
@@ -344,7 +342,6 @@ on_top() {
 }
 on_top INPUT -i koi-previews0 -p tcp --dport 3129 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
 on_top INPUT -i koi-previews0 -p udp --dport 3153 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
-on_top INPUT -i koi-previews0 -p tcp --dport 3153 -m conntrack --ctstate NEW -m conntrack --ctstate DNAT -j ACCEPT
 leave=(DOCKER-USER -i koi-previews0 ! -o koi-previews0 -j DROP)
 iptables -C "${leave[@]}" 2>/dev/null || iptables -I "${leave[@]}"
 

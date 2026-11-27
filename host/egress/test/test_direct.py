@@ -6,10 +6,11 @@ installed:  uv run --with mitmproxy==12.2.3 --with pytest pytest host/egress/tes
 On the box, the firewall redirects a preview's connections to ports 443 and
 80 to the proxy's transparent listener, and mitmproxy asks the kernel where
 each was going. Here that lookup returns the address a test says the preview
-connected to, which is never one the proxy should use. mitmproxy's resolver
-answers from a table, so no test touches the network.
+connected to, which is never one the proxy should use. The policy's DNS
+server looks names up in a table, so no test touches the network.
 """
 
+import asyncio
 import http.client
 import socket
 import struct
@@ -27,23 +28,23 @@ DIALED = "93.184.215.14"
 
 
 class Resolver:
-    """mitmproxy's resolver, answering from a table and recording every name it looks up."""
+    """The policy's lookup, answering from a table and recording every name it looks up.
+
+    gate, when set, holds each lookup until it is set, to keep lookups in flight.
+    """
 
     def __init__(self, table):
         self.table = table
         self.looked_up = []
+        self.gate = None
 
-    async def lookup_ipv4(self, name):
-        return self.lookup(name, 4)
-
-    async def lookup_ipv6(self, name):
-        return self.lookup(name, 6)
-
-    def lookup(self, name, version):
+    async def __call__(self, name):
         self.looked_up.append(name)
+        if self.gate is not None:
+            await self.gate.wait()
         if name not in self.table:
             raise socket.gaierror(socket.EAI_NONAME, "no such name")
-        return [ip for ip in self.table[name] if (":" in ip) == (version == 6)]
+        return list(self.table[name])
 
 
 def free_port(kind=socket.SOCK_STREAM):
@@ -66,17 +67,19 @@ def direct():
         while len(ports) < 2:
             ports.add(free_port())
         regular, redirected = sorted(ports)
-        modes = [f"regular@{regular}", f"transparent@{redirected}", f"dns@{free_port(socket.SOCK_DGRAM)}"]
-        p = Proxy(workdir, upstream, allow, modes=modes, koi_fixtures=FIXTURES)
+        modes = [f"regular@{regular}", f"transparent@{redirected}"]
+        dns_at = ("127.0.0.1", free_port(socket.SOCK_DGRAM))
+        p = Proxy(workdir, upstream, allow, modes=modes, koi_fixtures=FIXTURES, koi_dns=f"{dns_at[0]}:{dns_at[1]}")
+        p.dns_at = dns_at
         p.dialed = dialed
         p.resolver = Resolver(
             {
-                "pypi.org": ["151.101.0.223", "10.0.0.5", "2a04:4e42::223", "::ffff:10.0.0.1"],
+                "pypi.org": ["151.101.0.223", "10.0.0.5", "151.101.0.223"],
                 FIXTURES: ["198.41.0.4"],
                 "files.pythonhosted.org": ["127.0.0.1", "169.254.169.254"],
             }
         )
-        p.master.addons.get("dnsresolver").resolver = lambda: p.resolver
+        p.policy().lookup = p.resolver
         try:
             yield p
         finally:
@@ -91,6 +94,7 @@ def proxy(direct):
     direct.flows.flows.clear()
     direct.to_upstream.asked.clear()
     direct.resolver.looked_up.clear()
+    direct.resolver.gate = None
     direct.dialed["address"] = (DIALED, 443)
     return direct
 
@@ -111,13 +115,16 @@ def get(sock, host, path):
     return response
 
 
-def lookup(proxy, name, qtype=dns.types.A):
-    """One DNS query over UDP to the proxy's DNS listener; returns the answer."""
+def query(name, qtype=dns.types.A, ident=0x4B1D):
     labels = b"".join(bytes([len(part)]) + part.encode() for part in name.split("."))
-    query = struct.pack(">HHHHHH", 0x4B1D, 0x0100, 1, 0, 0, 0) + labels + b"\0" + struct.pack(">HH", qtype, 1)
+    return struct.pack(">HHHHHH", ident, 0x0100, 1, 0, 0, 0) + labels + b"\0" + struct.pack(">HH", qtype, 1)
+
+
+def lookup(proxy, name, qtype=dns.types.A):
+    """One DNS query over UDP to the policy's DNS server; returns the answer."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.settimeout(10)
-        s.sendto(query, proxy.listener("dns"))
+        s.sendto(query(name, qtype), proxy.dns_at)
         return dns.DNSMessage.unpack(s.recv(4096))
 
 
@@ -203,8 +210,8 @@ def test_the_fixtures_host_serves_its_pages(proxy):
     assert get(sock, FIXTURES, "/").status == 200
     assert get(sock, FIXTURES, "/redirect/2").getheader("location") == "/redirect/1"
     assert get(sock, FIXTURES, "/redirect/0").body == b"redirects done\n"
-    assert get(sock, FIXTURES, "/bytes/70000").body == b"x" * 70000
-    assert get(sock, FIXTURES, "/bytes/262145").status == 404
+    assert get(sock, FIXTURES, "/bytes/65536").body == b"x" * 65536
+    assert get(sock, FIXTURES, "/bytes/65537").status == 404
     assert get(sock, FIXTURES, "/delay/0.2").body == b"delayed 0.2 seconds\n"
     assert get(sock, FIXTURES, "/json").getheader("content-type") == "application/json"
     assert get(sock, FIXTURES, "/delay/11").status == 400
@@ -217,6 +224,18 @@ def test_the_fixtures_host_serves_its_pages(proxy):
 def test_the_fixtures_host_over_plain_http(proxy):
     assert request(redirected(proxy, 80), FIXTURES, "/status/418") == (418, b"status 418\n")
     assert proxy.to_upstream.asked == []
+
+
+def test_head_gets_the_headers_get_would(proxy):
+    sock = proxy.tls(redirected(proxy), FIXTURES)
+    conn = http.client.HTTPConnection(FIXTURES)
+    conn.sock = sock
+    for path, length in (("/bytes/100", "100"), ("/status/204", None), ("/status/304", None)):
+        conn.request("HEAD", path, headers={"Host": FIXTURES})
+        response = conn.getresponse()
+        assert response.read() == b""
+        assert response.getheader("content-length") == length
+    assert get(sock, FIXTURES, "/json").status == 200
 
 
 def test_a_bodyless_status_keeps_the_connection_usable(proxy):
@@ -273,3 +292,27 @@ def test_an_allowed_name_gets_no_other_record_types(proxy):
 
 def test_the_fixtures_host_resolves(proxy):
     assert addresses(lookup(proxy, FIXTURES)) == ["198.41.0.4"]
+
+
+def test_lookups_in_flight_are_capped_per_preview(proxy):
+    cap = proxy.script().ns.MAX_LOOKUPS_PER_SOURCE
+    proxy.resolver.gate = asyncio.Event()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(10)
+        for ident in range(cap + 1):
+            s.sendto(query("pypi.org", ident=ident), proxy.dns_at)
+        # The one past the cap is answered at once, while the rest wait.
+        answer = dns.DNSMessage.unpack(s.recv(4096))
+        assert (answer.id, answer.response_code) == (cap, dns.response_codes.SERVFAIL)
+        proxy.master.event_loop.call_soon_threadsafe(proxy.resolver.gate.set)
+        answers = [dns.DNSMessage.unpack(s.recv(4096)) for _ in range(cap)]
+    assert {a.response_code for a in answers} == {dns.response_codes.NOERROR}
+    assert proxy.policy().lookups == {}
+
+
+def test_garbage_gets_no_answer_and_the_server_goes_on(proxy):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(1)
+        s.sendto(b"\x01\x02junk", proxy.dns_at)
+        assert refused(lambda: s.recv(4096))
+    assert addresses(lookup(proxy, "pypi.org")) == ["151.101.0.223"]

@@ -388,13 +388,17 @@ builder, and the egress proxy.
   `HTTP(S)_PROXY`; transparently, for the connections the firewall redirects, where
   the TLS server name (or, in plain HTTP, the Host header) is the one name the
   connection is for and the upstream connection opens to that name, never to the
-  address the preview dialed; and as previews' DNS server, which answers only
+  address the preview dialed; and, through a UDP server of the policy's own, as
+  previews' DNS server, which keeps nothing once it answers and answers only
   allowed names, only with IPv4 addresses (previews have no IPv6 route), and only
   public ones, and never looks up a name it would refuse. So code that resolves a host itself and refuses private
   addresses, as RocketRide's web nodes do, works on a preview for allowed hosts. The
   proxy also answers `fixtures.koi.<domain>` itself with test pages (`/status/CODE`,
-  `/redirect/N`, `/redirect-to?url=`, `/delay/S`, `/bytes/N`, `/json`, `/headers`),
-  so a preview can check how its code fetches the web without reaching any site.
+  `/redirect/N`, `/redirect-to?url=`, `/delay/S`, `/bytes/N` up to 64 KiB, `/json`,
+  `/headers`), so a preview can check how its code fetches the web without reaching
+  any site. Code that resolves the name itself needs the domain's public wildcard
+  record, which an AWS box has; under `koi.test` (`install-vm.sh --local`) only code
+  that uses the proxy setting reaches the test pages.
 - **koid** owns the Caddyfile and regenerates it whenever a preview starts, stops or
   is replaced. Caddy proxies each running preview directly and sends everything else
   to koid, which shows a status page or starts a stopped preview.
