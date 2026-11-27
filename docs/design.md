@@ -394,7 +394,7 @@ builder, and the egress proxy.
   public ones, and never looks up a name it would refuse. So code that resolves a host itself and refuses private
   addresses, as RocketRide's web nodes do, works on a preview for allowed hosts. The
   proxy also answers `fixtures.koi.<domain>` itself with test pages (`/status/CODE`,
-  `/redirect/N`, `/redirect-to?url=`, `/delay/S`, `/bytes/N` up to 64 KiB, `/json`,
+  `/redirect/N`, `/redirect-to?url=`, `/delay/S`, `/json`,
   `/headers`), so a preview can check how its code fetches the web without reaching
   any site. Code that resolves the name itself needs the domain's public wildcard
   record, which an AWS box has; under `koi.test` (`install-vm.sh --local`) only code

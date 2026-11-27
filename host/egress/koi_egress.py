@@ -73,6 +73,7 @@ key or a koi token.
 
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
 import hmac
 import ipaddress
@@ -208,14 +209,17 @@ MAX_PREVIEWS = 1000
 MAX_LOOKUPS = 64
 MAX_LOOKUPS_PER_SOURCE = 8
 DNS_TTL = 60
-# What the fixtures host serves at most: a body of this many bytes, a delay
-# of this many seconds, a chain of this many redirects, a Location this long.
+# The threads previews' lookups run on, apart from the ones mitmproxy
+# resolves upstream hosts on, so slow lookups cannot hold up the proxy. The
+# largest query taken (a plain one with EDNS is under 100 bytes) and the
+# header's length.
+DNS_WORKERS = 4
+MAX_DNS_QUERY = 512
+DNS_HEADER = 12
+# What the fixtures host serves at most: a delay of this many seconds, a
+# chain of this many redirects, a Location this long. Every page is small:
 # mitmproxy holds a response this addon makes whole until the client reads
-# it, so /bytes is no larger than the request body it holds for any request
-# (stream_large_bodies, 64k), and lets no request make the shared proxy hold
-# more than it already could. To check a size limit, set the fetching code's
-# limit below it.
-FIXTURE_MAX_BYTES = 64 * 1024
+# it, so no page offers a large body.
 FIXTURE_MAX_DELAY = 10
 FIXTURE_MAX_REDIRECTS = 20
 FIXTURE_MAX_LOCATION = 2048
@@ -231,7 +235,6 @@ FIXTURE_HTML = b"""<!doctype html>
 <li><a href="/redirect/3">/redirect/N</a>: N redirects, then a page</li>
 <li><a href="/redirect-to?url=http://example.com:99999/">/redirect-to?url=URL&amp;status_code=3XX</a>: one redirect to URL, whatever it is</li>
 <li><a href="/delay/2">/delay/SECONDS</a>: a page after up to 10 seconds</li>
-<li><a href="/bytes/1024">/bytes/N</a>: N bytes, up to 64 KiB</li>
 <li><a href="/json">/json</a>, <a href="/headers">/headers</a>: JSON, and the request's own headers</li>
 </ul>
 </body></html>
@@ -391,7 +394,7 @@ def page(status, body, content_type="text/plain", **headers):
 
 
 async def fixture_response(request):
-    """The fixtures host's answer to a GET or HEAD request (see FIXTURE_HTML for what it serves).
+    """The fixtures host's answer to a GET or HEAD request (see FIXTURE_HTML for what it serves), a few KiB at most.
 
     It answers from what the path asks for only, within the FIXTURE_MAX
     limits, and quotes the request back to the one preview that sent it on
@@ -435,8 +438,6 @@ async def fixture_response(request):
             return page(400, f"delay takes 0 to {FIXTURE_MAX_DELAY} seconds\n".encode())
         await asyncio.sleep(seconds)
         return page(200, f"delayed {seconds:g} seconds\n".encode())
-    if head == "bytes" and number is not None and int(number) <= FIXTURE_MAX_BYTES:
-        return page(200, b"x" * int(number), "application/octet-stream")
     if head == "json" and len(words) == 1:
         return page(200, b'{"fixture": "koi", "ok": true}\n', "application/json")
     if head == "headers" and len(words) == 1:
@@ -729,6 +730,7 @@ class KoiEgress:
         # its lookups in flight per preview address.
         self.dns_server = None
         self.dns_sock = None
+        self.dns_pool = None
         self.lookups = {}
 
     def load(self, loader):
@@ -880,6 +882,10 @@ class KoiEgress:
 
     def allowed_name(self, host):
         host = clean(host)
+        # A hostname and nothing else: libc ends a name at a NUL, so
+        # "evil.example\0.pypi.org" would be looked up as evil.example.
+        if not HOSTNAME_RE.fullmatch(host):
+            return False
         if self.fixtures and host == self.fixtures:
             return False
         return host in self.exact or any(host.endswith(s) for s in self.suffixes)
@@ -1042,6 +1048,14 @@ class KoiEgress:
         and per preview; past either cap a query gets SERVFAIL, and its
         client asks again. The log names the preview, never the name.
         """
+        # A plain query only, small, with one question and at most an EDNS
+        # record, checked before anything is parsed; anything else gets
+        # nothing.
+        if not DNS_HEADER <= len(data) <= MAX_DNS_QUERY:
+            return None
+        _, flags, questions, answers, authorities, additionals = struct.unpack(">HHHHHH", data[:DNS_HEADER])
+        if flags & 0xF800 or questions != 1 or answers or authorities or additionals > 1:
+            return None
         try:
             request = dns.DNSMessage.unpack(data)
         except (struct.error, ValueError, IndexError):
@@ -1085,10 +1099,11 @@ class KoiEgress:
                 records.append(dns.ResourceRecord.A(question.name, ip, ttl=DNS_TTL))
         return request.succeed(records).packed
 
-    @staticmethod
-    async def lookup(name):
-        """The IPv4 addresses the box's resolver has for name; socket.gaierror if none."""
-        infos = await asyncio.get_running_loop().getaddrinfo(name, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    async def lookup(self, name):
+        """The IPv4 addresses the box's resolver has for name, on the DNS server's own threads; socket.gaierror if none."""
+        infos = await asyncio.get_running_loop().run_in_executor(
+            self.dns_pool, socket.getaddrinfo, name, None, socket.AF_INET, socket.SOCK_STREAM
+        )
         return [info[4][0] for info in infos]
 
     def listen_dns(self, where):
@@ -1098,6 +1113,7 @@ class KoiEgress:
         sock.bind((host, int(port)))
         sock.setblocking(False)
         self.dns_sock = sock
+        self.dns_pool = concurrent.futures.ThreadPoolExecutor(max_workers=DNS_WORKERS, thread_name_prefix="koi-dns")
         loop = asyncio.get_running_loop()
         self.dns_server = loop.create_task(loop.create_datagram_endpoint(lambda: DnsServer(self), sock=sock))
         log.info("koi egress DNS on %s", where)
@@ -1111,6 +1127,7 @@ class KoiEgress:
         else:
             task.cancel()
         self.dns_sock.close()
+        self.dns_pool.shutdown(wait=False, cancel_futures=True)
 
     def swap_keys(self, flow: http.HTTPFlow, tunnel):
         """Swap koi tokens for keys in the provider's own auth fields; False if the request was refused.

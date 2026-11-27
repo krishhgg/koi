@@ -61,7 +61,7 @@ def direct():
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
         allow = workdir / "allow.txt"
-        allow.write_text("pypi.org\nfiles.pythonhosted.org\n")
+        allow.write_text("pypi.org\nfiles.pythonhosted.org\n*.hf.test\n")
         upstream = Upstream(workdir)
         ports = {free_port(), free_port()}
         while len(ports) < 2:
@@ -210,12 +210,10 @@ def test_the_fixtures_host_serves_its_pages(proxy):
     assert get(sock, FIXTURES, "/").status == 200
     assert get(sock, FIXTURES, "/redirect/2").getheader("location") == "/redirect/1"
     assert get(sock, FIXTURES, "/redirect/0").body == b"redirects done\n"
-    assert get(sock, FIXTURES, "/bytes/65536").body == b"x" * 65536
-    assert get(sock, FIXTURES, "/bytes/65537").status == 404
+    assert get(sock, FIXTURES, "/bytes/100").status == 404
     assert get(sock, FIXTURES, "/delay/0.2").body == b"delayed 0.2 seconds\n"
     assert get(sock, FIXTURES, "/json").getheader("content-type") == "application/json"
     assert get(sock, FIXTURES, "/delay/11").status == 400
-    assert get(sock, FIXTURES, "/bytes/99999999").status == 404
     assert get(sock, FIXTURES, "/redirect-to?url=http://a%20b/").status == 400
     assert get(sock, FIXTURES, "/nothing").status == 404
     assert proxy.to_upstream.asked == []
@@ -230,7 +228,7 @@ def test_head_gets_the_headers_get_would(proxy):
     sock = proxy.tls(redirected(proxy), FIXTURES)
     conn = http.client.HTTPConnection(FIXTURES)
     conn.sock = sock
-    for path, length in (("/bytes/100", "100"), ("/status/204", None), ("/status/304", None)):
+    for path, length in (("/json", "31"), ("/status/204", None), ("/status/304", None)):
         conn.request("HEAD", path, headers={"Host": FIXTURES})
         response = conn.getresponse()
         assert response.read() == b""
@@ -288,6 +286,34 @@ def test_an_allowed_name_gets_no_other_record_types(proxy):
     assert answer.response_code == dns.response_codes.NOERROR
     assert answer.answers == []
     assert proxy.resolver.looked_up == []
+
+
+def test_a_name_that_is_not_a_hostname_is_never_looked_up(proxy):
+    # Each ends with an allowed suffix. libc ends a name at a NUL, so the
+    # first would be looked up as attacker.example.
+    for name in ("attacker.example\x00.hf.test", "a b.hf.test", "a_b.hf.test"):
+        assert lookup(proxy, name).response_code == dns.response_codes.NXDOMAIN
+    assert proxy.resolver.looked_up == []
+    lookup(proxy, "models.hf.test")
+    assert proxy.resolver.looked_up == ["models.hf.test"]
+
+
+def test_a_query_that_is_not_a_plain_one_gets_nothing(proxy):
+    two_questions = bytearray(query("pypi.org"))
+    two_questions[5] = 2
+    response = bytearray(query("pypi.org"))
+    response[2] |= 0x80
+    for data in (bytes(two_questions), bytes(response), query("pypi.org") + b"x" * 600):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(1)
+            s.sendto(data, proxy.dns_at)
+            assert refused(lambda: s.recv(4096))
+    assert proxy.resolver.looked_up == []
+
+
+def test_redirected_tls_whose_server_name_is_not_a_hostname_is_refused(proxy):
+    assert refused(lambda: request(proxy.tls(redirected(proxy), "a_b.hf.test"), "a_b.hf.test"))
+    assert proxy.to_upstream.asked == []
 
 
 def test_the_fixtures_host_resolves(proxy):
