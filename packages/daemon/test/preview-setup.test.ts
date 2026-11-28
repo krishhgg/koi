@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { LoginKeySchema, RecipeSchema } from '@koi/shared';
 import { loadConfig } from '../src/config.ts';
 import { cliDocker, runArgs } from '../src/docker.ts';
-import { CA_BUNDLE_PATH, CA_CERT_PATH, egressEnv, loadEgress } from '../src/egress-config.ts';
+import {
+	CA_BUNDLE_PATH,
+	CA_CERT_PATH,
+	egressDns,
+	egressEnv,
+	loadEgress,
+	previewRoute,
+} from '../src/egress-config.ts';
 import type { ExecResult } from '../src/exec.ts';
 import { request, setup } from './fakes.ts';
 
@@ -155,6 +162,60 @@ describe('egress', () => {
 		const rerun = t.docker.runs.at(-1);
 		expect(rerun?.env.HTTPS_PROXY).toBe(EGRESS.proxy);
 		expect(rerun?.files?.length).toBe(2);
+	});
+
+	test('containers resolve names through the egress proxy, at the address it listens on', async () => {
+		const t = await setup({ egress: EGRESS });
+		await t.up(request());
+		expect(t.docker.runs[0]?.dns).toBe('172.19.0.1');
+		expect(egressDns(EGRESS)).toBe('172.19.0.1');
+	});
+
+	test('every start of a preview, a wake included, gets its route to the proxy after Docker starts it', async () => {
+		const routed: Array<[string, number]> = [];
+		const t = await setup({
+			egress: EGRESS,
+			routeOut: async (container) => {
+				routed.push([container, t.docker.starts.length + t.docker.runs.length]);
+			},
+		});
+		await t.up(request());
+		const d = (await t.store.get('hello-pr-7'))?.deployment;
+		expect(routed.map(([c]) => c)).toEqual([d?.container ?? '']);
+		await t.docker.stop(d?.container ?? '');
+		await t.deployer.ensureRunning('hello-pr-7');
+		expect(routed.map(([c]) => c)).toEqual([d?.container ?? '', d?.container ?? '']);
+		// Each after its start: a new start makes a new network namespace.
+		expect(routed[1]?.[1]).toBeGreaterThan(routed[0]?.[1] ?? 0);
+	});
+
+	test('a preview the route helper fails for still starts, and the failure is logged', async () => {
+		const t = await setup({
+			egress: EGRESS,
+			routeOut: async () => {
+				throw new Error('sudo: a password is required');
+			},
+		});
+		await t.up(request());
+		expect((await t.store.get('hello-pr-7'))?.status).toBe('running');
+		expect(t.logs).toContainEqual(expect.stringContaining('no route to the egress proxy'));
+	});
+
+	test('previewRoute runs the helper through sudo -n with the container alone, and throws when it fails', async () => {
+		const calls: string[][] = [];
+		const ok = previewRoute('/usr/local/libexec/koi-preview-route', async (cmd) => {
+			calls.push(cmd);
+			return { code: 0, stdout: '', stderr: '', timedOut: false } as ExecResult;
+		});
+		await ok('koi-hello-abc');
+		expect(calls).toEqual([
+			['sudo', '-n', '/usr/local/libexec/koi-preview-route', 'koi-hello-abc'],
+		]);
+		const failing = previewRoute(
+			'/x',
+			async () => ({ code: 1, stdout: '', stderr: 'no', timedOut: false }) as ExecResult,
+		);
+		await expect(failing('c')).rejects.toThrow();
 	});
 
 	test('without egress, containers get neither', async () => {

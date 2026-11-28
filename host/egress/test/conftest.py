@@ -195,10 +195,12 @@ class ToUpstream:
 
     def __init__(self, upstream):
         self.upstream = upstream
+        self.asked = []  # where the proxy meant to connect, before this addon redirects it
 
     def server_connect(self, data):
         if data.server.error:
             return
+        self.asked.append(tuple(data.server.address))
         port = data.server.address[1]
         server = self.upstream.https if port == 443 else self.upstream.http
         data.server.address = server.server_address
@@ -242,11 +244,15 @@ class Proxy:
     koi_secret is the workdir's token secret (token_secret) unless given.
     """
 
-    def __init__(self, workdir, upstream, allow, script=ADDON, port=0, wait=True, **policy_options):
+    def __init__(self, workdir, upstream, allow, script=ADDON, port=0, wait=True, modes=None, **policy_options):
         self.workdir = workdir
         self.upstream = upstream
+        # mitmproxy's listeners, as install.sh starts them on the box (each
+        # on a free port here), or None for the regular proxy alone.
+        self.modes = modes
         policy_options.setdefault("koi_secret", str(token_secret(workdir)))
         self.flows = Flows()
+        self.to_upstream = ToUpstream(upstream)
         self.ca = workdir / "confdir" / "mitmproxy-ca-cert.pem"
         self.log = Logged()
         for name in ("mitmproxy.addons.script", "koi_egress"):
@@ -265,7 +271,9 @@ class Proxy:
         async def main():
             opts = options.Options(listen_host="127.0.0.1", listen_port=port)
             self.master = master.Master(opts)
-            self.master.addons.add(*addons.default_addons(), ToUpstream(self.upstream), self.flows)
+            self.master.addons.add(*addons.default_addons(), self.to_upstream, self.flows)
+            if self.modes is not None:
+                opts.update(mode=list(self.modes))
             opts.update(
                 confdir=str(self.workdir / "confdir"),
                 ssl_verify_upstream_trusted_ca=str(self.upstream.ca),
@@ -327,6 +335,13 @@ class Proxy:
     def address(self):
         addrs = self.master.addons.get("proxyserver").listen_addrs()
         return addrs[0][:2] if addrs else None
+
+    def listener(self, kind):
+        """Where the listener of one mode ("regular", "transparent", "dns") is, or None."""
+        for server in self.master.addons.get("proxyserver").servers:
+            if server.mode.type_name == kind and server.listen_addrs:
+                return server.listen_addrs[0][:2]
+        return None
 
     def close(self):
         self.master.shutdown()

@@ -191,7 +191,7 @@ install_bundle() {
 	mv -f "$BIN_DIR/koid.new" "$BIN_DIR/koid"
 	unpack recipes.tar.gz "$SHARE/recipes"
 	unpack egress.tar.gz "$SHARE/egress"
-	bash "$SHARE/egress/install.sh"
+	KOI_DOMAIN="$DOMAIN" bash "$SHARE/egress/install.sh"
 	unpack verify.tar.gz "$SHARE/verify"
 	bash "$SHARE/verify/install.sh"
 	if [ "$LOCAL" = false ]; then

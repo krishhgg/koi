@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { ExecError, type ExecOptions, type ExecResult, exec } from './exec.ts';
 
 // How a preview reaches the internet: only through the egress proxy
 // (host/egress), which it must also trust, since the proxy intercepts TLS to
@@ -62,4 +63,27 @@ export function egressFiles(egress: Egress): Array<{ path: string; content: stri
 		{ path: CA_BUNDLE_PATH, content: egress.caBundle },
 		{ path: CA_CERT_PATH, content: egress.caCert },
 	];
+}
+
+// The DNS server a preview uses: the egress proxy's DNS listener, on the
+// address the proxy listens on (host/egress/install.sh). It answers only for
+// names the proxy lets previews reach, with public addresses only.
+export function egressDns(egress: Egress): string {
+	return new URL(egress.proxy).hostname;
+}
+
+type Run = (cmd: string[], options?: ExecOptions) => Promise<ExecResult>;
+
+// Gives a preview container just started a default route to its bridge, the
+// way out for code in it that ignores the proxy setting, which the box's
+// firewall sends to the same proxy. Through the root-owned helper
+// (host/egress/koi-preview-route) and sudo: the sudoers rule provisioning
+// installs names exactly this path (host/cloud-init.sh), and -n fails
+// instead of waiting for a password.
+export function previewRoute(path: string, run: Run = exec): (container: string) => Promise<void> {
+	return async (container) => {
+		const cmd = ['sudo', '-n', path, container];
+		const r = await run(cmd, { timeoutMs: 30_000 });
+		if (r.code !== 0 || r.timedOut) throw new ExecError(cmd, r);
+	};
 }

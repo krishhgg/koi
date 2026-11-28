@@ -11,7 +11,7 @@ import { type CtlIo, ctl, ctlEncoded, socketFetch } from './ctl.ts';
 import { Deployer } from './deployer.ts';
 import { cliDocker, watchDeaths } from './docker.ts';
 import { egressControl, proxyPreviews } from './egress.ts';
-import { loadEgress } from './egress-config.ts';
+import { loadEgress, previewRoute } from './egress-config.ts';
 import { diskSpace, extractTarball, resolveInside } from './fsutil.ts';
 import { hostSpec, verificationCapability, verifyHost } from './host.ts';
 import { hostDescriber } from './host-info.ts';
@@ -180,7 +180,7 @@ async function daemon(): Promise<void> {
 		// the preview is started with it; the loop above covers the ones
 		// made before.
 		registerSecret: (value) => secrets.add(value),
-		...(egress !== undefined ? { egress } : {}),
+		...(egress !== undefined ? { egress, routeOut: previewRoute(config.previewRouteHelper) } : {}),
 		drainVisits: () => activity.drainVisits(),
 		now: () => new Date(),
 		sleep: (ms) => Bun.sleep(ms),

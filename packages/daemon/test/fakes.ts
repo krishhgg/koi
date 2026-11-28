@@ -973,6 +973,8 @@ export async function setup(
 	options: {
 		builtin?: Recipe;
 		egress?: Egress;
+		// Stands in for the helper that gives a started preview its route.
+		routeOut?: (container: string) => Promise<void>;
 		proxy?: boolean;
 		// A live list with no size cap, as a file gives.
 		unboundedLive?: boolean;
@@ -1106,6 +1108,7 @@ export async function setup(
 		resolveInside,
 		diskSpace: async () => ({ ...disk }),
 		...(options.egress !== undefined ? { egress: options.egress } : {}),
+		...(options.routeOut !== undefined ? { routeOut: options.routeOut } : {}),
 		...(options.proxy
 			? {
 					previews: async (addresses: Record<string, string>) => {

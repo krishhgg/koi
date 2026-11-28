@@ -1,0 +1,45 @@
+#!/bin/bash
+# Gives one preview container a default route to its bridge, so code in it
+# that ignores the proxy setting reaches the egress proxy too. koid runs it
+# through sudo each time it starts a preview:
+#
+#   sudo -n /usr/local/libexec/koi-preview-route CONTAINER
+#
+# Docker gives a container on an internal network no default route, and only
+# root can add one in the container's network namespace. The route opens
+# nothing by itself: what a preview sends off its bridge reaches the host,
+# where the firewall (host/cloud-init.sh, koi-firewall) sends new connections
+# to ports 443 and 80 to the proxy's transparent listener, under the same
+# policy as everything else (host/egress/koi_egress.py), and Docker drops the
+# rest. Without the route, as before, the preview's direct connections fail
+# at once.
+#
+# It changes only a running container attached to koi-previews and nothing
+# else, and only its default route.
+set -euo pipefail
+name=${1:-}
+if [ $# -ne 1 ] || ! [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+	echo "usage: koi-preview-route CONTAINER" >&2
+	exit 2
+fi
+gateway=$(docker network inspect koi-previews -f '{{(index .IPAM.Config 0).Gateway}}')
+if ! [[ $gateway =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+	echo "koi-preview-route: koi-previews has no IPv4 gateway (got '$gateway')" >&2
+	exit 1
+fi
+read -r running sandbox networks < <(
+	docker container inspect -f '{{.State.Running}} {{.NetworkSettings.SandboxKey}} {{range $n, $_ := .NetworkSettings.Networks}}{{$n}},{{end}}' "$name"
+)
+if [ "$running" != true ]; then
+	echo "koi-preview-route: $name is not running" >&2
+	exit 1
+fi
+if [ "$networks" != koi-previews, ]; then
+	echo "koi-preview-route: $name is attached to ${networks%,}, not koi-previews alone" >&2
+	exit 1
+fi
+if ! [[ $sandbox =~ ^(/var)?/run/docker/netns/[0-9a-f]+$ ]]; then
+	echo "koi-preview-route: $name has no network namespace Docker made (got '$sandbox')" >&2
+	exit 1
+fi
+nsenter --net="$sandbox" ip route replace default via "$gateway"

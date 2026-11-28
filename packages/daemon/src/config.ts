@@ -79,6 +79,10 @@ const ConfigSchema = z.object({
 	// (host/verify/koi_verify_net.py). Missing from the box: verification is
 	// unavailable.
 	verifyHelper: z.string().startsWith('/'),
+	// The root-owned helper that gives a preview its default route to the
+	// bridge (host/egress/koi-preview-route), run through sudo after each
+	// start when previews have the egress proxy.
+	previewRouteHelper: z.string().startsWith('/'),
 	// The recorder image (host/recorder), as the id Docker gives a local
 	// build or a registry reference pinned with @sha256:<64 hex>
 	// (KOI_RECORDER_IMAGE). Unset: verification is unavailable.
@@ -134,6 +138,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 		...(env.KOI_EGRESS_CA ? { egressCa: env.KOI_EGRESS_CA } : {}),
 		...(env.KOI_VERIFY_POOL ? { verifyPool: env.KOI_VERIFY_POOL } : {}),
 		verifyHelper: env.KOI_VERIFY_HELPER ?? '/usr/local/libexec/koi-verify-net',
+		previewRouteHelper: env.KOI_PREVIEW_ROUTE ?? '/usr/local/libexec/koi-preview-route',
 		...(env.KOI_RECORDER_IMAGE ? { recorderImage: env.KOI_RECORDER_IMAGE } : {}),
 		recorderSeccomp: env.KOI_RECORDER_SECCOMP ?? '/usr/local/share/koi/recorder-seccomp.json',
 		...(env.KOI_VERIFIER_IMAGE ? { verifierImage: env.KOI_VERIFIER_IMAGE } : {}),

@@ -539,7 +539,9 @@ must name the target's domain before any of the source goes out.
 
    That serves previews under `koi.test` with Caddy's own CA. Pass `--domain`
    for another domain; `koi up --local` then needs the same `--domain`, or
-   `KOI_DOMAIN`.
+   `KOI_DOMAIN`. Under `koi.test` the egress proxy's test pages
+   (`fixtures.koi.koi.test`) answer only code that uses the proxy setting: the
+   name has no public record for code that resolves it itself.
 2. Log out and in again, or start a shell with `newgrp koi-control`, so the
    new group applies.
 3. Trust Caddy's CA: `sudo caddy trust --address unix//run/caddy/admin.sock`

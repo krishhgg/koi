@@ -291,7 +291,10 @@ are its limits, each with the file that decides it.
   caps a token at 600 requests an hour (`REQUESTS_PER_HOUR` in `koi_egress.py`), which
   caps the request count, not the cost.
 - A preview reaches the network only through the egress proxy's allowlist
-  (`host/egress/allow.txt`, plus the provider hosts in `koi_egress.py`). Its Docker
+  (`host/egress/allow.txt`, plus the provider hosts in `koi_egress.py`), whether its
+  code uses the proxy setting or connects directly, which the firewall redirects to
+  the same proxy; its DNS answers allowed names only. The proxy serves test pages at
+  `fixtures.koi.<domain>` for code that fetches the web. Its Docker
   network is internal with inter-container traffic off, and the firewall drops new
   connections from it to the host except to the proxy (`ensure_network` and
   `koi-firewall` in `host/cloud-init.sh`), so a pull request's code cannot reach
